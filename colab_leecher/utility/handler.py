@@ -25,7 +25,6 @@ from colab_leecher.freeconvert import (
     hardsub_remote_url as fc_hardsub_remote_url,
     quality_label as fc_quality_label,
 )
-from colab_leecher.local_hardsub import hardsub_local
 from colab_leecher.downlader.aria2 import aria2_Download
 from colab_leecher.seedr import SeedrError, _del_folder, fetch_urls_via_seedr
 from colab_leecher.uploader.telegram import upload_file
