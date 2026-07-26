@@ -286,7 +286,24 @@ def _create_hardsub_payload(
     subtitle_b64: str,
     crf: int,
     speed: str,
+    resize: Optional[tuple[int, int]] = None,
 ) -> dict:
+    options = {
+        "video_codec": "libx264",
+        "video_rate_control_h264": "crf",
+        "video_crf_h264": crf,
+        "video_encoding_speed_h264_265": speed,
+        "audio_codec": "aac",
+        "audio_bitrate_aac": "128k",
+        "subtitle_add": "upload",
+        "subtitle": subtitle_b64,
+        "subtitle_mode": "hard",
+    }
+    if resize:
+        width, height = resize
+        options["adjust_video_settings"] = "change-resolution"
+        options["video_screen_size"] = f"{width}:{height}"
+
     return {
         "tasks": {
             "import-video": {
@@ -298,17 +315,7 @@ def _create_hardsub_payload(
                 "input": "import-video",
                 "input_format": input_format,
                 "output_format": output_format,
-                "options": {
-                    "video_codec": "libx264",
-                    "video_rate_control_h264": "crf",
-                    "video_crf_h264": crf,
-                    "video_encoding_speed_h264_265": speed,
-                    "audio_codec": "aac",
-                    "audio_bitrate_aac": "128k",
-                    "subtitle_add": "upload",
-                    "subtitle": subtitle_b64,
-                    "subtitle_mode": "hard",
-                },
+                "options": options,
             },
             "export": {
                 "operation": "export/url",
@@ -327,6 +334,7 @@ async def hardsub_remote_url(
     *,
     quality_profile: str = "balanced",
     style: AssStyle = DEFAULT_HARDSUB_STYLE,
+    resize: Optional[tuple[int, int]] = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
     url_cb: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -335,6 +343,10 @@ async def hardsub_remote_url(
     Brûle des sous-titres dans une vidéo via FreeConvert, en forçant le style
     ASS (police/contour/ombre) avant envoi puisque FreeConvert applique
     tel quel le style écrit dans le fichier sous-titre reçu.
+
+    resize : optionnel — (largeur, hauteur) cible, ex (854, 480) pour du
+    480p. Réduit le temps de traitement FreeConvert ET le poids du fichier
+    final. None = garde la résolution d'origine.
 
     url_cb : optionnel — appelé avec le lien de téléchargement direct dès
     que FreeConvert a fini son job, AVANT qu'on commence à télécharger le
@@ -362,6 +374,7 @@ async def hardsub_remote_url(
         subtitle_b64=subtitle_b64,
         crf=cfg.crf,
         speed=cfg.speed,
+        resize=resize,
     )
 
     job = await _post_job(api_key, payload)
