@@ -185,6 +185,43 @@ async def _startup_welcome() -> None:
 def _owner(m): return m.chat.id == OWNER
 def _ring(p):  return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
 
+REQUIRED_CHANNEL = "@hebdos"
+
+
+async def _is_subscribed(client, user_id: int) -> bool:
+    try:
+        member = await client.get_chat_member(REQUIRED_CHANNEL, user_id)
+        return str(member.status).lower() not in ("left", "banned", "kicked")
+    except Exception as exc:
+        logging.debug(f"Subscription check failed: {exc}")
+        return False
+
+
+def _join_gate_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Rejoindre " + REQUIRED_CHANNEL, url=f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}")],
+        [InlineKeyboardButton("✅ J'ai rejoint", callback_data="check_sub")],
+    ])
+
+
+# Résolutions proposées avant un hardsub FreeConvert — format (largeur, hauteur).
+# None = garde la résolution d'origine du fichier (comportement historique).
+FC_RESOLUTIONS: dict[str, tuple[int, int] | None] = {
+    "orig": None,
+    "360":  (640, 360),
+    "480":  (854, 480),
+    "720":  (1280, 720),
+}
+
+
+def _fc_quality_kb(flow: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 Qualité d'origine", callback_data=f"fc_res|{flow}|orig")],
+        [InlineKeyboardButton("360p", callback_data=f"fc_res|{flow}|360"),
+         InlineKeyboardButton("480p", callback_data=f"fc_res|{flow}|480")],
+        [InlineKeyboardButton("720p", callback_data=f"fc_res|{flow}|720")],
+    ])
+
 
 # ══════════════════════════════════════════════
 #  /start
@@ -193,25 +230,47 @@ def _ring(p):  return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
 @colab_bot.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     await message.delete()
+
+    if _owner(message):
+        await message.reply_text(
+            "⚡ <b>ZILONG BOT</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🟢 Online &amp; Ready\n\n"
+            "Send a <b>link</b>, <b>magnet</b> or <b>path</b>.\n\n"
+            "📥 Direct links · Magnet · GDrive\n"
+            "🎬 YouTube · Mega · Terabox\n"
+            "☁️ CloudConvert convert · resize · compress\n"
+            "🧲 Seedr + CloudConvert convert · hardsub\n"
+            "🧲 Seedr + FreeConvert hardsub\n"
+            "🎞 Stream Extractor (any link)\n"
+            "📊 /status — live dashboard\n"
+            "📡 /nyaa_search — anime search\n\n"
+            "💡 /help for all commands",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📖 Help",     callback_data="cb_help"),
+                InlineKeyboardButton("⚙️ Settings", callback_data="cb_settings"),
+            ], [
+                InlineKeyboardButton("📊 Status",   callback_data="status_refresh"),
+            ]])
+        )
+        return
+
+    if not await _is_subscribed(client, message.from_user.id):
+        await message.reply_text(
+            "🔒 <b>Accès restreint</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Pour utiliser ce bot, abonne-toi d'abord à {REQUIRED_CHANNEL}.\n\n"
+            "Une fois fait, tape sur « J'ai rejoint » ci-dessous.",
+            reply_markup=_join_gate_kb(),
+        )
+        return
+
     await message.reply_text(
-        "⚡ <b>ZILONG BOT</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🟢 Online &amp; Ready\n\n"
-        "Send a <b>link</b>, <b>magnet</b> or <b>path</b>.\n\n"
-        "📥 Direct links · Magnet · GDrive\n"
-        "🎬 YouTube · Mega · Terabox\n"
-        "☁️ CloudConvert convert · resize · compress\n"
-        "🧲 Seedr + CloudConvert convert · hardsub\n"
-        "🧲 Seedr + FreeConvert hardsub\n"
-        "🎞 Stream Extractor (any link)\n"
-        "📊 /status — live dashboard\n"
-        "📡 /nyaa_search — anime search\n\n"
-        "💡 /help for all commands",
+        "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ Abonnement vérifié\n\n"
+        "Tu peux consulter les réglages du bot, mais seul le propriétaire "
+        "peut lancer des téléchargements.",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("📖 Help",     callback_data="cb_help"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="cb_settings"),
-        ], [
-            InlineKeyboardButton("📊 Status",   callback_data="status_refresh"),
+            InlineKeyboardButton("⚙️ Voir les réglages", callback_data="cb_settings"),
         ]])
     )
 
@@ -485,9 +544,17 @@ async def stop_bot(client, message):
 
 @colab_bot.on_message(filters.command("settings") & filters.private)
 async def settings_cmd(client, message):
+    await message.delete()
     if _owner(message):
-        await message.delete()
         await send_settings(client, message, message.id, True)
+        return
+    if not await _is_subscribed(client, message.from_user.id):
+        await message.reply_text(
+            f"🔒 Abonne-toi à {REQUIRED_CHANNEL} pour voir les réglages.",
+            reply_markup=_join_gate_kb(),
+        )
+        return
+    await send_settings(client, message, message.id, True, readonly=True)
 
 
 @colab_bot.on_message(filters.command("setname") & filters.private)
@@ -659,7 +726,21 @@ def _mode_keyboard():
 
 @colab_bot.on_message(filters.create(isLink) & ~filters.photo & filters.private)
 async def handle_url(client, message):
-    if not _owner(message): return
+    if not _owner(message):
+        if await _is_subscribed(client, message.from_user.id):
+            msg = await message.reply_text(
+                "⛔ Seul le propriétaire du bot peut lancer des téléchargements.\n"
+                "Tape /settings pour consulter les réglages.",
+                quote=True,
+            )
+        else:
+            msg = await message.reply_text(
+                f"🔒 Abonne-toi à {REQUIRED_CHANNEL} pour utiliser ce bot.",
+                reply_markup=_join_gate_kb(),
+                quote=True,
+            )
+        await sleep(10); await msg.delete()
+        return
     BOT.Options.custom_name = ""
     BOT.Options.zip_pswd    = ""
     BOT.Options.unzip_pswd  = ""
@@ -731,7 +812,24 @@ async def callbacks(client, cq):
 
     if data == "cb_settings":
         await cq.answer()
-        await send_settings(client, cq.message, cq.message.id, False)
+        is_owner = cq.from_user and cq.from_user.id == OWNER
+        await send_settings(client, cq.message, cq.message.id, False, readonly=not is_owner)
+        return
+
+    if data == "check_sub":
+        if await _is_subscribed(client, cq.from_user.id):
+            await cq.answer("✅ Abonnement confirmé !", show_alert=True)
+            await cq.message.edit_text(
+                "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ Abonnement vérifié\n\n"
+                "Tu peux consulter les réglages du bot, mais seul le propriétaire "
+                "peut lancer des téléchargements.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⚙️ Voir les réglages", callback_data="cb_settings"),
+                ]])
+            )
+        else:
+            await cq.answer(f"❌ Toujours pas abonné à {REQUIRED_CHANNEL}", show_alert=True)
         return
 
     if data == "cb_back_start":
@@ -894,13 +992,30 @@ async def callbacks(client, cq):
             await cq.answer("Seedr mode currently needs a magnet link.", show_alert=True)
             return
 
+        await cq.message.edit_text(
+            "🆓 <b>FREECONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Choisis la qualité de sortie :\n"
+            "<i>Une résolution plus basse = traitement plus rapide.</i>",
+            reply_markup=_fc_quality_kb("magnet"),
+        )
+        _link_sessions[cq.message.id] = [magnet]
+        return
+
+    if data.startswith("fc_res|magnet|"):
+        code = data.split("|", 2)[2]
+        resize = FC_RESOLUTIONS.get(code)
+        magnet = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
+        if not magnet.startswith("magnet:?xt=urn:btih:"):
+            await cq.answer("Session expirée, renvoie le lien.", show_alert=True)
+            return
+
         await cq.answer("🆓 Hardsub FreeConvert démarré (en parallèle)")
         await cq.message.delete()
         job_status_msg = await colab_bot.send_message(
             chat_id=OWNER,
             text="⏳ <i>Starting Seedr + FreeConvert hardsub job...</i>",
         )
-        get_event_loop().create_task(Seedr_FC_Hardsub_Handler(magnet, job_status_msg))
+        get_event_loop().create_task(Seedr_FC_Hardsub_Handler(magnet, job_status_msg, resize=resize))
         return
 
     # ── FreeConvert Hardsub sur lien direct (sous-titre fourni manuellement) ──
@@ -913,6 +1028,23 @@ async def callbacks(client, cq):
         url = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
         if not (url.startswith("http://") or url.startswith("https://")):
             await cq.answer("This option needs a direct HTTP(S) link.", show_alert=True)
+            return
+
+        await cq.message.edit_text(
+            "🆓 <b>FREECONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Choisis la qualité de sortie :\n"
+            "<i>Une résolution plus basse = traitement plus rapide.</i>",
+            reply_markup=_fc_quality_kb("direct"),
+        )
+        _link_sessions[cq.message.id] = [url]
+        return
+
+    if data.startswith("fc_res|direct|"):
+        code = data.split("|", 2)[2]
+        resize = FC_RESOLUTIONS.get(code)
+        url = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            await cq.answer("Session expirée, renvoie le lien.", show_alert=True)
             return
 
         name = os.path.basename(urlparse(url).path) or "video.mp4"
@@ -928,7 +1060,7 @@ async def callbacks(client, cq):
                 InlineKeyboardButton("✖ Annuler", callback_data="fc_hardsub_cancel"),
             ]]),
         )
-        _pending_fc_subtitle[prompt.id] = {"url": url, "name": name}
+        _pending_fc_subtitle[prompt.id] = {"url": url, "name": name, "resize": resize}
         return
 
     if data == "fc_hardsub_cancel":
@@ -1316,7 +1448,7 @@ async def handle_subtitle_document(client, message):
     # Fire-and-forget : ne bloque pas ce handler, donc le bot reste réactif
     # pour recevoir d'autres liens/sous-titres pendant que celui-ci tourne.
     get_event_loop().create_task(
-        Direct_FC_Hardsub_Handler(pending["url"], pending["name"], subtitle_path, status_msg)
+        Direct_FC_Hardsub_Handler(pending["url"], pending["name"], subtitle_path, status_msg, resize=pending.get("resize"))
     )
 
 
