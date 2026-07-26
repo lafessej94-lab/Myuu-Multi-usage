@@ -25,6 +25,7 @@ from colab_leecher.freeconvert import (
     hardsub_remote_url as fc_hardsub_remote_url,
     quality_label as fc_quality_label,
 )
+from colab_leecher.local_hardsub import hardsub_local
 from colab_leecher.downlader.aria2 import aria2_Download
 from colab_leecher.seedr import SeedrError, _del_folder, fetch_urls_via_seedr
 from colab_leecher.uploader.telegram import upload_file
@@ -585,7 +586,7 @@ async def Seedr_CC_Hardsub_Handler(magnet: str) -> None:
             await _del_folder(seedr_user, seedr_pwd, folder_id)
 
 
-async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg) -> None:
+async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, int] | None = None) -> None:
     """
     Équivalent de Seedr_CC_Hardsub_Handler mais via FreeConvert au lieu de
     CloudConvert. Même pipeline : Seedr -> sonde la piste FR -> extrait le
@@ -680,6 +681,7 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg) -> None:
                     subtitle_path,
                     job_dir,
                     quality_profile=BOT.Options.cc_quality_profile,
+                    resize=resize,
                     process_cb=_process_cb,
                     download_cb=_download_cb,
                     url_cb=_url_cb,
@@ -704,7 +706,7 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg) -> None:
                     shutil.rmtree(d, ignore_errors=True)
 
 
-async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: str, status_msg) -> None:
+async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: str, status_msg, resize: tuple[int, int] | None = None) -> None:
     """
     Hardsub FreeConvert sur un lien direct (ex: lien Seedr, lien HTTP classique),
     avec un fichier de sous-titres fourni manuellement par l'utilisateur —
@@ -763,6 +765,7 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
                 subtitle_path,
                 job_dir,
                 quality_profile=BOT.Options.cc_quality_profile,
+                resize=resize,
                 process_cb=_process_cb,
                 download_cb=_download_cb,
                 url_cb=_url_cb,
