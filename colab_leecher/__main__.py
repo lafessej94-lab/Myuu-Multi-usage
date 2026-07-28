@@ -47,6 +47,11 @@ if _initial_dump not in ("", "0"):
 BOT.Options.auto_forward = bool(BOT.Options.dump_ids)
 BOT.Setting.auto_forward = "On" if BOT.Options.auto_forward else "Off"
 
+# Clés API CloudConvert/FreeConvert : reprend celles du launcher Colab comme
+# point de départ, puis gérables en plus depuis le bot via /addcc et /addfc.
+BOT.Options.cc_api_keys = [k.strip() for k in str(CC_API_KEY or "").split(",") if k.strip()]
+BOT.Options.fc_api_keys = [k.strip() for k in str(FC_API_KEY or "").split(",") if k.strip()]
+
 # ── État en mémoire pour le hardsub FreeConvert concurrent ──────────────────
 # _link_sessions : message_id (du message "Choose mode:") -> liste de sources.
 #   Nécessaire pour que plusieurs liens envoyés d'affilée ne se marchent pas
@@ -172,7 +177,7 @@ async def _startup_welcome() -> None:
             display = first.replace("<", "&lt;").replace(">", "&gt;")
             text = (
                 f"👋 <b>Welcome back, {display}</b>\n"
-                "⚡ <b>Zilong is online</b>\n\n"
+                "⚡ <b>Myuu-Multi-Usage is online</b>\n\n"
                 "Send a link, magnet, or path to begin.\n"
                 "Use /start for the full menu and /status for the live dashboard."
             )
@@ -233,7 +238,7 @@ async def start(client, message):
 
     if _owner(message):
         await message.reply_text(
-            "⚡ <b>ZILONG BOT</b>\n"
+            "⚡ <b>Myuu-Multi-Usage BOT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🟢 Online &amp; Ready\n\n"
             "Send a <b>link</b>, <b>magnet</b> or <b>path</b>.\n\n"
@@ -265,7 +270,7 @@ async def start(client, message):
         return
 
     await message.reply_text(
-        "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ <b>Myuu-Multi-Usage BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "✅ Abonnement vérifié\n\n"
         "Tu peux consulter les réglages du bot, mais seul le propriétaire "
         "peut lancer des téléchargements.",
@@ -300,7 +305,10 @@ async def help_cmd(client, message):
         "  /setname   — custom filename\n"
         "  /rename    — rename after download\n"
         "  /add       — add a dump channel\n"
-        "  /dumps     — list/remove dump channels\n\n"
+        "  /dumps     — list/remove dump channels\n"
+        "  /addcc     — add a CloudConvert API key\n"
+        "  /addfc     — add a FreeConvert API key\n"
+        "  /apikeys   — list/remove API keys\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📡 <b>Nyaa Anime Search</b>\n"
         "  /nyaa_search <query> — search Nyaa.si\n"
@@ -357,7 +365,7 @@ def _status_panel() -> str:
 
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━━━",
-        "⚡  <b>ZILONG BOT — STATUS</b>",
+        "⚡  <b>Myuu-Multi-Usage BOT — STATUS</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
@@ -674,6 +682,77 @@ async def dumps_cmd(client, message):
     await message.reply_text(_dumps_text(), reply_markup=_dumps_kb())
 
 
+def _mask_key(key: str) -> str:
+    if len(key) <= 10:
+        return "•" * len(key)
+    return f"{key[:4]}…{key[-4:]}"
+
+
+def _apikeys_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for i, key in enumerate(BOT.Options.cc_api_keys):
+        rows.append([InlineKeyboardButton(f"🗑 CC · {_mask_key(key)}", callback_data=f"apikey_remove|cc|{i}")])
+    for i, key in enumerate(BOT.Options.fc_api_keys):
+        rows.append([InlineKeyboardButton(f"🗑 FC · {_mask_key(key)}", callback_data=f"apikey_remove|fc|{i}")])
+    rows.append([InlineKeyboardButton("⏎ Back", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _apikeys_text() -> str:
+    cc_lines = "\n".join(f"· <code>{_mask_key(k)}</code>" for k in BOT.Options.cc_api_keys) or "Aucune"
+    fc_lines = "\n".join(f"· <code>{_mask_key(k)}</code>" for k in BOT.Options.fc_api_keys) or "Aucune"
+    return (
+        "🔑 <b>CLÉS API</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>☁️ CloudConvert</b>\n{cc_lines}\n\n"
+        f"<b>🆓 FreeConvert</b>\n{fc_lines}\n\n"
+        "Ajoute-en une avec :\n"
+        "<code>/addcc TA_CLE</code>\n"
+        "<code>/addfc TA_CLE</code>\n\n"
+        "Tape sur 🗑 pour en retirer une."
+    )
+
+
+@colab_bot.on_message(filters.command("addcc") & filters.private)
+async def add_cc_key_cmd(client, message):
+    if not _owner(message): return
+    await message.delete()
+    if len(message.command) != 2:
+        msg = await message.reply_text("Usage: <code>/addcc TA_CLE_CLOUDCONVERT</code>", quote=True)
+        await sleep(10); await msg.delete()
+        return
+    key = message.command[1].strip()
+    if key in BOT.Options.cc_api_keys:
+        msg = await message.reply_text("⚠️ Cette clé est déjà enregistrée.", quote=True)
+    else:
+        BOT.Options.cc_api_keys.append(key)
+        msg = await message.reply_text(f"✅ Clé CloudConvert ajoutée : <code>{_mask_key(key)}</code>", quote=True)
+    await sleep(10); await msg.delete()
+
+
+@colab_bot.on_message(filters.command("addfc") & filters.private)
+async def add_fc_key_cmd(client, message):
+    if not _owner(message): return
+    await message.delete()
+    if len(message.command) != 2:
+        msg = await message.reply_text("Usage: <code>/addfc TA_CLE_FREECONVERT</code>", quote=True)
+        await sleep(10); await msg.delete()
+        return
+    key = message.command[1].strip()
+    if key in BOT.Options.fc_api_keys:
+        msg = await message.reply_text("⚠️ Cette clé est déjà enregistrée.", quote=True)
+    else:
+        BOT.Options.fc_api_keys.append(key)
+        msg = await message.reply_text(f"✅ Clé FreeConvert ajoutée : <code>{_mask_key(key)}</code>", quote=True)
+    await sleep(10); await msg.delete()
+
+
+@colab_bot.on_message(filters.command("apikeys") & filters.private)
+async def apikeys_cmd(client, message):
+    if not _owner(message): return
+    await message.delete()
+    await message.reply_text(_apikeys_text(), reply_markup=_apikeys_kb())
+
+
 @colab_bot.on_message(filters.reply & filters.private)
 async def setFix(client, message):
     if BOT.State.prefix:
@@ -820,7 +899,7 @@ async def callbacks(client, cq):
         if await _is_subscribed(client, cq.from_user.id):
             await cq.answer("✅ Abonnement confirmé !", show_alert=True)
             await cq.message.edit_text(
-                "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "⚡ <b>Myuu-Multi-Usage BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Abonnement vérifié\n\n"
                 "Tu peux consulter les réglages du bot, mais seul le propriétaire "
                 "peut lancer des téléchargements.",
@@ -835,7 +914,7 @@ async def callbacks(client, cq):
     if data == "cb_back_start":
         await cq.answer()
         await cq.message.edit_text(
-            "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 Online",
+            "⚡ <b>Myuu-Multi-Usage BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 Online",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📖 Help",     callback_data="cb_help"),
                 InlineKeyboardButton("⚙️ Settings", callback_data="cb_settings"),
@@ -915,8 +994,8 @@ async def callbacks(client, cq):
 
     # ── Task launch ────────────────────────────
     if data in ["normal", "zip", "unzip", "undzip", "cc_convert", "cc_resize", "cc_compress"]:
-        if data.startswith("cc_") and not CC_API_KEY.strip():
-            await cq.answer("CloudConvert API key is missing in your Colab launcher.", show_alert=True)
+        if data.startswith("cc_") and not BOT.Options.cc_api_keys:
+            await cq.answer("CloudConvert API key missing — use /addcc YOUR_KEY.", show_alert=True)
             return
         BOT.Mode.type = data
         await cq.message.delete()
@@ -939,8 +1018,8 @@ async def callbacks(client, cq):
         return
 
     if data in ["seedr_cc_convert", "seedr_cc_hardsub"]:
-        if not CC_API_KEY.strip():
-            await cq.answer("CloudConvert API key is missing in your Colab launcher.", show_alert=True)
+        if not BOT.Options.cc_api_keys:
+            await cq.answer("CloudConvert API key missing — use /addcc YOUR_KEY.", show_alert=True)
             return
         if not str(SEEDR_USERNAME or "").strip() or not str(SEEDR_PASSWORD or "").strip():
             await cq.answer("Seedr credentials are missing in your Colab launcher.", show_alert=True)
@@ -981,8 +1060,8 @@ async def callbacks(client, cq):
     # Ne bloque pas sur BOT.State.task_going : peut tourner en même temps
     # qu'un autre hardsub FC, ou même pendant un leech normal en cours.
     if data == "seedr_fc_hardsub":
-        if not FC_API_KEY.strip():
-            await cq.answer("FreeConvert API key is missing in your Colab launcher.", show_alert=True)
+        if not BOT.Options.fc_api_keys:
+            await cq.answer("FreeConvert API key missing — use /addfc YOUR_KEY.", show_alert=True)
             return
         if not str(SEEDR_USERNAME or "").strip() or not str(SEEDR_PASSWORD or "").strip():
             await cq.answer("Seedr credentials are missing in your Colab launcher.", show_alert=True)
@@ -1004,9 +1083,10 @@ async def callbacks(client, cq):
     if data.startswith("fc_res|magnet|"):
         code = data.split("|", 2)[2]
         resize = FC_RESOLUTIONS.get(code)
-        magnet = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
+        session = _link_sessions.pop(cq.message.id, None)
+        magnet = (session or (BOT.SOURCE or [""]))[0].strip()
         if not magnet.startswith("magnet:?xt=urn:btih:"):
-            await cq.answer("Session expirée, renvoie le lien.", show_alert=True)
+            await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
             return
 
         await cq.answer("🆓 Hardsub FreeConvert démarré (en parallèle)")
@@ -1022,8 +1102,8 @@ async def callbacks(client, cq):
     # Concurrent lui aussi. Le sous-titre est associé via reply-to-message,
     # pour supporter plusieurs demandes en attente simultanément.
     if data == "fc_hardsub_manual":
-        if not FC_API_KEY.strip():
-            await cq.answer("FreeConvert API key is missing in your Colab launcher.", show_alert=True)
+        if not BOT.Options.fc_api_keys:
+            await cq.answer("FreeConvert API key missing — use /addfc YOUR_KEY.", show_alert=True)
             return
         url = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
         if not (url.startswith("http://") or url.startswith("https://")):
@@ -1042,9 +1122,10 @@ async def callbacks(client, cq):
     if data.startswith("fc_res|direct|"):
         code = data.split("|", 2)[2]
         resize = FC_RESOLUTIONS.get(code)
-        url = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
+        session = _link_sessions.pop(cq.message.id, None)
+        url = (session or (BOT.SOURCE or [""]))[0].strip()
         if not (url.startswith("http://") or url.startswith("https://")):
-            await cq.answer("Session expirée, renvoie le lien.", show_alert=True)
+            await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
             return
 
         name = os.path.basename(urlparse(url).path) or "video.mp4"
@@ -1236,7 +1317,7 @@ async def callbacks(client, cq):
                 [InlineKeyboardButton("⏎ Back",     callback_data="back")],
             ]))
     elif data == "cc":
-        cc_ready = "Ready" if CC_API_KEY.strip() else "Missing"
+        cc_ready = "Ready" if BOT.Options.cc_api_keys else "Missing"
         await cq.message.edit_text(
             "☁️ <b>CLOUDCONVERT SETTINGS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"API Key  <code>{cc_ready}</code>\n"
@@ -1356,6 +1437,18 @@ async def callbacks(client, cq):
         else:
             await cq.answer("Déjà retiré.")
         await cq.message.edit_text(_dumps_text(), reply_markup=_dumps_kb())
+    elif data == "apikeys":
+        await cq.message.edit_text(_apikeys_text(), reply_markup=_apikeys_kb())
+    elif data.startswith("apikey_remove|"):
+        _, kind, idx_str = data.split("|")
+        idx = int(idx_str)
+        target_list = BOT.Options.cc_api_keys if kind == "cc" else BOT.Options.fc_api_keys
+        if 0 <= idx < len(target_list):
+            target_list.pop(idx)
+            await cq.answer("🗑 Retirée")
+        else:
+            await cq.answer("Déjà retirée.")
+        await cq.message.edit_text(_apikeys_text(), reply_markup=_apikeys_kb())
     elif data in ["media","document"]:
         BOT.Options.stream_upload = data == "media"
         BOT.Setting.stream_upload = "Media" if data == "media" else "Document"
@@ -1463,6 +1556,6 @@ except Exception as e:
     logging.warning(f"Nyaa tracker not loaded: {e}")
 
 
-logging.info("⚡ Zilong started.")
+logging.info("⚡ Myuu started.")
 get_event_loop().create_task(_startup_welcome())
 colab_bot.run()
