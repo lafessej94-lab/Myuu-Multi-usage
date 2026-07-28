@@ -14,7 +14,7 @@ from PIL import Image
 from pyrogram.errors import BadRequest
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 
-from colab_leecher import CC_API_KEY, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot
+from colab_leecher import SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.utility.variables import BOT, MSG, BotTimes, Messages, Paths
 
@@ -395,40 +395,48 @@ async def status_bar(down_msg, speed, percentage, eta, done, left, engine, statu
         logging.warning(f"Status bar error: {exc}")
 
 
-async def send_settings(client, message, msg_id, command: bool):
+async def send_settings(client, message, msg_id, command: bool, readonly: bool = False):
     up_mode = "document" if BOT.Options.stream_upload else "media"
     up_toggle = "📄 -> Media" if not BOT.Options.stream_upload else "🎞 -> Document"
     pr = "—" if BOT.Setting.prefix == "" else BOT.Setting.prefix
     su = "—" if BOT.Setting.suffix == "" else BOT.Setting.suffix
     thmb = "✅ Définie" if BOT.Setting.thumbnail else "❌ Non définie"
-    cc_ready = "✅ Prête" if CC_API_KEY else "❌ Manquante"
+    cc_ready = f"✅ {len(BOT.Options.cc_api_keys)} clé(s)" if BOT.Options.cc_api_keys else "❌ Aucune"
+    fc_ready = f"✅ {len(BOT.Options.fc_api_keys)} clé(s)" if BOT.Options.fc_api_keys else "❌ Aucune"
     seedr_ready = "✅ Prêt" if str(SEEDR_USERNAME or "").strip() and str(SEEDR_PASSWORD or "").strip() else "❌ Manquant"
     n_dumps = len(BOT.Options.dump_ids)
     dump_status = f"✅ {n_dumps} configuré(s)" if n_dumps else "❌ Aucun"
     autofwd_toggle = "📨 Transfert : ON" if BOT.Options.auto_forward else "📨 Transfert : OFF"
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(up_toggle, callback_data=up_mode),
-         InlineKeyboardButton("🎥 Vidéo", callback_data="video")],
-        [InlineKeyboardButton("☁️ CloudConvert", callback_data="cc"),
-         InlineKeyboardButton("🖼 Miniature", callback_data="thumb")],
-        [InlineKeyboardButton(autofwd_toggle, callback_data="autofwd"),
-         InlineKeyboardButton("📦 Dumps", callback_data="dumps")],
-        [InlineKeyboardButton("✏️ Légende", callback_data="caption")],
-        [InlineKeyboardButton("⬅️ Préfixe", callback_data="set-prefix"),
-         InlineKeyboardButton("Suffixe ➡️", callback_data="set-suffix")],
-        [InlineKeyboardButton("✖ Fermer", callback_data="close")],
-    ])
+    if readonly:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✖ Fermer", callback_data="close")]])
+    else:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(up_toggle, callback_data=up_mode),
+             InlineKeyboardButton("🎥 Vidéo", callback_data="video")],
+            [InlineKeyboardButton("☁️ CloudConvert", callback_data="cc"),
+             InlineKeyboardButton("🖼 Miniature", callback_data="thumb")],
+            [InlineKeyboardButton(autofwd_toggle, callback_data="autofwd"),
+             InlineKeyboardButton("📦 Dumps", callback_data="dumps")],
+            [InlineKeyboardButton("🔑 Clés API", callback_data="apikeys")],
+            [InlineKeyboardButton("✏️ Légende", callback_data="caption")],
+            [InlineKeyboardButton("⬅️ Préfixe", callback_data="set-prefix"),
+             InlineKeyboardButton("Suffixe ➡️", callback_data="set-suffix")],
+            [InlineKeyboardButton("✖ Fermer", callback_data="close")],
+        ])
 
     text = (
-        "⚙️ <b>Réglages du bot</b>\n\n"
+        "⚙️ <b>Réglages du bot</b>"
+        + (" <i>(lecture seule)</i>" if readonly else "")
+        + "\n\n"
         "<b>🎬 Vidéo</b>\n"
         f"Conversion       <code>{BOT.Setting.convert_video}</code>\n"
         f"Découpage        <code>{BOT.Setting.split_video}</code>\n\n"
-        "<b>☁️ CloudConvert</b>\n"
+        "<b>☁️ Conversion</b>\n"
         f"Mode · Preset    <code>{cc_mode_label(BOT.Options.cc_engine_mode)} · {quality_label(BOT.Options.cc_quality_profile)}</code>\n"
         f"Resize · Cible   <code>{resize_label(BOT.Options.cc_resize)} · {BOT.Setting.cc_target_size}</code>\n"
-        f"Clé API          {cc_ready}\n\n"
+        f"CloudConvert     {cc_ready}\n"
+        f"FreeConvert      {fc_ready}\n\n"
         "<b>🔌 Intégrations</b>\n"
         f"Seedr            {seedr_ready}\n"
         f"Transfert auto   <code>{BOT.Setting.auto_forward}</code>\n"
