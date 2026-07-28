@@ -37,6 +37,8 @@ class BOT:
         zip_pswd = ""
         unzip_pswd = ""
         dump_ids = []  # liste de chat_id (int) — canaux dump, gérés via /add et /dumps
+        cc_api_keys = []  # liste de clés CloudConvert, gérées via /addcc et /apikeys
+        fc_api_keys = []  # liste de clés FreeConvert, gérées via /addfc et /apikeys
 
     class Mode:
         mode = "leech"
