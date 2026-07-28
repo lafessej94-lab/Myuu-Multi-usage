@@ -7,7 +7,7 @@ import pathlib
 import uuid
 from asyncio import sleep
 from time import time
-from colab_leecher import OWNER, CC_API_KEY, FC_API_KEY, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot
+from colab_leecher import OWNER, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot
 from natsort import natsorted
 from datetime import datetime
 from os import makedirs, path as ospath
@@ -145,7 +145,7 @@ async def Leech(folder_path: str, remove: bool, convert_videos: bool = True, sta
 
 
 async def CloudConvert_Handler(folder_path: str, remove: bool):
-    if not CC_API_KEY.strip():
+    if not BOT.Options.cc_api_keys:
         await cancelTask("CloudConvert API key is missing in your Colab launcher.")
         return
 
@@ -218,7 +218,7 @@ async def CloudConvert_Handler(folder_path: str, remove: bool):
             if BOT.Mode.type == "cc_convert":
                 await _cc_update("Convert", 0.0, "Preparing CloudConvert job")
                 await convert_file(
-                    CC_API_KEY,
+                    ",".join(BOT.Options.cc_api_keys),
                     video_path,
                     out_dir,
                     output_ext=BOT.Options.video_out,
@@ -231,7 +231,7 @@ async def CloudConvert_Handler(folder_path: str, remove: bool):
             elif BOT.Mode.type == "cc_resize":
                 await _cc_update("Resize", 0.0, f"Target {resize_label(BOT.Options.cc_resize)}")
                 await resize_file(
-                    CC_API_KEY,
+                    ",".join(BOT.Options.cc_api_keys),
                     video_path,
                     out_dir,
                     height=BOT.Options.cc_resize,
@@ -245,7 +245,7 @@ async def CloudConvert_Handler(folder_path: str, remove: bool):
             else:
                 await _cc_update("Compress", 0.0, f"Target {BOT.Setting.cc_target_size}")
                 await compress_file(
-                    CC_API_KEY,
+                    ",".join(BOT.Options.cc_api_keys),
                     video_path,
                     out_dir,
                     target_mb=BOT.Options.cc_target_size_mb,
@@ -450,7 +450,7 @@ async def Seedr_CC_Convert_Handler(magnet: str) -> None:
     if not _seedr_ready():
         await cancelTask("Seedr credentials are missing in your Colab launcher.")
         return
-    if not CC_API_KEY.strip():
+    if not BOT.Options.cc_api_keys:
         await cancelTask("CloudConvert API key is missing in your Colab launcher.")
         return
 
@@ -487,7 +487,7 @@ async def Seedr_CC_Convert_Handler(magnet: str) -> None:
 
             await _seedr_status("Seedr + CloudConvert Convert", "Queue", chunk_start, "Submitting CloudConvert job", name)
             await convert_remote_url(
-                CC_API_KEY,
+                ",".join(BOT.Options.cc_api_keys),
                 video["url"],
                 name,
                 Paths.temp_cc_path,
@@ -512,7 +512,7 @@ async def Seedr_CC_Hardsub_Handler(magnet: str) -> None:
     if not _seedr_ready():
         await cancelTask("Seedr credentials are missing in your Colab launcher.")
         return
-    if not CC_API_KEY.strip():
+    if not BOT.Options.cc_api_keys:
         await cancelTask("CloudConvert API key is missing in your Colab launcher.")
         return
 
@@ -565,7 +565,7 @@ async def Seedr_CC_Hardsub_Handler(magnet: str) -> None:
 
             await _seedr_status("Seedr + CloudConvert Hardsub", "Queue", base_start + 10.0, "Submitting CloudConvert hardsub job", name)
             await hardsub_remote_url(
-                CC_API_KEY,
+                ",".join(BOT.Options.cc_api_keys),
                 video_url,
                 name,
                 subtitle_path,
@@ -601,7 +601,7 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
         except Exception:
             pass
         return
-    if not FC_API_KEY.strip():
+    if not BOT.Options.fc_api_keys:
         try:
             await status_msg.edit_text("❌ FreeConvert API key is missing in your Colab launcher.")
         except Exception:
@@ -674,7 +674,7 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
                         pass
 
                 await fc_hardsub_remote_url(
-                    FC_API_KEY,
+                    ",".join(BOT.Options.fc_api_keys),
                     video_url,
                     name,
                     subtitle_path,
@@ -716,7 +716,7 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
     FC_HARDSUB_CONCURRENCY à la fois) : dossier de travail et message de
     statut dédiés à ce job.
     """
-    if not FC_API_KEY.strip():
+    if not BOT.Options.fc_api_keys:
         try:
             await status_msg.edit_text("❌ FreeConvert API key is missing in your Colab launcher.")
         except Exception:
@@ -758,7 +758,7 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
                     pass
 
             await fc_hardsub_remote_url(
-                FC_API_KEY,
+                ",".join(BOT.Options.fc_api_keys),
                 video_url,
                 name,
                 subtitle_path,
