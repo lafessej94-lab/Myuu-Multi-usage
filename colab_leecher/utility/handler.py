@@ -25,6 +25,7 @@ from colab_leecher.freeconvert import (
     hardsub_remote_url as fc_hardsub_remote_url,
     quality_label as fc_quality_label,
 )
+from colab_leecher.local_convert import convert_resolution
 from colab_leecher.downlader.aria2 import aria2_Download
 from colab_leecher.seedr import SeedrError, _del_folder, fetch_urls_via_seedr
 from colab_leecher.uploader.telegram import upload_file
@@ -787,6 +788,64 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
                     os.remove(subtitle_path)
                 except Exception:
                     pass
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+# ═════════════════════════════════════════════════════════════
+# Video Converter local (ffmpeg sur le CPU de Colab)
+#
+# Contrairement à FreeConvert (qui tourne sur leurs serveurs), l'encodage ici
+# consomme le CPU partagé de Colab — on limite donc la concurrence à 2 jobs
+# max (au lieu de 3 pour FreeConvert), sinon les encodages se marchent
+# dessus et ralentissent tout le monde au lieu d'aider.
+# ═════════════════════════════════════════════════════════════
+
+LOCAL_CONVERT_CONCURRENCY = 2
+_local_convert_semaphore = asyncio.Semaphore(LOCAL_CONVERT_CONCURRENCY)
+
+
+async def Local_Video_Convert_Handler(source_message, height: int, status_msg) -> None:
+    """
+    Télécharge une vidéo envoyée directement au bot (message Telegram), la
+    convertit en local à la résolution demandée via ffmpeg, puis l'upload.
+    Job isolé (dossier + message de statut dédiés), comme les jobs FreeConvert.
+    """
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_local_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Video Converter", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Video Converter", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(
+                file_name=os.path.join(job_dir, "source_input")
+            )
+
+            async def _progress_cb(pct: float, detail: str) -> None:
+                overall = 10.0 + (max(0.0, min(pct, 100.0)) * 0.80)
+                await _fc_job_status(status_msg, "Video Converter", "Encodage", overall, detail)
+
+            base = os.path.splitext(os.path.basename(input_path))[0]
+            output_path = os.path.join(job_dir, f"{base}.{height}p.mp4")
+
+            await _fc_job_status(status_msg, "Video Converter", "Encodage", 10.0, f"ffmpeg -> {height}p")
+            await convert_resolution(input_path, output_path, height, progress_cb=_progress_cb)
+
+            await _fc_job_status(status_msg, "Video Converter", "Upload", 95.0, "Uploading to Telegram")
+            await upload_file(output_path, os.path.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Video Converter failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
 
