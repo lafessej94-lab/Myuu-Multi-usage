@@ -93,3 +93,55 @@ async def convert_resolution(
     if progress_cb:
         await progress_cb(100.0, "Conversion terminée")
     return output_path
+
+
+async def merge_audio_video(
+    video_path: str,
+    audio_path: str,
+    output_path: str,
+    progress_cb: ProgressCB = None,
+) -> str:
+    """
+    Fusionne une vidéo et un fichier audio séparé. La piste vidéo n'est PAS
+    ré-encodée (copy — rapide, aucune perte de qualité), seule la piste
+    audio est (ré)encodée en AAC. Le résultat dure aussi longtemps que la
+    plus courte des deux pistes (-shortest).
+    """
+    duration = await _probe_duration(video_path)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+    assert proc.stdout is not None
+    while True:
+        line_bytes = await proc.stdout.readline()
+        if not line_bytes:
+            break
+        line = line_bytes.decode("utf-8", errors="replace")
+        t = _parse_ffmpeg_time(line)
+        if t is not None and duration > 0 and progress_cb:
+            pct = min(100.0, (t / duration) * 100.0)
+            await progress_cb(pct, f"Fusion {int(t)}s / {int(duration)}s")
+
+    code = await proc.wait()
+    if code != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg merge failed (code {code})")
+
+    if progress_cb:
+        await progress_cb(100.0, "Fusion terminée")
+    return output_path
