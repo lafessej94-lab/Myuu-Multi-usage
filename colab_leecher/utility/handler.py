@@ -25,7 +25,7 @@ from colab_leecher.freeconvert import (
     hardsub_remote_url as fc_hardsub_remote_url,
     quality_label as fc_quality_label,
 )
-from colab_leecher.local_convert import convert_resolution
+from colab_leecher.local_convert import convert_resolution, merge_audio_video
 from colab_leecher.downlader.aria2 import aria2_Download
 from colab_leecher.seedr import SeedrError, _del_folder, fetch_urls_via_seedr
 from colab_leecher.uploader.telegram import upload_file
@@ -846,6 +846,54 @@ async def Local_Video_Convert_Handler(source_message, height: int, status_msg) -
             except Exception:
                 pass
         finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Merge_Handler(video_message, audio_path: str, status_msg) -> None:
+    """
+    Fusionne une vidéo envoyée au bot avec un fichier audio séparé (envoyé
+    ensuite en reply). Traitement local ffmpeg, même sémaphore CPU que le
+    Video Converter (pas de course entre les deux pour le CPU Colab).
+    """
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_merge_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Merge Audio+Vidéo", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Merge Audio+Vidéo", "Download", 0.0, "Téléchargement de la vidéo...")
+            video_path = await video_message.download(file_name=os.path.join(job_dir, "source_video"))
+
+            async def _progress_cb(pct: float, detail: str) -> None:
+                overall = 20.0 + (max(0.0, min(pct, 100.0)) * 0.70)
+                await _fc_job_status(status_msg, "Merge Audio+Vidéo", "Fusion", overall, detail)
+
+            base = os.path.splitext(os.path.basename(video_path))[0]
+            output_path = os.path.join(job_dir, f"{base}.merged.mp4")
+
+            await _fc_job_status(status_msg, "Merge Audio+Vidéo", "Fusion", 15.0, "ffmpeg -> fusion audio/vidéo")
+            await merge_audio_video(video_path, audio_path, output_path, progress_cb=_progress_cb)
+
+            await _fc_job_status(status_msg, "Merge Audio+Vidéo", "Upload", 95.0, "Uploading to Telegram")
+            await upload_file(output_path, os.path.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Merge failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except Exception:
+                    pass
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
 
