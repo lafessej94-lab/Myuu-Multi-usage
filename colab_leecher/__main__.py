@@ -17,6 +17,7 @@ from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.utility.handler import (
     Direct_FC_Hardsub_Handler,
+    Local_Merge_Handler,
     Local_Video_Convert_Handler,
     Seedr_CC_Convert_Handler,
     Seedr_CC_Hardsub_Handler,
@@ -71,12 +72,17 @@ _pending_fc_subtitle: dict[int, dict] = {}
 # vidéo d'origine une fois qu'un outil (ex: Video Converter) est choisi.
 _pending_video: dict[int, dict] = {}
 
+# _pending_merge : message_id (du prompt "envoie l'audio") -> {"source_message": Message}
+_pending_merge: dict[int, dict] = {}
+
 LOCAL_RESOLUTIONS: dict[str, int] = {"480": 480, "720": 720, "1080": 1080}
+_AUDIO_EXTS = (".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus")
 
 
 def _video_tools_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎞 Video Converter", callback_data="vidtool_convert")],
+        [InlineKeyboardButton("🔊 Merge Audio+Vidéo", callback_data="vidtool_merge")],
     ])
 
 
@@ -200,7 +206,7 @@ async def _startup_welcome() -> None:
             display = first.replace("<", "&lt;").replace(">", "&gt;")
             text = (
                 f"👋 <b>Welcome back, {display}</b>\n"
-                "❤️ <b>Myuu-Multi-usages is online</b>\n\n"
+                "⚡ <b>Zilong is online</b>\n\n"
                 "Send a link, magnet, or path to begin.\n"
                 "Use /start for the full menu and /status for the live dashboard."
             )
@@ -261,7 +267,7 @@ async def start(client, message):
 
     if _owner(message):
         await message.reply_text(
-            "❤️ <b>Myuu-Multi-usages BOT</b>\n"
+            "⚡ <b>ZILONG BOT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🟢 Online &amp; Ready\n\n"
             "Send a <b>link</b>, <b>magnet</b> or <b>path</b>.\n\n"
@@ -293,7 +299,7 @@ async def start(client, message):
         return
 
     await message.reply_text(
-        "❤️ <b>Myuu-Multi-usages BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "✅ Abonnement vérifié\n\n"
         "Tu peux consulter les réglages du bot, mais seul le propriétaire "
         "peut lancer des téléchargements.",
@@ -388,7 +394,7 @@ def _status_panel() -> str:
 
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━━━",
-        "❤️  <b>Myuu-Multi-usages BOT — STATUS</b>",
+        "⚡  <b>ZILONG BOT — STATUS</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
@@ -922,7 +928,7 @@ async def callbacks(client, cq):
         if await _is_subscribed(client, cq.from_user.id):
             await cq.answer("✅ Abonnement confirmé !", show_alert=True)
             await cq.message.edit_text(
-                "❤️ <b>Myuu-Multi-usage BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Abonnement vérifié\n\n"
                 "Tu peux consulter les réglages du bot, mais seul le propriétaire "
                 "peut lancer des téléchargements.",
@@ -937,7 +943,7 @@ async def callbacks(client, cq):
     if data == "cb_back_start":
         await cq.answer()
         await cq.message.edit_text(
-            "❤️ <b>Myuu-Multi-usage BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 Online",
+            "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 Online",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📖 Help",     callback_data="cb_help"),
                 InlineKeyboardButton("⚙️ Settings", callback_data="cb_settings"),
@@ -1205,7 +1211,24 @@ async def callbacks(client, cq):
 
     if data == "vidtool_cancel":
         _pending_video.pop(cq.message.id, None)
+        _pending_merge.pop(cq.message.id, None)
         await cq.message.edit_text("❌ Annulé.")
+        return
+
+    if data == "vidtool_merge":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        prompt = await cq.message.edit_text(
+            f"🔊 <code>{pending['name']}</code>\n\n"
+            "📎 <b>Réponds à ce message</b> (reply) avec le fichier audio "
+            "à fusionner avec cette vidéo.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
+            ]]),
+        )
+        _pending_merge[prompt.id] = {"source_message": pending["source_message"]}
         return
 
     # ════════════════════════════════════════════
@@ -1559,12 +1582,52 @@ async def handle_photo(client, message):
 _VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m2ts", ".flv", ".wmv")
 
 
-@colab_bot.on_message((filters.video | filters.document) & filters.private, group=-1)
+@colab_bot.on_message(
+    (filters.video | filters.audio | filters.voice | filters.document) & filters.private,
+    group=-1,
+)
 async def handle_incoming_video(client, message):
     if not _owner(message):
         message.continue_propagation()
         return
 
+    # ── Cas 1 : c'est l'audio attendu pour un merge en cours ──────────────
+    reply_id = message.reply_to_message_id
+    pending_merge = _pending_merge.get(reply_id) if reply_id else None
+    if pending_merge:
+        is_audio = False
+        audio_name = "audio"
+        if message.audio:
+            is_audio = True
+            audio_name = message.audio.file_name or "audio.mp3"
+        elif message.voice:
+            is_audio = True
+            audio_name = "voice.ogg"
+        elif message.document:
+            mime = (message.document.mime_type or "")
+            name = (message.document.file_name or "")
+            if mime.startswith("audio/") or name.lower().endswith(_AUDIO_EXTS):
+                is_audio = True
+                audio_name = name or "audio"
+
+        if is_audio:
+            _pending_merge.pop(reply_id, None)
+            status_msg = await message.reply_text("⏳ <i>Audio reçu, démarrage de la fusion...</i>")
+            await message.delete()
+
+            os.makedirs(Paths.WORK_PATH, exist_ok=True)
+            ext = os.path.splitext(audio_name)[1] or ".mp3"
+            audio_path = os.path.join(Paths.WORK_PATH, f"merge_audio_{uuid4().hex[:8]}{ext}")
+            await message.download(file_name=audio_path)
+
+            get_event_loop().create_task(
+                Local_Merge_Handler(pending_merge["source_message"], audio_path, status_msg)
+            )
+            return
+        # Reply présent mais c'est pas un fichier audio -> on laisse tomber
+        # ce cas précis et on continue l'analyse normale ci-dessous.
+
+    # ── Cas 2 : c'est une vidéo -> affiche le menu d'outils ────────────────
     is_video = False
     display_name = "video.mp4"
     if message.video:
@@ -1652,6 +1715,6 @@ except Exception as e:
     logging.warning(f"Nyaa tracker not loaded: {e}")
 
 
-logging.info("❤️Myuu-Multi-usage started.")
+logging.info("⚡ Zilong started.")
 get_event_loop().create_task(_startup_welcome())
 colab_bot.run()
