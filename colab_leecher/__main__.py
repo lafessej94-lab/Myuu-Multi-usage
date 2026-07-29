@@ -206,7 +206,7 @@ async def _startup_welcome() -> None:
             display = first.replace("<", "&lt;").replace(">", "&gt;")
             text = (
                 f"👋 <b>Welcome back, {display}</b>\n"
-                "⚡ <b>Zilong is online</b>\n\n"
+                "❤️ <b>MYUU is online</b>\n\n"
                 "Send a link, magnet, or path to begin.\n"
                 "Use /start for the full menu and /status for the live dashboard."
             )
@@ -267,7 +267,7 @@ async def start(client, message):
 
     if _owner(message):
         await message.reply_text(
-            "⚡ <b>ZILONG BOT</b>\n"
+            "❤️ <b>MYUU BOT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🟢 Online &amp; Ready\n\n"
             "Send a <b>link</b>, <b>magnet</b> or <b>path</b>.\n\n"
@@ -299,7 +299,7 @@ async def start(client, message):
         return
 
     await message.reply_text(
-        "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "❤️ <b>MYUU BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "✅ Abonnement vérifié\n\n"
         "Tu peux consulter les réglages du bot, mais seul le propriétaire "
         "peut lancer des téléchargements.",
@@ -394,7 +394,7 @@ def _status_panel() -> str:
 
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━━━",
-        "⚡  <b>ZILONG BOT — STATUS</b>",
+        "❤️  <b>MYUU BOT — STATUS</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
@@ -928,7 +928,7 @@ async def callbacks(client, cq):
         if await _is_subscribed(client, cq.from_user.id):
             await cq.answer("✅ Abonnement confirmé !", show_alert=True)
             await cq.message.edit_text(
-                "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "❤️ <b>MYUU BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Abonnement vérifié\n\n"
                 "Tu peux consulter les réglages du bot, mais seul le propriétaire "
                 "peut lancer des téléchargements.",
@@ -943,7 +943,7 @@ async def callbacks(client, cq):
     if data == "cb_back_start":
         await cq.answer()
         await cq.message.edit_text(
-            "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 Online",
+            "❤️ <b>MYUU BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 Online",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📖 Help",     callback_data="cb_help"),
                 InlineKeyboardButton("⚙️ Settings", callback_data="cb_settings"),
@@ -1715,6 +1715,6 @@ except Exception as e:
     logging.warning(f"Nyaa tracker not loaded: {e}")
 
 
-logging.info("⚡ Zilong started.")
+logging.info("❤️ MYUU-MULTI-USAGES started.")
 get_event_loop().create_task(_startup_welcome())
 colab_bot.run()
