@@ -17,6 +17,7 @@ from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.utility.handler import (
     Direct_FC_Hardsub_Handler,
+    Local_Video_Convert_Handler,
     Seedr_CC_Convert_Handler,
     Seedr_CC_Hardsub_Handler,
     Seedr_FC_Hardsub_Handler,
@@ -64,6 +65,28 @@ BOT.Options.fc_api_keys = [k.strip() for k in str(FC_API_KEY or "").split(",") i
 #   avec le bon fichier pour lever l'ambiguïté.
 _link_sessions: dict[int, list[str]] = {}
 _pending_fc_subtitle: dict[int, dict] = {}
+
+# _pending_video : message_id (du menu affiché après réception d'une vidéo)
+# -> {"source_message": Message, "name": str}. Nécessaire pour retrouver la
+# vidéo d'origine une fois qu'un outil (ex: Video Converter) est choisi.
+_pending_video: dict[int, dict] = {}
+
+LOCAL_RESOLUTIONS: dict[str, int] = {"480": 480, "720": 720, "1080": 1080}
+
+
+def _video_tools_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎞 Video Converter", callback_data="vidtool_convert")],
+    ])
+
+
+def _video_res_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("480p", callback_data="vidres|480"),
+         InlineKeyboardButton("720p", callback_data="vidres|720")],
+        [InlineKeyboardButton("1080p", callback_data="vidres|1080")],
+        [InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel")],
+    ])
 
 
 def _pick_stream_source_file(root: str) -> str | None:
@@ -177,7 +200,7 @@ async def _startup_welcome() -> None:
             display = first.replace("<", "&lt;").replace(">", "&gt;")
             text = (
                 f"👋 <b>Welcome back, {display}</b>\n"
-                "⚡ <b>Myuu-Multi-Usage is online</b>\n\n"
+                "❤️ <b>Myuu-Multi-usages is online</b>\n\n"
                 "Send a link, magnet, or path to begin.\n"
                 "Use /start for the full menu and /status for the live dashboard."
             )
@@ -238,7 +261,7 @@ async def start(client, message):
 
     if _owner(message):
         await message.reply_text(
-            "⚡ <b>Myuu-Multi-Usage BOT</b>\n"
+            "❤️ <b>Myuu-Multi-usages BOT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🟢 Online &amp; Ready\n\n"
             "Send a <b>link</b>, <b>magnet</b> or <b>path</b>.\n\n"
@@ -270,7 +293,7 @@ async def start(client, message):
         return
 
     await message.reply_text(
-        "⚡ <b>Myuu-Multi-Usage BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "❤️ <b>Myuu-Multi-usages BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "✅ Abonnement vérifié\n\n"
         "Tu peux consulter les réglages du bot, mais seul le propriétaire "
         "peut lancer des téléchargements.",
@@ -365,7 +388,7 @@ def _status_panel() -> str:
 
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━━━",
-        "⚡  <b>Myuu-Multi-Usage BOT — STATUS</b>",
+        "❤️  <b>Myuu-Multi-usages BOT — STATUS</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
@@ -899,7 +922,7 @@ async def callbacks(client, cq):
         if await _is_subscribed(client, cq.from_user.id):
             await cq.answer("✅ Abonnement confirmé !", show_alert=True)
             await cq.message.edit_text(
-                "⚡ <b>Myuu-Multi-Usage BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "❤️ <b>Myuu-Multi-usage BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Abonnement vérifié\n\n"
                 "Tu peux consulter les réglages du bot, mais seul le propriétaire "
                 "peut lancer des téléchargements.",
@@ -914,7 +937,7 @@ async def callbacks(client, cq):
     if data == "cb_back_start":
         await cq.answer()
         await cq.message.edit_text(
-            "⚡ <b>Myuu-Multi-Usage BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 Online",
+            "❤️ <b>Myuu-Multi-usage BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 Online",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📖 Help",     callback_data="cb_help"),
                 InlineKeyboardButton("⚙️ Settings", callback_data="cb_settings"),
@@ -1147,6 +1170,42 @@ async def callbacks(client, cq):
     if data == "fc_hardsub_cancel":
         _pending_fc_subtitle.pop(cq.message.id, None)
         await cq.message.edit_text("❌ Hardsub annulé.")
+        return
+
+    # ── Video Converter local (ffmpeg) ─────────────────────────
+    if data == "vidtool_convert":
+        pending = _pending_video.get(cq.message.id)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        await cq.message.edit_text(
+            f"📹 <code>{pending['name']}</code>\n\n<b>Choisis la résolution de sortie :</b>",
+            reply_markup=_video_res_kb(),
+        )
+        return
+
+    if data.startswith("vidres|"):
+        code = data.split("|", 1)[1]
+        height = LOCAL_RESOLUTIONS.get(code)
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending or not height:
+            await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
+            return
+
+        await cq.answer(f"🎞 Conversion {height}p démarrée")
+        await cq.message.delete()
+        job_status_msg = await colab_bot.send_message(
+            chat_id=OWNER,
+            text=f"⏳ <i>Starting local video conversion ({height}p)...</i>",
+        )
+        get_event_loop().create_task(
+            Local_Video_Convert_Handler(pending["source_message"], height, job_status_msg)
+        )
+        return
+
+    if data == "vidtool_cancel":
+        _pending_video.pop(cq.message.id, None)
+        await cq.message.edit_text("❌ Annulé.")
         return
 
     # ════════════════════════════════════════════
@@ -1494,6 +1553,43 @@ async def handle_photo(client, message):
 
 
 # ══════════════════════════════════════════════
+#  Vidéo envoyée directement → menu d'outils locaux
+# ══════════════════════════════════════════════
+
+_VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m2ts", ".flv", ".wmv")
+
+
+@colab_bot.on_message((filters.video | filters.document) & filters.private, group=-1)
+async def handle_incoming_video(client, message):
+    if not _owner(message):
+        message.continue_propagation()
+        return
+
+    is_video = False
+    display_name = "video.mp4"
+    if message.video:
+        is_video = True
+        display_name = message.video.file_name or "video.mp4"
+    elif message.document:
+        mime = (message.document.mime_type or "")
+        name = (message.document.file_name or "")
+        if mime.startswith("video/") or name.lower().endswith(_VIDEO_EXTS):
+            is_video = True
+            display_name = name or "video.mp4"
+
+    if not is_video:
+        message.continue_propagation()
+        return
+
+    prompt = await message.reply_text(
+        f"📹 <code>{display_name}</code>\n\n<b>Choisis une action :</b>",
+        reply_markup=_video_tools_kb(),
+        quote=True,
+    )
+    _pending_video[prompt.id] = {"source_message": message, "name": display_name}
+
+
+# ══════════════════════════════════════════════
 #  Document → sous-titre pour FC Hardsub manuel
 # ══════════════════════════════════════════════
 
@@ -1556,6 +1652,6 @@ except Exception as e:
     logging.warning(f"Nyaa tracker not loaded: {e}")
 
 
-logging.info("⚡ Myuu started.")
+logging.info("❤️Myuu-Multi-usage started.")
 get_event_loop().create_task(_startup_welcome())
 colab_bot.run()
