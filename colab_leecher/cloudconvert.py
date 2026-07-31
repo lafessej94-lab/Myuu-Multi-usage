@@ -38,6 +38,45 @@ QUALITY_PROFILES = {
     "best": QualityProfile("best", "Best", 21, "slow"),
 }
 
+# --- Résolutions de sortie (miroir de ce qui existe déjà sur FreeConvert) ---
+RESOLUTIONS = {
+    "480p": 480,
+    "720p": 720,
+    "1080p": 1080,
+    "original": 0,
+}
+
+# --- Presets de vitesse d'encodage exposés au bot (mêmes noms ffmpeg) ---
+ENCODE_SPEEDS = {
+    "superfast": "superfast",
+    "veryfast": "veryfast",
+    "fast": "fast",
+}
+DEFAULT_ENCODE_SPEED = "fast"
+
+
+def normalize_resolution(resolution: str | None) -> str:
+    resolution = (resolution or "original").strip().lower()
+    return resolution if resolution in RESOLUTIONS else "original"
+
+
+def resolution_height(resolution: str | None) -> int:
+    return RESOLUTIONS[normalize_resolution(resolution)]
+
+
+def resolution_label(resolution: str | None) -> str:
+    key = normalize_resolution(resolution)
+    return "Original" if key == "original" else key
+
+
+def normalize_encode_speed(speed: str | None) -> str:
+    speed = (speed or DEFAULT_ENCODE_SPEED).strip().lower()
+    return speed if speed in ENCODE_SPEEDS else DEFAULT_ENCODE_SPEED
+
+
+def encode_speed_label(speed: str | None) -> str:
+    return normalize_encode_speed(speed).capitalize()
+
 
 def normalize_cc_mode(mode: str | None) -> str:
     mode = (mode or "balanced").strip().lower()
@@ -73,8 +112,14 @@ def resize_label(height: int) -> str:
     return "Original" if int(height or 0) <= 0 else f"{int(height)}p"
 
 
-def profile_options(profile: str | None, mode: str | None) -> tuple[int, str]:
+def profile_options(profile: str | None, mode: str | None, speed: str | None = None) -> tuple[int, str]:
+    """Retourne (crf, preset). Si `speed` est fourni explicitement (choix utilisateur
+    superfast/veryfast/fast), il prend le pas sur le preset dérivé de quality_profile/cc_mode —
+    seul le CRF du profil de qualité reste utilisé."""
     cfg = QUALITY_PROFILES[normalize_quality_profile(profile)]
+    if speed:
+        crf = max(cfg.crf, 24) if normalize_cc_mode(mode) == "economy" else cfg.crf
+        return crf, normalize_encode_speed(speed)
     if normalize_cc_mode(mode) == "economy":
         return max(cfg.crf, 24), "veryfast"
     return cfg.crf, cfg.preset
@@ -440,15 +485,27 @@ async def _create_hardsub_job(
     preset: str,
 ) -> dict:
     v_safe = _arg_safe(video_filename)
-    s_safe = _arg_safe(subtitle_filename)
     o_safe = _arg_safe(output_filename)
-    with open(subtitle_path, "rb") as fh:
-        subtitle_b64 = base64.b64encode(fh.read()).decode("ascii")
+
+    # On applique notre style uniforme (subtitles.py) au fichier de sous-titres
+    # AVANT de l'envoyer à CloudConvert — même logique que sur FreeConvert.
+    # Ça règle au passage le bug de fontsize (PlayResX/Y forcés à 640x360).
+    from subtitles import apply_hardsub_style
+
+    styled_path = subtitle_path + ".styled.ass"
+    apply_hardsub_style(subtitle_path, styled_path)
+    s_safe = _arg_safe(os.path.splitext(subtitle_filename)[0] + ".ass")
+
+    try:
+        with open(styled_path, "rb") as fh:
+            subtitle_b64 = base64.b64encode(fh.read()).decode("ascii")
+    finally:
+        if os.path.exists(styled_path):
+            os.remove(styled_path)
+
     sub_path_in_cc = f"/input/import-sub/{s_safe}"
     escaped = sub_path_in_cc.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
-    ext = os.path.splitext(subtitle_filename)[1].lower()
-    filter_name = "ass" if ext in {".ass", ".ssa"} else "subtitles"
-    vf = f"{filter_name}='{escaped}'"
+    vf = f"ass='{escaped}'"
 
     ffmpeg_args = (
         f"-i /input/import-video/{v_safe} "
@@ -506,13 +563,14 @@ async def convert_file(
     output_ext: str = "mp4",
     cc_mode: str = "balanced",
     quality_profile: str = "balanced",
+    encode_speed: str | None = None,
     upload_cb: ProgressCB = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
 ) -> str:
     keys = parse_api_keys(api_keys)
     api_key, _ = await pick_best_key(keys)
-    crf, preset = profile_options(quality_profile, cc_mode)
+    crf, preset = profile_options(quality_profile, cc_mode, encode_speed)
     base = os.path.splitext(os.path.basename(source_path))[0]
     output_name = f"{base}.{output_ext.lstrip('.') or 'mp4'}"
     output_path = os.path.join(dest_dir, output_name)
@@ -539,19 +597,24 @@ async def resize_file(
     source_path: str,
     dest_dir: str,
     *,
-    height: int,
+    height: int = 0,
+    resolution: str | None = None,
     output_ext: str = "mp4",
     cc_mode: str = "balanced",
     quality_profile: str = "balanced",
+    encode_speed: str | None = None,
     upload_cb: ProgressCB = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
 ) -> str:
+    """`resolution` accepte "480p"/"720p"/"1080p"/"original" et prend le pas sur
+    `height` si fourni — sinon on retombe sur `height` (compat rétro)."""
     keys = parse_api_keys(api_keys)
     api_key, _ = await pick_best_key(keys)
-    crf, preset = profile_options(quality_profile, cc_mode)
+    crf, preset = profile_options(quality_profile, cc_mode, encode_speed)
+    target_height = resolution_height(resolution) if resolution else int(height or 0)
     base = os.path.splitext(os.path.basename(source_path))[0]
-    suffix = "orig" if int(height or 0) <= 0 else f"{int(height)}p"
+    suffix = "orig" if target_height <= 0 else f"{target_height}p"
     output_name = f"{base}.{suffix}.{output_ext.lstrip('.') or 'mp4'}"
     output_path = os.path.join(dest_dir, output_name)
     return await _run_job(
@@ -565,7 +628,7 @@ async def resize_file(
             output_filename=output_name,
             crf=crf,
             preset=preset,
-            scale_height=max(int(height or 0), 0),
+            scale_height=max(target_height, 0),
         ),
         upload_cb=upload_cb,
         process_cb=process_cb,
@@ -619,17 +682,20 @@ async def convert_remote_url(
     *,
     output_ext: str = "mp4",
     scale_height: int = 0,
+    resolution: str | None = None,
     cc_mode: str = "balanced",
     quality_profile: str = "balanced",
+    encode_speed: str | None = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
 ) -> str:
     keys = parse_api_keys(api_keys)
     api_key, _ = await pick_best_key(keys)
-    crf, preset = profile_options(quality_profile, cc_mode)
+    crf, preset = profile_options(quality_profile, cc_mode, encode_speed)
+    target_height = resolution_height(resolution) if resolution else int(scale_height or 0)
     base = os.path.splitext(os.path.basename(source_name))[0]
-    if int(scale_height or 0) > 0:
-        output_name = f"{base}.{int(scale_height)}p.{output_ext.lstrip('.') or 'mp4'}"
+    if target_height > 0:
+        output_name = f"{base}.{target_height}p.{output_ext.lstrip('.') or 'mp4'}"
     else:
         output_name = f"{base}.{output_ext.lstrip('.') or 'mp4'}"
     output_path = os.path.join(dest_dir, output_name)
@@ -640,7 +706,7 @@ async def convert_remote_url(
         output_filename=output_name,
         crf=crf,
         preset=preset,
-        scale_height=max(int(scale_height or 0), 0),
+        scale_height=max(target_height, 0),
     )
     job = await _wait_for_job(api_key, job.get("id", "?"), process_cb)
     url = _export_url(job)
@@ -658,12 +724,13 @@ async def hardsub_remote_url(
     *,
     cc_mode: str = "balanced",
     quality_profile: str = "balanced",
+    encode_speed: str | None = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
 ) -> str:
     keys = parse_api_keys(api_keys)
     api_key, _ = await pick_best_key(keys)
-    crf, preset = profile_options(quality_profile, cc_mode)
+    crf, preset = profile_options(quality_profile, cc_mode, encode_speed)
     base = os.path.splitext(os.path.basename(source_name))[0]
     output_name = f"{base}.VOSTFR.mp4"
     output_path = os.path.join(dest_dir, output_name)
