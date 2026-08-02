@@ -16,7 +16,6 @@ from colab_leecher.cloudconvert import (
     compress_file,
     convert_file,
     convert_remote_url,
-    encode_speed_label,
     hardsub_remote_url,
     quality_label,
     resize_file,
@@ -201,7 +200,6 @@ async def CloudConvert_Handler(folder_path: str, remove: bool):
                 f"<b>Progress</b>  <code>{overall:.1f}%</code>\n"
                 f"<b>Mode</b>  <code>{cc_mode_label(BOT.Options.cc_engine_mode)}</code>\n"
                 f"<b>Preset</b>  <code>{quality_label(BOT.Options.cc_quality_profile)}</code>\n"
-                f"<b>Speed</b>  <code>{encode_speed_label(getattr(BOT.Options, 'cc_encode_speed', None))}</code>\n"
                 f"<b>Detail</b>  <code>{detail}</code>"
             )
             try:
@@ -227,7 +225,6 @@ async def CloudConvert_Handler(folder_path: str, remove: bool):
                     output_ext=BOT.Options.video_out,
                     cc_mode=BOT.Options.cc_engine_mode,
                     quality_profile=BOT.Options.cc_quality_profile,
-                    encode_speed=getattr(BOT.Options, "cc_encode_speed", None),
                     upload_cb=upload_cb,
                     process_cb=process_cb,
                     download_cb=download_cb,
@@ -242,7 +239,6 @@ async def CloudConvert_Handler(folder_path: str, remove: bool):
                     output_ext=BOT.Options.video_out,
                     cc_mode=BOT.Options.cc_engine_mode,
                     quality_profile=BOT.Options.cc_quality_profile,
-                    encode_speed=getattr(BOT.Options, "cc_encode_speed", None),
                     upload_cb=upload_cb,
                     process_cb=process_cb,
                     download_cb=download_cb,
@@ -329,7 +325,6 @@ async def _seedr_status(kind: str, stage: str, pct: float, detail: str, filename
         f"<b>Progress</b>  <code>{pct:.1f}%</code>\n"
         f"<b>Mode</b>  <code>{cc_mode_label(BOT.Options.cc_engine_mode)}</code>\n"
         f"<b>Preset</b>  <code>{quality_label(BOT.Options.cc_quality_profile)}</code>\n"
-        f"<b>Speed</b>  <code>{encode_speed_label(getattr(BOT.Options, 'cc_encode_speed', None))}</code>\n"
         f"<b>Detail</b>  <code>{detail}</code>"
     )
     try:
@@ -501,7 +496,6 @@ async def Seedr_CC_Convert_Handler(magnet: str) -> None:
                 scale_height=0,
                 cc_mode=BOT.Options.cc_engine_mode,
                 quality_profile=BOT.Options.cc_quality_profile,
-                encode_speed=getattr(BOT.Options, "cc_encode_speed", None),
                 process_cb=_process_cb,
                 download_cb=_download_cb,
             )
@@ -515,7 +509,7 @@ async def Seedr_CC_Convert_Handler(magnet: str) -> None:
             await _del_folder(seedr_user, seedr_pwd, folder_id)
 
 
-async def Seedr_CC_Hardsub_Handler(magnet: str) -> None:
+async def Seedr_CC_Hardsub_Handler(magnet: str, resolution: str | None = None, encode_speed: str | None = None) -> None:
     if not _seedr_ready():
         await cancelTask("Seedr credentials are missing in your Colab launcher.")
         return
@@ -577,9 +571,10 @@ async def Seedr_CC_Hardsub_Handler(magnet: str) -> None:
                 name,
                 subtitle_path,
                 Paths.temp_cc_path,
+                resolution=resolution,
                 cc_mode=BOT.Options.cc_engine_mode,
                 quality_profile=BOT.Options.cc_quality_profile,
-                encode_speed=getattr(BOT.Options, "cc_encode_speed", None),
+                encode_speed=encode_speed,
                 process_cb=_process_cb,
                 download_cb=_download_cb,
             )
