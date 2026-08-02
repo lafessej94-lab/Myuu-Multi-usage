@@ -257,6 +257,41 @@ def _fc_quality_kb(flow: str) -> InlineKeyboardMarkup:
     ])
 
 
+# ── CC Hardsub : résolution puis vitesse d'encodage, choisies avant de lancer ──
+# _cc_hardsub_session : message_id -> {"magnet": str, "resolution": str|None}
+_cc_hardsub_session: dict[int, dict] = {}
+
+CC_RESOLUTION_LABELS: dict[str, str] = {
+    "original": "🎬 Qualité d'origine",
+    "480p": "480p",
+    "720p": "720p",
+    "1080p": "1080p",
+}
+
+CC_SPEED_LABELS: dict[str, str] = {
+    "superfast": "⚡ Superfast",
+    "veryfast": "🚀 Veryfast",
+    "fast": "🏃 Fast",
+}
+
+
+def _cc_res_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(CC_RESOLUTION_LABELS["original"], callback_data="cc_res|original")],
+        [InlineKeyboardButton("480p", callback_data="cc_res|480p"),
+         InlineKeyboardButton("720p", callback_data="cc_res|720p")],
+        [InlineKeyboardButton("1080p", callback_data="cc_res|1080p")],
+    ])
+
+
+def _cc_speed_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(CC_SPEED_LABELS["superfast"], callback_data="cc_speed|superfast")],
+        [InlineKeyboardButton(CC_SPEED_LABELS["veryfast"], callback_data="cc_speed|veryfast")],
+        [InlineKeyboardButton(CC_SPEED_LABELS["fast"], callback_data="cc_speed|fast")],
+    ])
+
+
 # ══════════════════════════════════════════════
 #  /start
 # ══════════════════════════════════════════════
@@ -1046,7 +1081,7 @@ async def callbacks(client, cq):
         TaskInfo.reset()
         return
 
-    if data in ["seedr_cc_convert", "seedr_cc_hardsub"]:
+    if data == "seedr_cc_convert":
         if not BOT.Options.cc_api_keys:
             await cq.answer("CloudConvert API key missing — use /addcc YOUR_KEY.", show_alert=True)
             return
@@ -1076,13 +1111,86 @@ async def callbacks(client, cq):
         TaskInfo.reset()
         TaskInfo.set(phase="process", engine="Seedr+CloudConvert", started_at=datetime.now().timestamp())
         BOT.Mode.type = data
-        if data == "seedr_cc_convert":
-            BOT.TASK = get_event_loop().create_task(Seedr_CC_Convert_Handler(magnet))
-        else:
-            BOT.TASK = get_event_loop().create_task(Seedr_CC_Hardsub_Handler(magnet))
+        BOT.TASK = get_event_loop().create_task(Seedr_CC_Convert_Handler(magnet))
         await BOT.TASK
         BOT.State.task_going = False
         TaskInfo.reset()
+        return
+
+    if data == "seedr_cc_hardsub":
+        if not BOT.Options.cc_api_keys:
+            await cq.answer("CloudConvert API key missing — use /addcc YOUR_KEY.", show_alert=True)
+            return
+        if not str(SEEDR_USERNAME or "").strip() or not str(SEEDR_PASSWORD or "").strip():
+            await cq.answer("Seedr credentials are missing in your Colab launcher.", show_alert=True)
+            return
+        magnet = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
+        if not magnet.startswith("magnet:?xt=urn:btih:"):
+            await cq.answer("Seedr mode currently needs a magnet link.", show_alert=True)
+            return
+        if BOT.State.task_going:
+            await cq.answer("A task is already running — /cancel first.", show_alert=True)
+            return
+
+        await cq.message.edit_text(
+            "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Choisis la résolution de sortie :",
+            reply_markup=_cc_res_kb(),
+        )
+        _cc_hardsub_session[cq.message.id] = {"magnet": magnet}
+        return
+
+    if data.startswith("cc_res|"):
+        resolution = data.split("|", 1)[1]
+        session = _cc_hardsub_session.get(cq.message.id)
+        if not session:
+            await cq.answer("Session expirée, renvoie le lien.", show_alert=True)
+            return
+        session["resolution"] = resolution
+        await cq.message.edit_text(
+            "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Résolution : <code>{CC_RESOLUTION_LABELS.get(resolution, resolution)}</code>\n\n"
+            "Choisis la vitesse d'encodage :\n"
+            "<i>Plus rapide = moins de compression, fichier un peu plus lourd.</i>",
+            reply_markup=_cc_speed_kb(),
+        )
+        return
+
+    if data.startswith("cc_speed|"):
+        speed = data.split("|", 1)[1]
+        session = _cc_hardsub_session.pop(cq.message.id, None)
+        if not session:
+            await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
+            return
+        if BOT.State.task_going:
+            await cq.answer("A task is already running — /cancel first.", show_alert=True)
+            return
+
+        magnet = session["magnet"]
+        resolution = session.get("resolution")
+
+        await cq.message.delete()
+        MSG.status_msg = await colab_bot.send_message(
+            chat_id=OWNER,
+            text="⏳ <i>Starting Seedr + CloudConvert hardsub job...</i>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⛔ Cancel", callback_data="cancel"),
+                InlineKeyboardButton("📊 Status", callback_data="status_refresh"),
+            ]]),
+        )
+        BOT.State.task_going = True
+        BOT.State.started = False
+        BotTimes.start_time = datetime.now()
+        TaskInfo.reset()
+        TaskInfo.set(phase="process", engine="Seedr+CloudConvert", started_at=datetime.now().timestamp())
+        BOT.Mode.type = "seedr_cc_hardsub"
+        BOT.TASK = get_event_loop().create_task(
+            Seedr_CC_Hardsub_Handler(magnet, resolution=resolution, encode_speed=speed)
+        )
+        await BOT.TASK
+        BOT.State.task_going = False
+        TaskInfo.reset()
+        return
         return
 
     # ── FreeConvert Hardsub (magnet) — CONCURRENT, jusqu'à 3 en parallèle ──
