@@ -17,6 +17,7 @@ class BOT:
         cc_quality_profile = "Balanced"
         cc_resize = "720p"
         cc_target_size = "100 MB"
+        cc_rip_type = "Auto"
         prefix = ""
         suffix = ""
         thumbnail = False
@@ -33,6 +34,7 @@ class BOT:
         cc_quality_profile = "balanced"
         cc_resize = 720
         cc_target_size_mb = 100
+        cc_rip_type = ""  # "" = Auto (pas de tag) · BDRip / WEBRip / WEB-DL / HDRip / DVDRip
         custom_name = ""
         zip_pswd = ""
         unzip_pswd = ""
