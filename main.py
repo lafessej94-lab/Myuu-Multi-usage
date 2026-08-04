@@ -38,9 +38,9 @@ _Thread.start()
 if os.path.exists("/content/sample_data"):
     shutil.rmtree("/content/sample_data")
 
-# ⚠️ Fork perso (avec le patch thumbnail HD) — remplace vicMenma/zilong par lafessej94-lab/zilong
+# ⚠️ Repo Myuu-Multi-usage (plus le fork zilong, abandonné)
 clone_result = subprocess.run(
-    "git clone https://github.com/lafessej94-lab/zilong.git /content/zilong",
+    "git clone https://github.com/lafessej94-lab/Myuu-Multi-usage.git /content/zilong",
     shell=True,
 )
 install_result = subprocess.run("apt update -qq && apt install -y -qq ffmpeg aria2", shell=True)
