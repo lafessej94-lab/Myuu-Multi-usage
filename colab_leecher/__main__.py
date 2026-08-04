@@ -14,7 +14,7 @@ from pyrogram import filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot, OWNER
-from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label, rip_label, RIP_TYPES
+from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.utility.handler import (
     Direct_FC_Hardsub_Handler,
     Local_Merge_Handler,
@@ -1514,15 +1514,13 @@ async def callbacks(client, cq):
             f"Mode     <code>{cc_mode_label(BOT.Options.cc_engine_mode)}</code>\n"
             f"Preset   <code>{quality_label(BOT.Options.cc_quality_profile)}</code>\n"
             f"Resize   <code>{resize_label(BOT.Options.cc_resize)}</code>\n"
-            f"Target   <code>{BOT.Setting.cc_target_size}</code>\n"
-            f"Rip      <code>{rip_label(BOT.Options.cc_rip_type)}</code>\n\n"
+            f"Target   <code>{BOT.Setting.cc_target_size}</code>\n\n"
             "These settings are used by CC Convert, CC Resize, and CC Compress.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚖️ CC Mode", callback_data="cc-mode"),
                  InlineKeyboardButton("🎚 Preset", callback_data="cc-quality")],
                 [InlineKeyboardButton("📐 Resize", callback_data="cc-resize"),
                  InlineKeyboardButton("🗜 Target", callback_data="cc-target")],
-                [InlineKeyboardButton("🎞 Rip Type", callback_data="cc-rip")],
                 [InlineKeyboardButton("⏮ Back", callback_data="back")],
             ]))
     elif data == "caption":
@@ -1603,14 +1601,6 @@ async def callbacks(client, cq):
         BOT.Options.cc_target_size_mb = nxt
         BOT.Setting.cc_target_size = f"{nxt} MB"
         await cq.answer(BOT.Setting.cc_target_size, show_alert=True)
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data == "cc-rip":
-        cycle = RIP_TYPES
-        cur = str(BOT.Options.cc_rip_type or "")
-        nxt = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else ""
-        BOT.Options.cc_rip_type = nxt
-        BOT.Setting.cc_rip_type = rip_label(nxt)
-        await cq.answer(BOT.Setting.cc_rip_type, show_alert=True)
         await send_settings(client, cq.message, cq.message.id, False)
     elif data == "autofwd":
         if not BOT.Options.dump_ids:
