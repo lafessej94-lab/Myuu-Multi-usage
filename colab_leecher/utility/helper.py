@@ -15,7 +15,7 @@ from pyrogram.errors import BadRequest
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 
 from colab_leecher import SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot
-from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label, rip_label
+from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.utility.variables import BOT, MSG, BotTimes, Messages, Paths
 
 
@@ -31,7 +31,7 @@ def _speed_emoji(speed_str: str) -> str:
         try:
             value = float(speed_str.split()[0])
             if value >= 50:
-                return "⚡"
+                return "⚡️"
             if value >= 10:
                 return "🔥"
         except Exception:
@@ -379,7 +379,7 @@ async def status_bar(down_msg, speed, percentage, eta, done, left, engine, statu
     text = (
         f"\n<code>[{bar}]</code>\n"
         f"<code>{done} / {left}</code>   <b>{pct_f:.0f}%</b>\n\n"
-        f"⚡ <code>{speed}</code>   ⏳ <code>{eta}</code>\n"
+        f"⚡️ <code>{speed}</code>   ⏳ <code>{eta}</code>\n"
         f"🕐 <code>{elapsed}</code>   ⚙️ <code>{engine}</code>\n"
     )
     try:
@@ -409,7 +409,7 @@ async def send_settings(client, message, msg_id, command: bool, readonly: bool =
     autofwd_toggle = "📨 Transfert : ON" if BOT.Options.auto_forward else "📨 Transfert : OFF"
 
     if readonly:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✖ Fermer", callback_data="close")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Fermer", callback_data="close")]])
     else:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(up_toggle, callback_data=up_mode),
@@ -422,7 +422,7 @@ async def send_settings(client, message, msg_id, command: bool, readonly: bool =
             [InlineKeyboardButton("✏️ Légende", callback_data="caption")],
             [InlineKeyboardButton("⬅️ Préfixe", callback_data="set-prefix"),
              InlineKeyboardButton("Suffixe ➡️", callback_data="set-suffix")],
-            [InlineKeyboardButton("✖ Fermer", callback_data="close")],
+            [InlineKeyboardButton("✖️ Fermer", callback_data="close")],
         ])
 
     text = (
@@ -435,7 +435,6 @@ async def send_settings(client, message, msg_id, command: bool, readonly: bool =
         "<b>☁️ Conversion</b>\n"
         f"Mode · Preset    <code>{cc_mode_label(BOT.Options.cc_engine_mode)} · {quality_label(BOT.Options.cc_quality_profile)}</code>\n"
         f"Resize · Cible   <code>{resize_label(BOT.Options.cc_resize)} · {BOT.Setting.cc_target_size}</code>\n"
-        f"Rip              <code>{rip_label(BOT.Options.cc_rip_type)}</code>\n"
         f"CloudConvert     {cc_ready}\n"
         f"FreeConvert      {fc_ready}\n\n"
         "<b>🔌 Intégrations</b>\n"
