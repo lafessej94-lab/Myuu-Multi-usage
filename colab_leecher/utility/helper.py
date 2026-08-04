@@ -15,7 +15,7 @@ from pyrogram.errors import BadRequest
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 
 from colab_leecher import SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot
-from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
+from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label, rip_label
 from colab_leecher.utility.variables import BOT, MSG, BotTimes, Messages, Paths
 
 
@@ -435,6 +435,7 @@ async def send_settings(client, message, msg_id, command: bool, readonly: bool =
         "<b>☁️ Conversion</b>\n"
         f"Mode · Preset    <code>{cc_mode_label(BOT.Options.cc_engine_mode)} · {quality_label(BOT.Options.cc_quality_profile)}</code>\n"
         f"Resize · Cible   <code>{resize_label(BOT.Options.cc_resize)} · {BOT.Setting.cc_target_size}</code>\n"
+        f"Rip              <code>{rip_label(BOT.Options.cc_rip_type)}</code>\n"
         f"CloudConvert     {cc_ready}\n"
         f"FreeConvert      {fc_ready}\n\n"
         "<b>🔌 Intégrations</b>\n"
