@@ -75,6 +75,20 @@ def resize_label(height: int) -> str:
     return "Original" if int(height or 0) <= 0 else f"{int(height)}p"
 
 
+RIP_TYPES = ["", "BDRip", "WEBRip", "WEB-DL", "HDRip", "DVDRip"]
+
+
+def rip_label(rip_type: str | None) -> str:
+    rip_type = (rip_type or "").strip()
+    return rip_type if rip_type else "Auto"
+
+
+def _rip_tag(rip_type: str | None) -> str:
+    """Renvoie '.BDRip' (avec le point) ou '' si Auto — à insérer dans le nom de fichier final."""
+    rip_type = (rip_type or "").strip()
+    return f".{rip_type}" if rip_type else ""
+
+
 def profile_options(profile: str | None, mode: str | None) -> tuple[int, str]:
     cfg = QUALITY_PROFILES[normalize_quality_profile(profile)]
     if normalize_cc_mode(mode) == "economy":
@@ -520,6 +534,7 @@ async def convert_file(
     output_ext: str = "mp4",
     cc_mode: str = "balanced",
     quality_profile: str = "balanced",
+    rip_type: str = "",
     upload_cb: ProgressCB = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
@@ -528,7 +543,7 @@ async def convert_file(
     api_key, _ = await pick_best_key(keys)
     crf, preset = profile_options(quality_profile, cc_mode)
     base = os.path.splitext(os.path.basename(source_path))[0]
-    output_name = f"{base}.{output_ext.lstrip('.') or 'mp4'}"
+    output_name = f"{base}{_rip_tag(rip_type)}.{output_ext.lstrip('.') or 'mp4'}"
     output_path = os.path.join(dest_dir, output_name)
     return await _run_job(
         api_key,
@@ -557,6 +572,7 @@ async def resize_file(
     output_ext: str = "mp4",
     cc_mode: str = "balanced",
     quality_profile: str = "balanced",
+    rip_type: str = "",
     upload_cb: ProgressCB = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
@@ -566,7 +582,7 @@ async def resize_file(
     crf, preset = profile_options(quality_profile, cc_mode)
     base = os.path.splitext(os.path.basename(source_path))[0]
     suffix = "orig" if int(height or 0) <= 0 else f"{int(height)}p"
-    output_name = f"{base}.{suffix}.{output_ext.lstrip('.') or 'mp4'}"
+    output_name = f"{base}{_rip_tag(rip_type)}.{suffix}.{output_ext.lstrip('.') or 'mp4'}"
     output_path = os.path.join(dest_dir, output_name)
     return await _run_job(
         api_key,
@@ -594,6 +610,7 @@ async def compress_file(
     *,
     target_mb: float,
     cc_mode: str = "balanced",
+    rip_type: str = "",
     upload_cb: ProgressCB = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
@@ -601,7 +618,7 @@ async def compress_file(
     keys = parse_api_keys(api_keys)
     api_key, _ = await pick_best_key(keys)
     base = os.path.splitext(os.path.basename(source_path))[0]
-    output_name = f"{base}.compressed.mp4"
+    output_name = f"{base}{_rip_tag(rip_type)}.compressed.mp4"
     output_path = os.path.join(dest_dir, output_name)
     source_mb = os.path.getsize(source_path) / (1024 * 1024)
     duration_s = media_duration_seconds(source_path)
@@ -635,6 +652,7 @@ async def convert_remote_url(
     scale_height: int = 0,
     cc_mode: str = "balanced",
     quality_profile: str = "balanced",
+    rip_type: str = "",
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
 ) -> str:
@@ -642,10 +660,11 @@ async def convert_remote_url(
     api_key, _ = await pick_best_key(keys)
     crf, preset = profile_options(quality_profile, cc_mode)
     base = os.path.splitext(os.path.basename(source_name))[0]
+    tag = _rip_tag(rip_type)
     if int(scale_height or 0) > 0:
-        output_name = f"{base}.{int(scale_height)}p.{output_ext.lstrip('.') or 'mp4'}"
+        output_name = f"{base}{tag}.{int(scale_height)}p.{output_ext.lstrip('.') or 'mp4'}"
     else:
-        output_name = f"{base}.{output_ext.lstrip('.') or 'mp4'}"
+        output_name = f"{base}{tag}.{output_ext.lstrip('.') or 'mp4'}"
     output_path = os.path.join(dest_dir, output_name)
     job = await _create_convert_job(
         api_key,
@@ -672,6 +691,7 @@ async def hardsub_remote_url(
     *,
     cc_mode: str = "balanced",
     quality_profile: str = "balanced",
+    rip_type: str = "",
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
 ) -> str:
@@ -679,7 +699,7 @@ async def hardsub_remote_url(
     api_key, _ = await pick_best_key(keys)
     crf, preset = profile_options(quality_profile, cc_mode)
     base = os.path.splitext(os.path.basename(source_name))[0]
-    output_name = f"{base}.VOSTFR.mp4"
+    output_name = f"{base}{_rip_tag(rip_type)}.VOSTFR.mp4"
     output_path = os.path.join(dest_dir, output_name)
     job = await _create_hardsub_job(
         api_key,
