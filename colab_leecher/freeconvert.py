@@ -12,7 +12,6 @@ from typing import Awaitable, Callable, Optional
 import aiohttp
 
 from colab_leecher.subtitle_style import DEFAULT_HARDSUB_STYLE, AssStyle, apply_hardsub_style
-from colab_leecher.cloudconvert import _rip_tag
 
 log = logging.getLogger(__name__)
 
@@ -336,7 +335,6 @@ async def hardsub_remote_url(
     quality_profile: str = "balanced",
     style: AssStyle = DEFAULT_HARDSUB_STYLE,
     resize: Optional[tuple[int, int]] = None,
-    rip_type: str = "",
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
     url_cb: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -361,7 +359,7 @@ async def hardsub_remote_url(
 
     base = os.path.splitext(os.path.basename(source_name))[0]
     input_format = os.path.splitext(source_name)[1].lstrip(".").lower() or "mkv"
-    output_name = f"{base}{_rip_tag(rip_type)}.VOSTFR.mp4"
+    output_name = f"{base}.VOSTFR.mp4"
     output_path = os.path.join(dest_dir, output_name)
 
     # Pré-stylage : force le rendu, indépendamment de ce que contenait le fichier source
