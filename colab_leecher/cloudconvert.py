@@ -75,6 +75,30 @@ def resize_label(height: int) -> str:
     return "Original" if int(height or 0) <= 0 else f"{int(height)}p"
 
 
+def _resolution_to_height(resolution: str | None) -> int:
+    """Convertit un label venant du menu CC Hardsub ('original'/'480p'/'720p'/'1080p') en hauteur pixel."""
+    resolution = (resolution or "").strip().lower()
+    if not resolution or resolution == "original":
+        return 0
+    try:
+        return int(resolution.rstrip("p"))
+    except ValueError:
+        return 0
+
+
+_VALID_X264_PRESETS = {
+    "ultrafast", "superfast", "veryfast", "faster", "fast",
+    "medium", "slow", "slower", "veryslow",
+}
+
+
+def _encode_speed_to_preset(encode_speed: str | None, fallback: str) -> str:
+    """Convertit le choix du menu vitesse ('superfast'/'veryfast'/'fast') en preset x264,
+    sinon retombe sur le preset venant du profil qualité."""
+    encode_speed = (encode_speed or "").strip().lower()
+    return encode_speed if encode_speed in _VALID_X264_PRESETS else fallback
+
+
 def profile_options(profile: str | None, mode: str | None) -> tuple[int, str]:
     cfg = QUALITY_PROFILES[normalize_quality_profile(profile)]
     if normalize_cc_mode(mode) == "economy":
@@ -440,6 +464,7 @@ async def _create_hardsub_job(
     output_filename: str,
     crf: int,
     preset: str,
+    scale_height: int = 0,
     style: AssStyle = DEFAULT_HARDSUB_STYLE,
 ) -> dict:
     v_safe = _arg_safe(video_filename)
@@ -462,7 +487,11 @@ async def _create_hardsub_job(
     escaped = sub_path_in_cc.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
     ext = os.path.splitext(subtitle_filename)[1].lower()
     filter_name = "ass" if ext in {".ass", ".ssa"} else "subtitles"
+    # Le hardsub (burn des subs) doit passer AVANT le scale dans la chaîne -vf,
+    # sinon le style ASS (contour/police) est calculé sur la mauvaise résolution.
     vf = f"{filter_name}='{escaped}'"
+    if scale_height > 0:
+        vf += f",scale=-2:{scale_height}"
 
     ffmpeg_args = (
         f"-i /input/import-video/{v_safe} "
@@ -672,14 +701,19 @@ async def hardsub_remote_url(
     *,
     cc_mode: str = "balanced",
     quality_profile: str = "balanced",
+    resolution: str | None = None,
+    encode_speed: str | None = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
 ) -> str:
     keys = parse_api_keys(api_keys)
     api_key, _ = await pick_best_key(keys)
-    crf, preset = profile_options(quality_profile, cc_mode)
+    crf, base_preset = profile_options(quality_profile, cc_mode)
+    preset = _encode_speed_to_preset(encode_speed, base_preset)
+    scale_height = _resolution_to_height(resolution)
     base = os.path.splitext(os.path.basename(source_name))[0]
-    output_name = f"{base}.VOSTFR.mp4"
+    tag = f".{scale_height}p" if scale_height > 0 else ""
+    output_name = f"{base}{tag}.VOSTFR.mp4"
     output_path = os.path.join(dest_dir, output_name)
     job = await _create_hardsub_job(
         api_key,
@@ -690,6 +724,7 @@ async def hardsub_remote_url(
         output_filename=output_name,
         crf=crf,
         preset=preset,
+        scale_height=scale_height,
     )
     job = await _wait_for_job(api_key, job.get("id", "?"), process_cb)
     url = _export_url(job)
