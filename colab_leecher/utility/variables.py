@@ -39,6 +39,7 @@ class BOT:
         dump_ids = []  # liste de chat_id (int) — canaux dump, gérés via /add et /dumps
         cc_api_keys = []  # liste de clés CloudConvert, gérées via /addcc et /apikeys
         fc_api_keys = []  # liste de clés FreeConvert, gérées via /addfc et /apikeys
+        allowed_users = []  # liste de user_id (int) autorisés à utiliser le bot, gérée via /adduser et /users
 
     class Mode:
         mode = "leech"
