@@ -29,8 +29,14 @@ from colab_leecher.local_convert import convert_resolution, merge_audio_video
 from colab_leecher.local_video_tools import (
     burn_subtitles,
     compress_video,
+    extract_audio,
     extract_random_thumbnail,
+    mute_video,
     mux_subtitles,
+    probe_media_info_text,
+    sample_clip,
+    screenshot_at,
+    split_video,
     take_screenshots,
     trim_video,
 )
@@ -1101,6 +1107,223 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
                     pass
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_ManualShot_Handler(source_message, timestamp: str, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_shot_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Manual Shot", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Manual Shot", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            await _fc_job_status(status_msg, "Manual Shot", "Extraction", 60.0, f"ffmpeg -> {timestamp}")
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            shot_path = ospath.join(job_dir, f"{base}.shot.jpg")
+            await screenshot_at(input_path, shot_path, timestamp)
+
+            await _fc_job_status(status_msg, "Manual Shot", "Upload", 95.0, "Uploading to Telegram")
+            await colab_bot.send_photo(chat_id=OWNER, photo=shot_path, caption=f"🖼 {timestamp} — {ospath.basename(input_path)}")
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Manual Shot failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Split_Handler(source_message, parts: int, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_split_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Split", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Split", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            await _fc_job_status(status_msg, "Split", "Découpe", 40.0, f"ffmpeg -> {parts} parties")
+            files = await split_video(input_path, ospath.join(job_dir, "parts"), parts=parts)
+
+            for i, fp in enumerate(files, start=1):
+                await _fc_job_status(status_msg, "Split", "Upload", 60.0 + (i / len(files)) * 35.0, f"Partie {i}/{len(files)}")
+                await upload_file(fp, ospath.basename(fp), is_last=(i == len(files)), status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Split failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Sample_Handler(source_message, duration: int, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_sample_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Sample", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Sample", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            ext = ospath.splitext(ospath.basename(input_path))[1] or ".mp4"
+            output_path = ospath.join(job_dir, f"{base}.sample{ext}")
+
+            await _fc_job_status(status_msg, "Sample", "Extraction", 50.0, f"ffmpeg -> {duration}s")
+            await sample_clip(input_path, output_path, duration=duration)
+
+            await _fc_job_status(status_msg, "Sample", "Upload", 90.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Sample failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Rename_Handler(source_message, new_name: str, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_rename_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Rename", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Rename", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            await _fc_job_status(status_msg, "Rename", "Upload", 60.0, f"-> {new_name}")
+            await upload_file(input_path, new_name, is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Rename failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_ToAudio_Handler(source_message, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_toaudio_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "To Audio", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "To Audio", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            output_path = ospath.join(job_dir, f"{base}.mp3")
+
+            await _fc_job_status(status_msg, "To Audio", "Extraction", 50.0, "ffmpeg -> mp3")
+            await extract_audio(input_path, output_path)
+
+            await _fc_job_status(status_msg, "To Audio", "Upload", 90.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>To Audio failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Mute_Handler(source_message, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_mute_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Mute", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Mute", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            ext = ospath.splitext(ospath.basename(input_path))[1] or ".mp4"
+            output_path = ospath.join(job_dir, f"{base}.mute{ext}")
+
+            await _fc_job_status(status_msg, "Mute", "Traitement", 50.0, "ffmpeg -> retrait audio")
+            await mute_video(input_path, output_path)
+
+            await _fc_job_status(status_msg, "Mute", "Upload", 90.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Mute failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Metadata_Handler(source_message, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_meta_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+    try:
+        await status_msg.edit_text("⏳ <i>Téléchargement depuis Telegram...</i>")
+        input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+        text = await probe_media_info_text(input_path)
+        await status_msg.edit_text(text)
+    except Exception as exc:
+        try:
+            await status_msg.edit_text(f"❌ <b>Metadata failed</b>\n\n<code>{exc}</code>")
+        except Exception:
+            pass
+    finally:
+        if ospath.exists(job_dir):
+            shutil.rmtree(job_dir, ignore_errors=True)
+
 
 
 async def Zip_Handler(down_path: str, is_split: bool, remove: bool):
