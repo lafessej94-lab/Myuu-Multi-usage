@@ -1101,6 +1101,9 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
                     pass
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Zip_Handler(down_path: str, is_split: bool, remove: bool):
     Messages.status_head = f"🗜 <b>COMPRESSING</b>\n\n<code>{Messages.download_name}</code>\n"
     TaskInfo.set(phase="process", engine="zip", filename=Messages.download_name)
     try:
