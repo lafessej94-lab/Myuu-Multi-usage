@@ -17,7 +17,12 @@ from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.utility.handler import (
     Direct_FC_Hardsub_Handler,
+    Local_Compress_Handler,
     Local_Merge_Handler,
+    Local_Screenshots_Handler,
+    Local_Subs_Handler,
+    Local_Thumb_Handler,
+    Local_Trim_Handler,
     Local_Video_Convert_Handler,
     Seedr_CC_Convert_Handler,
     Seedr_CC_Hardsub_Handler,
@@ -75,14 +80,30 @@ _pending_video: dict[int, dict] = {}
 # _pending_merge : message_id (du prompt "envoie l'audio") -> {"source_message": Message}
 _pending_merge: dict[int, dict] = {}
 
+# _pending_trim : message_id (du prompt "envoie start/end") -> {"source_message": Message}
+_pending_trim: dict[int, dict] = {}
+
+# _pending_subs : message_id (du prompt "envoie le sous-titre") ->
+# {"source_message": Message, "burn": bool}. Séparé de _pending_fc_subtitle
+# (qui gère le hardsub FreeConvert sur lien distant) car ici c'est du
+# ffmpeg local sur une vidéo déjà envoyée au bot.
+_pending_subs: dict[int, dict] = {}
+
 LOCAL_RESOLUTIONS: dict[str, int] = {"480": 480, "720": 720, "1080": 1080}
 _AUDIO_EXTS = (".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus")
 
 
 def _video_tools_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎞 Video Converter", callback_data="vidtool_convert")],
-        [InlineKeyboardButton("🔊 Merge Audio+Vidéo", callback_data="vidtool_merge")],
+        [InlineKeyboardButton("🎞 Video Converter", callback_data="vidtool_convert"),
+         InlineKeyboardButton("🔊 Merge Audio+Vidéo", callback_data="vidtool_merge")],
+        [InlineKeyboardButton("🖼 Thumb (aléatoire)", callback_data="vidtool_thumb"),
+         InlineKeyboardButton("📸 Screenshots", callback_data="vidtool_shots")],
+        [InlineKeyboardButton("✂️ Trim", callback_data="vidtool_trim"),
+         InlineKeyboardButton("🗜 Compress", callback_data="vidtool_compress")],
+        [InlineKeyboardButton("💬 Mux subs", callback_data="vidtool_muxsubs"),
+         InlineKeyboardButton("🔥 Burn subs", callback_data="vidtool_burnsubs")],
+        [InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel")],
     ])
 
 
@@ -827,6 +848,25 @@ async def setFix(client, message):
         BOT.Setting.suffix = message.text; BOT.State.suffix = False
         await send_settings(client, message, message.reply_to_message_id, False)
         await message.delete()
+    elif message.reply_to_message_id in _pending_trim:
+        pending = _pending_trim.pop(message.reply_to_message_id)
+        parts = (message.text or "").split()
+        if len(parts) != 2:
+            msg = await message.reply_text(
+                "❌ Format invalide. Exemple : <code>00:01:30 00:04:10</code>",
+                quote=True,
+            )
+            _pending_trim[message.reply_to_message_id] = pending
+            await sleep(8); await msg.delete()
+            return
+        start, end = parts
+        await message.delete()
+        job_status_msg = await colab_bot.send_message(
+            chat_id=OWNER, text="⏳ <i>Starting trim...</i>",
+        )
+        get_event_loop().create_task(
+            Local_Trim_Handler(pending["source_message"], start, end, job_status_msg)
+        )
 
 
 # ══════════════════════════════════════════════
@@ -1320,6 +1360,8 @@ async def callbacks(client, cq):
     if data == "vidtool_cancel":
         _pending_video.pop(cq.message.id, None)
         _pending_merge.pop(cq.message.id, None)
+        _pending_trim.pop(cq.message.id, None)
+        _pending_subs.pop(cq.message.id, None)
         await cq.message.edit_text("❌ Annulé.")
         return
 
@@ -1337,6 +1379,86 @@ async def callbacks(client, cq):
             ]]),
         )
         _pending_merge[prompt.id] = {"source_message": pending["source_message"]}
+        return
+
+    if data == "vidtool_thumb":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        await cq.answer("🖼 Extraction du thumb...")
+        await cq.message.delete()
+        job_status_msg = await colab_bot.send_message(
+            chat_id=OWNER, text="⏳ <i>Starting thumbnail extraction...</i>",
+        )
+        get_event_loop().create_task(
+            Local_Thumb_Handler(pending["source_message"], job_status_msg)
+        )
+        return
+
+    if data == "vidtool_shots":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        await cq.answer("📸 Extraction des screenshots...")
+        await cq.message.delete()
+        job_status_msg = await colab_bot.send_message(
+            chat_id=OWNER, text="⏳ <i>Starting screenshots extraction...</i>",
+        )
+        get_event_loop().create_task(
+            Local_Screenshots_Handler(pending["source_message"], job_status_msg)
+        )
+        return
+
+    if data == "vidtool_trim":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        prompt = await cq.message.edit_text(
+            f"✂️ <code>{pending['name']}</code>\n\n"
+            "📎 <b>Réponds à ce message</b> (reply) avec :\n"
+            "<code>début fin</code>\n\n"
+            "Exemple : <code>00:01:30 00:04:10</code>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
+            ]]),
+        )
+        _pending_trim[prompt.id] = {"source_message": pending["source_message"]}
+        return
+
+    if data == "vidtool_compress":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        await cq.answer("🗜 Compression démarrée")
+        await cq.message.delete()
+        job_status_msg = await colab_bot.send_message(
+            chat_id=OWNER, text="⏳ <i>Starting local compression...</i>",
+        )
+        get_event_loop().create_task(
+            Local_Compress_Handler(pending["source_message"], job_status_msg)
+        )
+        return
+
+    if data in ("vidtool_muxsubs", "vidtool_burnsubs"):
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        burn = data == "vidtool_burnsubs"
+        label = "🔥 Burn subs (incrusté)" if burn else "💬 Mux subs (piste)"
+        prompt = await cq.message.edit_text(
+            f"{label}\n<code>{pending['name']}</code>\n\n"
+            "📎 <b>Réponds à ce message</b> (reply) avec le fichier de "
+            "sous-titres (<code>.ass</code> ou <code>.srt</code>).",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
+            ]]),
+        )
+        _pending_subs[prompt.id] = {"source_message": pending["source_message"], "burn": burn}
         return
 
     # ════════════════════════════════════════════
@@ -1772,6 +1894,33 @@ async def handle_incoming_video(client, message):
 async def handle_subtitle_document(client, message):
     if not _owner(message):
         return
+
+    # ── Sous-titre pour Mux/Burn subs (ffmpeg local sur vidéo déjà envoyée) ──
+    reply_id_subs = message.reply_to_message_id
+    pending_subs = _pending_subs.get(reply_id_subs) if reply_id_subs else None
+    if pending_subs is None and len(_pending_subs) == 1:
+        reply_id_subs, pending_subs = next(iter(_pending_subs.items()))
+    if pending_subs:
+        file_name = message.document.file_name or ""
+        ext = os.path.splitext(file_name)[1].lower()
+        if ext not in (".ass", ".srt", ".ssa"):
+            await message.reply_text(
+                "❌ Envoie un fichier <code>.ass</code> ou <code>.srt</code> valide.",
+                quote=True,
+            )
+            return
+        _pending_subs.pop(reply_id_subs, None)
+        burn = pending_subs["burn"]
+        status_msg = await message.reply_text("⏳ <i>Sous-titre reçu, démarrage...</i>")
+        await message.delete()
+        os.makedirs(Paths.WORK_PATH, exist_ok=True)
+        subtitle_path = os.path.join(Paths.WORK_PATH, f"vidtool_sub_{uuid4().hex[:8]}{ext}")
+        await message.download(file_name=subtitle_path)
+        get_event_loop().create_task(
+            Local_Subs_Handler(pending_subs["source_message"], subtitle_path, status_msg, burn)
+        )
+        return
+
     if not _pending_fc_subtitle:
         return  # Aucun hardsub en attente de sous-titre, on ignore ce fichier
 
