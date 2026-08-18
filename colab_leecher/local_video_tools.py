@@ -239,3 +239,179 @@ async def burn_subtitles(
     if progress_cb:
         await progress_cb(100.0, "Hardsub terminé")
     return output_path
+
+
+# ── Manual shot — capture à un timestamp précis fourni par l'utilisateur ──
+async def screenshot_at(input_path: str, output_path: str, timestamp: str) -> str:
+    """timestamp au format HH:MM:SS, MM:SS ou secondes (ex: '90')."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", timestamp,
+        "-i", input_path,
+        "-vframes", "1",
+        "-q:v", "2",
+        output_path,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    code = await proc.wait()
+    if code != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg screenshot failed (code {code}) — timestamp invalide ?")
+    return output_path
+
+
+# ── Split — découpe en N parts à peu près égales ──────────────────────
+async def split_video(input_path: str, out_dir: str, parts: int = 3) -> list[str]:
+    duration = await _probe_duration(input_path)
+    if duration <= 0:
+        raise RuntimeError("Impossible de déterminer la durée de la vidéo.")
+    parts = max(2, min(parts, 20))
+    segment_time = max(1, int(duration / parts))
+    ext = os.path.splitext(input_path)[1] or ".mp4"
+    os.makedirs(out_dir, exist_ok=True)
+    pattern = os.path.join(out_dir, f"part_%02d{ext}")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+        "-force_key_frames", f"expr:gte(t,n_forced*{segment_time})",
+        "-c:a", "aac", "-b:a", "128k",
+        "-f", "segment",
+        "-segment_time", str(segment_time),
+        "-reset_timestamps", "1",
+        pattern,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    code = await proc.wait()
+    if code != 0:
+        raise RuntimeError(f"ffmpeg split failed (code {code})")
+
+    files = sorted(
+        os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.startswith("part_")
+    )
+    if not files:
+        raise RuntimeError("ffmpeg split produced no output files")
+    return files
+
+
+# ── Sample — extrait court à un point aléatoire de la vidéo ───────────
+async def sample_clip(input_path: str, output_path: str, duration: int = 30) -> str:
+    total = await _probe_duration(input_path)
+    duration = max(5, min(duration, 120))
+    if total > duration:
+        start = random.uniform(0, max(0.0, total - duration))
+    else:
+        start = 0.0
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.2f}",
+        "-i", input_path,
+        "-t", str(duration),
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        output_path,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    code = await proc.wait()
+    if code != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg sample extraction failed (code {code})")
+    return output_path
+
+
+# ── To Audio — extrait la piste audio en mp3 ───────────────────────────
+async def extract_audio(input_path: str, output_path: str) -> str:
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vn",
+        "-c:a", "libmp3lame", "-q:a", "2",
+        output_path,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    code = await proc.wait()
+    if code != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg audio extraction failed (code {code})")
+    return output_path
+
+
+# ── Mute — retire la piste audio ────────────────────────────────────────
+async def mute_video(input_path: str, output_path: str) -> str:
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c:v", "copy",
+        "-an",
+        output_path,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    code = await proc.wait()
+    if code != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg mute failed (code {code})")
+    return output_path
+
+
+# ── Metadata — texte MediaInfo lisible (ffprobe) ───────────────────────
+async def probe_media_info_text(path: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", "-show_streams", path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    import json as _json
+    try:
+        data = _json.loads(out.decode("utf-8", errors="replace") or "{}")
+    except Exception:
+        return "❌ Impossible de lire les métadonnées."
+
+    fmt = data.get("format", {}) or {}
+    streams = data.get("streams", []) or []
+    size = int(fmt.get("size") or os.path.getsize(path))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            size_s = f"{size:.1f}{unit}" if unit != "B" else f"{size}{unit}"
+            break
+        size = size / 1024
+    else:
+        size_s = f"{size:.1f}TB"
+
+    lines = [
+        "MEDIA INFO",
+        f"FILE  <code>{os.path.basename(path)}</code>",
+        f"SIZE  <code>{size_s}</code>",
+    ]
+    duration = float(fmt.get("duration") or 0.0)
+    if duration > 0:
+        h, rem = divmod(int(duration), 3600)
+        m, s = divmod(rem, 60)
+        dur_s = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+        lines.append(f"DURATION  <code>{dur_s}</code>")
+
+    for stream in streams:
+        stype = str(stream.get("codec_type") or "").lower()
+        codec = str(stream.get("codec_name") or "?").upper()
+        tags = stream.get("tags", {}) or {}
+        lang = (tags.get("language") or "").lower()
+        lang_s = f" [{lang}]" if lang else ""
+        if stype == "video":
+            w, h2 = stream.get("width", 0), stream.get("height", 0)
+            lines.append(f"VIDEO  <code>{codec}  {w}x{h2}</code>")
+        elif stype == "audio":
+            ch = int(stream.get("channels") or 0)
+            ch_s = {1: "Mono", 2: "Stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch}ch" if ch else "")
+            lines.append(f"AUDIO  <code>{codec}  {ch_s}{lang_s}</code>")
+        elif stype == "subtitle":
+            lines.append(f"SUB  <code>{codec}{lang_s}</code>")
+
+    return "\n".join(lines[:14])
