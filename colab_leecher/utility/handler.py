@@ -26,6 +26,14 @@ from colab_leecher.freeconvert import (
     quality_label as fc_quality_label,
 )
 from colab_leecher.local_convert import convert_resolution, merge_audio_video
+from colab_leecher.local_video_tools import (
+    burn_subtitles,
+    compress_video,
+    extract_random_thumbnail,
+    mux_subtitles,
+    take_screenshots,
+    trim_video,
+)
 from colab_leecher.downlader.aria2 import aria2_Download
 from colab_leecher.seedr import SeedrError, _del_folder, fetch_urls_via_seedr
 from colab_leecher.uploader.telegram import upload_file
@@ -900,7 +908,199 @@ async def Local_Merge_Handler(video_message, audio_path: str, status_msg) -> Non
                 shutil.rmtree(job_dir, ignore_errors=True)
 
 
-async def Zip_Handler(down_path: str, is_split: bool, remove: bool):
+async def Local_Thumb_Handler(source_message, status_msg) -> None:
+    """Extrait un thumbnail à un timestamp aléatoire (10%-90% de la durée)."""
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_thumb_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Thumb", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Thumb", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            await _fc_job_status(status_msg, "Thumb", "Extraction", 60.0, "ffmpeg -> frame aléatoire")
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            thumb_path = ospath.join(job_dir, f"{base}.thumb.jpg")
+            await extract_random_thumbnail(input_path, thumb_path)
+
+            await _fc_job_status(status_msg, "Thumb", "Upload", 95.0, "Uploading to Telegram")
+            await colab_bot.send_photo(chat_id=OWNER, photo=thumb_path, caption=f"🖼 {ospath.basename(input_path)}")
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Thumb failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Screenshots_Handler(source_message, status_msg, count: int = 5) -> None:
+    """Prend N screenshots répartis sur la durée (avec jitter aléatoire)."""
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_shots_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Screenshots", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Screenshots", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            await _fc_job_status(status_msg, "Screenshots", "Extraction", 50.0, f"ffmpeg -> {count} frames")
+            shots = await take_screenshots(input_path, job_dir, count=count)
+
+            await _fc_job_status(status_msg, "Screenshots", "Upload", 90.0, "Uploading to Telegram")
+            from pyrogram.types import InputMediaPhoto
+            media = [InputMediaPhoto(p) for p in shots]
+            await colab_bot.send_media_group(chat_id=OWNER, media=media)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Screenshots failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Trim_Handler(source_message, start: str, end: str, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_trim_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Trim", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Trim", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            async def _progress_cb(pct: float, detail: str) -> None:
+                overall = 10.0 + (max(0.0, min(pct, 100.0)) * 0.80)
+                await _fc_job_status(status_msg, "Trim", "Découpe", overall, detail)
+
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            ext = ospath.splitext(ospath.basename(input_path))[1] or ".mp4"
+            output_path = ospath.join(job_dir, f"{base}.trim{ext}")
+
+            await _fc_job_status(status_msg, "Trim", "Découpe", 10.0, f"ffmpeg -> {start} → {end}")
+            await trim_video(input_path, output_path, start, end, progress_cb=_progress_cb)
+
+            await _fc_job_status(status_msg, "Trim", "Upload", 95.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Trim failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Compress_Handler(source_message, status_msg, crf: int = 28) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_compress_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Compress", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Compress", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            async def _progress_cb(pct: float, detail: str) -> None:
+                overall = 10.0 + (max(0.0, min(pct, 100.0)) * 0.80)
+                await _fc_job_status(status_msg, "Compress", "Compression", overall, detail)
+
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            output_path = ospath.join(job_dir, f"{base}.compressed.mp4")
+
+            await _fc_job_status(status_msg, "Compress", "Compression", 10.0, f"ffmpeg -> crf {crf}")
+            await compress_video(input_path, output_path, crf=crf, progress_cb=_progress_cb)
+
+            await _fc_job_status(status_msg, "Compress", "Upload", 95.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Compress failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: bool) -> None:
+    """burn=True -> hardsub (incrusté, ré-encodé) ; burn=False -> mux (piste, copy)."""
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_subs_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+    kind = "Burn Subs" if burn else "Mux Subs"
+
+    await _fc_job_status(status_msg, kind, "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, kind, "Download", 0.0, "Téléchargement de la vidéo...")
+            video_path = await video_message.download(file_name=ospath.join(job_dir, "source_video"))
+
+            base = ospath.splitext(ospath.basename(video_path))[0]
+
+            if burn:
+                async def _progress_cb(pct: float, detail: str) -> None:
+                    overall = 15.0 + (max(0.0, min(pct, 100.0)) * 0.75)
+                    await _fc_job_status(status_msg, kind, "Hardsub", overall, detail)
+
+                output_path = ospath.join(job_dir, f"{base}.hardsub.mp4")
+                await _fc_job_status(status_msg, kind, "Hardsub", 10.0, "ffmpeg -> incrustation")
+                await burn_subtitles(video_path, sub_path, output_path, progress_cb=_progress_cb)
+            else:
+                output_path = ospath.join(job_dir, f"{base}.muxed.mkv")
+                await _fc_job_status(status_msg, kind, "Mux", 40.0, "ffmpeg -> ajout de la piste")
+                await mux_subtitles(video_path, sub_path, output_path)
+
+            await _fc_job_status(status_msg, kind, "Upload", 95.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>{kind} failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(sub_path):
+                try:
+                    os.remove(sub_path)
+                except Exception:
+                    pass
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
     Messages.status_head = f"🗜 <b>COMPRESSING</b>\n\n<code>{Messages.download_name}</code>\n"
     TaskInfo.set(phase="process", engine="zip", filename=Messages.download_name)
     try:
