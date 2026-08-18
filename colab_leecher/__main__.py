@@ -18,10 +18,17 @@ from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_labe
 from colab_leecher.utility.handler import (
     Direct_FC_Hardsub_Handler,
     Local_Compress_Handler,
+    Local_ManualShot_Handler,
     Local_Merge_Handler,
+    Local_Metadata_Handler,
+    Local_Mute_Handler,
+    Local_Rename_Handler,
+    Local_Sample_Handler,
     Local_Screenshots_Handler,
+    Local_Split_Handler,
     Local_Subs_Handler,
     Local_Thumb_Handler,
+    Local_ToAudio_Handler,
     Local_Trim_Handler,
     Local_Video_Convert_Handler,
     Seedr_CC_Convert_Handler,
@@ -89,6 +96,14 @@ _pending_trim: dict[int, dict] = {}
 # ffmpeg local sur une vidéo déjà envoyée au bot.
 _pending_subs: dict[int, dict] = {}
 
+# _pending_manualshot / _pending_split / _pending_sample / _pending_rename :
+# message_id (du prompt texte) -> {"source_message": Message}. Même pattern
+# que _pending_trim, juste un paramètre texte différent attendu en reply.
+_pending_manualshot: dict[int, dict] = {}
+_pending_split: dict[int, dict] = {}
+_pending_sample: dict[int, dict] = {}
+_pending_rename: dict[int, dict] = {}
+
 LOCAL_RESOLUTIONS: dict[str, int] = {"480": 480, "720": 720, "1080": 1080}
 _AUDIO_EXTS = (".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus")
 
@@ -99,10 +114,18 @@ def _video_tools_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔊 Merge Audio+Vidéo", callback_data="vidtool_merge")],
         [InlineKeyboardButton("🖼 Thumb (aléatoire)", callback_data="vidtool_thumb"),
          InlineKeyboardButton("📸 Screenshots", callback_data="vidtool_shots")],
+        [InlineKeyboardButton("🎯 Manual shot", callback_data="vidtool_manualshot"),
+         InlineKeyboardButton("🎬 Sample", callback_data="vidtool_sample")],
         [InlineKeyboardButton("✂️ Trim", callback_data="vidtool_trim"),
-         InlineKeyboardButton("🗜 Compress", callback_data="vidtool_compress")],
+         InlineKeyboardButton("🔪 Split", callback_data="vidtool_split")],
+        [InlineKeyboardButton("🗜 Compress", callback_data="vidtool_compress"),
+         InlineKeyboardButton("✏️ Rename", callback_data="vidtool_rename")],
+        [InlineKeyboardButton("🎵 To Audio", callback_data="vidtool_toaudio"),
+         InlineKeyboardButton("🔇 Mute", callback_data="vidtool_mute")],
         [InlineKeyboardButton("💬 Mux subs", callback_data="vidtool_muxsubs"),
          InlineKeyboardButton("🔥 Burn subs", callback_data="vidtool_burnsubs")],
+        [InlineKeyboardButton("📊 Metadata", callback_data="vidtool_metadata"),
+         InlineKeyboardButton("🎞 Streams", callback_data="vidtool_streams")],
         [InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel")],
     ])
 
@@ -238,6 +261,7 @@ async def _startup_welcome() -> None:
 
 
 def _owner(m): return m.chat.id == OWNER
+def _can_use(m): return m.chat.id == OWNER or m.chat.id in BOT.Options.allowed_users
 def _ring(p):  return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
 
 REQUIRED_CHANNEL = "@hebdos"
@@ -393,7 +417,10 @@ async def help_cmd(client, message):
         "  /dumps     — list/remove dump channels\n"
         "  /addcc     — add a CloudConvert API key\n"
         "  /addfc     — add a FreeConvert API key\n"
-        "  /apikeys   — list/remove API keys\n\n"
+        "  /apikeys   — list/remove API keys\n"
+        "  /adduser   — give a user access to the bot\n"
+        "  /deluser   — remove a user's access\n"
+        "  /users     — list authorized users\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📡 <b>Nyaa Anime Search</b>\n"
         "  /nyaa_search <query> — search Nyaa.si\n"
@@ -838,6 +865,87 @@ async def apikeys_cmd(client, message):
     await message.reply_text(_apikeys_text(), reply_markup=_apikeys_kb())
 
 
+def _users_kb() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"🗑 {uid}", callback_data=f"user_remove|{uid}")]
+            for uid in BOT.Options.allowed_users]
+    rows.append([InlineKeyboardButton("⏎ Back", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _users_text() -> str:
+    if not BOT.Options.allowed_users:
+        return (
+            "👥 <b>UTILISATEURS AUTORISÉS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Aucun utilisateur ajouté — seul le propriétaire peut utiliser le bot.\n\n"
+            "Ajoute-en un avec :\n<code>/adduser 123456789</code>"
+        )
+    lines = "\n".join(f"· <code>{uid}</code>" for uid in BOT.Options.allowed_users)
+    return (
+        "👥 <b>UTILISATEURS AUTORISÉS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{lines}\n\nAjoute-en un autre avec <code>/adduser id</code>\n"
+        "Tape sur 🗑 pour en retirer un."
+    )
+
+
+@colab_bot.on_message(filters.command("adduser") & filters.private)
+async def adduser_cmd(client, message):
+    if not _owner(message): return
+    await message.delete()
+    if len(message.command) != 2:
+        msg = await message.reply_text(
+            "Usage: <code>/adduser 123456789</code> (user_id Telegram)\n\n"
+            "L'utilisateur peut obtenir son ID via @userinfobot.",
+            quote=True,
+        )
+        await sleep(12); await msg.delete()
+        return
+    try:
+        uid = int(message.command[1].strip())
+    except ValueError:
+        msg = await message.reply_text("❌ user_id invalide — attendu un nombre.", quote=True)
+        await sleep(8); await msg.delete()
+        return
+    if uid in BOT.Options.allowed_users:
+        msg = await message.reply_text("⚠️ Cet utilisateur a déjà accès.", quote=True)
+    else:
+        BOT.Options.allowed_users.append(uid)
+        msg = await message.reply_text(f"✅ Utilisateur ajouté : <code>{uid}</code>", quote=True)
+        try:
+            await colab_bot.send_message(chat_id=uid, text="✅ Tu as maintenant accès à ce bot. Envoie /start.")
+        except Exception:
+            pass
+    await sleep(10); await msg.delete()
+
+
+@colab_bot.on_message(filters.command(["deluser", "removeuser"]) & filters.private)
+async def deluser_cmd(client, message):
+    if not _owner(message): return
+    await message.delete()
+    if len(message.command) != 2:
+        msg = await message.reply_text("Usage: <code>/deluser 123456789</code>", quote=True)
+        await sleep(10); await msg.delete()
+        return
+    try:
+        uid = int(message.command[1].strip())
+    except ValueError:
+        msg = await message.reply_text("❌ user_id invalide — attendu un nombre.", quote=True)
+        await sleep(8); await msg.delete()
+        return
+    if uid in BOT.Options.allowed_users:
+        BOT.Options.allowed_users.remove(uid)
+        msg = await message.reply_text(f"🗑 Accès retiré : <code>{uid}</code>", quote=True)
+    else:
+        msg = await message.reply_text("⚠️ Cet utilisateur n'a pas accès.", quote=True)
+    await sleep(10); await msg.delete()
+
+
+@colab_bot.on_message(filters.command("users") & filters.private)
+async def users_cmd(client, message):
+    if not _owner(message): return
+    await message.delete()
+    await message.reply_text(_users_text(), reply_markup=_users_kb())
+
+
 @colab_bot.on_message(filters.reply & filters.private)
 async def setFix(client, message):
     if BOT.State.prefix:
@@ -867,6 +975,56 @@ async def setFix(client, message):
         get_event_loop().create_task(
             Local_Trim_Handler(pending["source_message"], start, end, job_status_msg)
         )
+    elif message.reply_to_message_id in _pending_manualshot:
+        pending = _pending_manualshot.pop(message.reply_to_message_id)
+        ts = (message.text or "").strip()
+        if not ts:
+            msg = await message.reply_text("❌ Envoie un timestamp, ex: <code>00:02:15</code>", quote=True)
+            _pending_manualshot[message.reply_to_message_id] = pending
+            await sleep(8); await msg.delete()
+            return
+        await message.delete()
+        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting manual shot...</i>")
+        get_event_loop().create_task(Local_ManualShot_Handler(pending["source_message"], ts, job_status_msg))
+    elif message.reply_to_message_id in _pending_split:
+        pending = _pending_split.pop(message.reply_to_message_id)
+        try:
+            parts_n = int((message.text or "").strip())
+        except ValueError:
+            parts_n = 0
+        if parts_n < 2:
+            msg = await message.reply_text("❌ Envoie un nombre de parties (min 2), ex: <code>3</code>", quote=True)
+            _pending_split[message.reply_to_message_id] = pending
+            await sleep(8); await msg.delete()
+            return
+        await message.delete()
+        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting split...</i>")
+        get_event_loop().create_task(Local_Split_Handler(pending["source_message"], parts_n, job_status_msg))
+    elif message.reply_to_message_id in _pending_sample:
+        pending = _pending_sample.pop(message.reply_to_message_id)
+        try:
+            dur = int((message.text or "").strip())
+        except ValueError:
+            dur = 0
+        if dur < 5:
+            msg = await message.reply_text("❌ Envoie une durée en secondes (min 5), ex: <code>30</code>", quote=True)
+            _pending_sample[message.reply_to_message_id] = pending
+            await sleep(8); await msg.delete()
+            return
+        await message.delete()
+        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting sample...</i>")
+        get_event_loop().create_task(Local_Sample_Handler(pending["source_message"], dur, job_status_msg))
+    elif message.reply_to_message_id in _pending_rename:
+        pending = _pending_rename.pop(message.reply_to_message_id)
+        new_name = (message.text or "").strip()
+        if not new_name:
+            msg = await message.reply_text("❌ Envoie un nom de fichier valide.", quote=True)
+            _pending_rename[message.reply_to_message_id] = pending
+            await sleep(8); await msg.delete()
+            return
+        await message.delete()
+        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting rename...</i>")
+        get_event_loop().create_task(Local_Rename_Handler(pending["source_message"], new_name, job_status_msg))
 
 
 # ══════════════════════════════════════════════
@@ -909,11 +1067,11 @@ def _mode_keyboard():
 
 @colab_bot.on_message(filters.create(isLink) & ~filters.photo & filters.private)
 async def handle_url(client, message):
-    if not _owner(message):
+    if not _can_use(message):
         if await _is_subscribed(client, message.from_user.id):
             msg = await message.reply_text(
-                "⛔ Seul le propriétaire du bot peut lancer des téléchargements.\n"
-                "Tape /settings pour consulter les réglages.",
+                "⛔ Tu n'as pas accès aux téléchargements sur ce bot.\n"
+                "Demande au propriétaire de t'ajouter avec /adduser.",
                 quote=True,
             )
         else:
@@ -1362,6 +1520,10 @@ async def callbacks(client, cq):
         _pending_merge.pop(cq.message.id, None)
         _pending_trim.pop(cq.message.id, None)
         _pending_subs.pop(cq.message.id, None)
+        _pending_manualshot.pop(cq.message.id, None)
+        _pending_split.pop(cq.message.id, None)
+        _pending_sample.pop(cq.message.id, None)
+        _pending_rename.pop(cq.message.id, None)
         await cq.message.edit_text("❌ Annulé.")
         return
 
@@ -1443,7 +1605,124 @@ async def callbacks(client, cq):
         )
         return
 
-    if data in ("vidtool_muxsubs", "vidtool_burnsubs"):
+    if data == "vidtool_manualshot":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        prompt = await cq.message.edit_text(
+            f"🎯 <code>{pending['name']}</code>\n\n"
+            "📎 <b>Réponds à ce message</b> (reply) avec le timestamp exact.\n\n"
+            "Exemple : <code>00:02:15</code>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
+            ]]),
+        )
+        _pending_manualshot[prompt.id] = {"source_message": pending["source_message"]}
+        return
+
+    if data == "vidtool_sample":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        prompt = await cq.message.edit_text(
+            f"🎬 <code>{pending['name']}</code>\n\n"
+            "📎 <b>Réponds à ce message</b> (reply) avec la durée en secondes.\n\n"
+            "Exemple : <code>30</code>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
+            ]]),
+        )
+        _pending_sample[prompt.id] = {"source_message": pending["source_message"]}
+        return
+
+    if data == "vidtool_split":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        prompt = await cq.message.edit_text(
+            f"🔪 <code>{pending['name']}</code>\n\n"
+            "📎 <b>Réponds à ce message</b> (reply) avec le nombre de parties.\n\n"
+            "Exemple : <code>3</code>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
+            ]]),
+        )
+        _pending_split[prompt.id] = {"source_message": pending["source_message"]}
+        return
+
+    if data == "vidtool_rename":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        prompt = await cq.message.edit_text(
+            f"✏️ <code>{pending['name']}</code>\n\n"
+            "📎 <b>Réponds à ce message</b> (reply) avec le nouveau nom (avec extension).\n\n"
+            "Exemple : <code>Episode 05.mkv</code>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
+            ]]),
+        )
+        _pending_rename[prompt.id] = {"source_message": pending["source_message"]}
+        return
+
+    if data == "vidtool_toaudio":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        await cq.answer("🎵 Extraction audio démarrée")
+        await cq.message.delete()
+        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting audio extraction...</i>")
+        get_event_loop().create_task(Local_ToAudio_Handler(pending["source_message"], job_status_msg))
+        return
+
+    if data == "vidtool_mute":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        await cq.answer("🔇 Retrait audio démarré")
+        await cq.message.delete()
+        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting mute...</i>")
+        get_event_loop().create_task(Local_Mute_Handler(pending["source_message"], job_status_msg))
+        return
+
+    if data == "vidtool_metadata":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        await cq.answer()
+        status_msg = await cq.message.edit_text("⏳ <i>Lecture des métadonnées...</i>")
+        get_event_loop().create_task(Local_Metadata_Handler(pending["source_message"], status_msg))
+        return
+
+    if data == "vidtool_streams":
+        pending = _pending_video.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
+            return
+        await cq.answer()
+        await cq.message.edit_text("🎞 <b>STREAM EXTRACTOR</b>\n\nTéléchargement depuis Telegram...")
+        os.makedirs(Paths.WORK_PATH, exist_ok=True)
+        local_path = os.path.join(Paths.WORK_PATH, f"sx_{uuid4().hex[:8]}_{pending['name']}")
+        await pending["source_message"].download(file_name=local_path)
+
+        session = await analyse(local_path, chat_id)
+        if not session or (not session["video"] and not session["audio"] and not session["subs"]):
+            await cq.message.edit_text(
+                "🎞 <b>STREAM EXTRACTOR</b>\n\nAucune piste détectée sur ce fichier.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Fermer", callback_data="close")]]),
+            )
+            return
+        await _show_type_menu(cq.message, session)
+        return
+
+
         pending = _pending_video.pop(cq.message.id, None)
         if not pending:
             await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
@@ -1761,6 +2040,18 @@ async def callbacks(client, cq):
         else:
             await cq.answer("Déjà retirée.")
         await cq.message.edit_text(_apikeys_text(), reply_markup=_apikeys_kb())
+    elif data.startswith("user_remove|"):
+        raw_uid = data.split("|", 1)[1]
+        try:
+            uid = int(raw_uid)
+        except ValueError:
+            uid = None
+        if uid in BOT.Options.allowed_users:
+            BOT.Options.allowed_users.remove(uid)
+            await cq.answer("🗑 Retiré")
+        else:
+            await cq.answer("Déjà retiré.")
+        await cq.message.edit_text(_users_text(), reply_markup=_users_kb())
     elif data in ["media","document"]:
         BOT.Options.stream_upload = data == "media"
         BOT.Setting.stream_upload = "Media" if data == "media" else "Document"
@@ -1817,7 +2108,7 @@ _VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m2ts", ".flv", 
     group=-1,
 )
 async def handle_incoming_video(client, message):
-    if not _owner(message):
+    if not _can_use(message):
         message.continue_propagation()
         return
 
