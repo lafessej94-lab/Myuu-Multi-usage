@@ -3,6 +3,8 @@ import json
 import os
 import shutil
 import logging
+
+log = logging.getLogger(__name__)
 import pathlib
 import uuid
 from asyncio import sleep
@@ -28,6 +30,7 @@ from colab_leecher.freeconvert import (
 from colab_leecher.local_convert import convert_resolution, merge_audio_video
 from colab_leecher.local_video_tools import (
     burn_subtitles,
+    burn_text_overlay,
     compress_video,
     extract_audio,
     extract_random_thumbnail,
@@ -363,7 +366,7 @@ async def _seedr_status(kind: str, stage: str, pct: float, detail: str, filename
 # comme avant, gated par BOT.State.task_going — on ne touche pas à ça.
 # ═════════════════════════════════════════════════════════════
 
-FC_HARDSUB_CONCURRENCY = 3
+FC_HARDSUB_CONCURRENCY = 5
 _fc_hardsub_semaphore = asyncio.Semaphore(FC_HARDSUB_CONCURRENCY)
 
 
@@ -594,6 +597,7 @@ async def Seedr_CC_Hardsub_Handler(magnet: str, resolution: str | None = None, e
             )
 
         await _seedr_status("Seedr + CloudConvert Hardsub", "Upload", 100.0, "Uploading to Telegram")
+        await _burn_prefix_suffix_in_dir(Paths.temp_cc_path, None, "Seedr + CloudConvert Hardsub")
         await Leech(Paths.temp_cc_path, True, convert_videos=False)
     except Exception as exc:
         await cancelTask(f"Seedr+CC hardsub failed\n\n{exc}")
@@ -704,6 +708,7 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
                 )
 
             await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Upload", 100.0, "Uploading to Telegram")
+            await _burn_prefix_suffix_in_dir(job_dir, status_msg, "Seedr + FreeConvert Hardsub")
             await Leech(job_dir, True, convert_videos=False, status_msg=status_msg)
             try:
                 await status_msg.delete()
@@ -788,6 +793,7 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
             )
 
             await _fc_job_status(status_msg, "FreeConvert Hardsub", "Upload", 100.0, "Uploading to Telegram", name)
+            await _burn_prefix_suffix_in_dir(job_dir, status_msg, "FreeConvert Hardsub")
             await Leech(job_dir, True, convert_videos=False, status_msg=status_msg)
             try:
                 await status_msg.delete()
@@ -817,7 +823,7 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
 # dessus et ralentissent tout le monde au lieu d'aider.
 # ═════════════════════════════════════════════════════════════
 
-LOCAL_CONVERT_CONCURRENCY = 2
+LOCAL_CONVERT_CONCURRENCY = 5
 _local_convert_semaphore = asyncio.Semaphore(LOCAL_CONVERT_CONCURRENCY)
 
 
@@ -1324,6 +1330,40 @@ async def Local_Metadata_Handler(source_message, status_msg) -> None:
         if ospath.exists(job_dir):
             shutil.rmtree(job_dir, ignore_errors=True)
 
+
+
+async def _burn_prefix_suffix_in_dir(job_dir: str, status_msg, label: str) -> None:
+    """Grave BOT.Setting.prefix/suffix directement dans l'image de chaque
+    vidéo trouvée dans job_dir, EN PLACE (remplace le fichier d'origine).
+    No-op silencieux si prefix et suffix sont vides — c'est le comportement
+    historique (juste dans le nom de fichier/caption) qui continue à
+    s'appliquer dans ce cas. status_msg peut être None (pipeline Seedr+CC
+    historique, pas de message dédié) : dans ce cas on grave sans notifier
+    de progression détaillée, juste un log."""
+    prefix = (BOT.Setting.prefix or "").strip()
+    suffix = (BOT.Setting.suffix or "").strip()
+    if not prefix and not suffix:
+        return
+
+    video_files = [
+        f for f in pathlib.Path(job_dir).glob("**/*")
+        if f.is_file() and fileType(str(f)) == "video"
+    ]
+    for i, vf in enumerate(video_files, start=1):
+        try:
+            if status_msg is not None:
+                await _fc_job_status(
+                    status_msg, label, "Overlay", 90.0 + (i / max(1, len(video_files))) * 5.0,
+                    f"Gravure prefix/suffix {i}/{len(video_files)}",
+                )
+            else:
+                log.info("Burning prefix/suffix into %s (%d/%d)", vf.name, i, len(video_files))
+            tmp_out = str(vf) + ".burned.mp4"
+            await burn_text_overlay(str(vf), tmp_out, prefix=prefix, suffix=suffix)
+            os.remove(str(vf))
+            os.rename(tmp_out, str(vf))
+        except Exception as exc:
+            log.warning("Prefix/suffix burn-in failed for %s: %s", vf, exc)
 
 
 async def Zip_Handler(down_path: str, is_split: bool, remove: bool):
