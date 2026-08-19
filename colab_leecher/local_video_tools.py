@@ -415,3 +415,92 @@ async def probe_media_info_text(path: str) -> str:
             lines.append(f"SUB  <code>{codec}{lang_s}</code>")
 
     return "\n".join(lines[:14])
+
+
+# ── Burn prefix/suffix — texte incrusté en dur dans l'image (pas juste ──
+# ── dans le nom de fichier/caption, ré-encodage vidéo) ─────────────────
+_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
+
+
+def _drawtext_font() -> str | None:
+    for path in _FONT_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _drawtext_escape(text: str) -> str:
+    # Échappe les caractères qui cassent le parsing du filtre drawtext.
+    return (
+        text.replace("\\", "\\\\\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\u2019")  # apostrophe typographique, évite de casser le quoting
+        .replace("%", "\\%")
+    )
+
+
+async def burn_text_overlay(
+    input_path: str,
+    output_path: str,
+    prefix: str = "",
+    suffix: str = "",
+    progress_cb: ProgressCB = None,
+) -> str:
+    """Grave prefix (haut-gauche) et/ou suffix (bas-droite) directement
+    dans l'image vidéo. Appelé uniquement si prefix/suffix non vides —
+    sinon rien à graver, autant garder le fichier tel quel (voir handler.py)."""
+    prefix = (prefix or "").strip()
+    suffix = (suffix or "").strip()
+    if not prefix and not suffix:
+        raise ValueError("burn_text_overlay called with empty prefix and suffix")
+
+    duration = await _probe_duration(input_path)
+    font = _drawtext_font()
+    font_opt = f"fontfile='{font}':" if font else ""
+
+    filters = []
+    if prefix:
+        txt = _drawtext_escape(prefix)
+        filters.append(
+            f"drawtext={font_opt}text='{txt}':fontsize=h*0.045:fontcolor=white:"
+            "borderw=2:bordercolor=black@0.7:x=20:y=20"
+        )
+    if suffix:
+        txt = _drawtext_escape(suffix)
+        filters.append(
+            f"drawtext={font_opt}text='{txt}':fontsize=h*0.045:fontcolor=white:"
+            "borderw=2:bordercolor=black@0.7:x=w-tw-20:y=h-th-20"
+        )
+    vf = ",".join(filters)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", vf,
+        "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    assert proc.stdout is not None
+    while True:
+        line_bytes = await proc.stdout.readline()
+        if not line_bytes:
+            break
+        t = _parse_ffmpeg_time(line_bytes.decode("utf-8", errors="replace"))
+        if t is not None and duration > 0 and progress_cb:
+            pct = min(100.0, (t / duration) * 100.0)
+            await progress_cb(pct, f"Overlay {int(t)}s / {int(duration)}s")
+
+    code = await proc.wait()
+    if code != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg text overlay failed (code {code})")
+    if progress_cb:
+        await progress_cb(100.0, "Overlay terminé")
+    return output_path
