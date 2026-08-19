@@ -769,6 +769,22 @@ async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
 
             await _fc_job_status(status_msg, "CloudConvert Hardsub", "Queue", 5.0, "Submitting CloudConvert hardsub job", name)
 
+            async def _url_cb(url: str) -> None:
+                try:
+                    await colab_bot.send_message(
+                        chat_id=OWNER,
+                        text=(
+                            "🔗 <b>Lien direct disponible</b>\n\n"
+                            f"<code>{name}</code>\n\n"
+                            f"{url}\n\n"
+                            "<i>Le bot va maintenant le télécharger et l'uploader. "
+                            "Si ça plante, tu as déjà ce lien pour le récupérer toi-même.</i>"
+                        ),
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+
             await hardsub_remote_url(
                 ",".join(BOT.Options.cc_api_keys),
                 video_url,
@@ -780,6 +796,7 @@ async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
                 resolution=resolution,
                 process_cb=_process_cb,
                 download_cb=_download_cb,
+                url_cb=_url_cb,
             )
 
             await _fc_job_status(status_msg, "CloudConvert Hardsub", "Upload", 100.0, "Uploading to Telegram", name)
