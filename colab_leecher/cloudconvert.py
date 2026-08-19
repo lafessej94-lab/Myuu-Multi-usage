@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -323,6 +324,79 @@ async def _wait_for_job(
 
 
 async def _download_file(url: str, dest_path: str, progress_cb: ProgressCB = None) -> str:
+    """
+    Télécharge le résultat CloudConvert via aria2c — même approche que
+    FreeConvert (voir freeconvert.py::_download_file) : une seule connexion
+    (-x1 -s1) par sécurité si le lien d'export ne supporte pas le
+    multi-range, avec retries et timeout pour ne jamais rester bloqué.
+    Fallback aiohttp mono-connexion si aria2c est indisponible.
+    """
+    dest_dir = os.path.dirname(dest_path) or "."
+    dest_name = os.path.basename(dest_path)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    if shutil.which("aria2c") is None:
+        return await _download_file_aiohttp_fallback(url, dest_path, progress_cb)
+
+    cmd = [
+        "aria2c",
+        "-x1", "-s1",
+        "--seed-time=0",
+        "--summary-interval=1",
+        "--max-tries=3",
+        "--retry-wait=2",
+        "--console-log-level=notice",
+        "-d", dest_dir,
+        "-o", dest_name,
+        url,
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        assert proc.stdout is not None
+        if progress_cb:
+            await progress_cb(0.0, "Downloading result")
+        while True:
+            line_bytes = await proc.stdout.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode("utf-8", errors="replace")
+            pct = _parse_aria2_pct(line)
+            if pct is not None and progress_cb:
+                await progress_cb(pct, "Downloading result")
+        code = await proc.wait()
+        if code != 0 or not os.path.exists(dest_path):
+            raise RuntimeError(f"aria2c download failed (code {code})")
+    except Exception:
+        # Filet de sécurité : si aria2c plante pour une raison quelconque,
+        # on retombe sur le téléchargement mono-connexion classique plutôt
+        # que de perdre le job entier.
+        return await _download_file_aiohttp_fallback(url, dest_path, progress_cb)
+
+    if progress_cb:
+        await progress_cb(100.0, "Download complete")
+    return dest_path
+
+
+def _parse_aria2_pct(line: str) -> Optional[float]:
+    """Extrait le pourcentage d'une ligne de log aria2c du style '12MiB/345MiB(3%)'."""
+    if "ETA:" not in line:
+        return None
+    try:
+        parts = line.split()
+        token = next((p for p in parts if "(" in p and ")" in p and "/" in p), None)
+        if not token:
+            return None
+        pct_str = token.split("(")[1].split("%")[0]
+        return float(pct_str)
+    except Exception:
+        return None
+
+
+async def _download_file_aiohttp_fallback(url: str, dest_path: str, progress_cb: ProgressCB = None) -> str:
+    """Fallback mono-connexion (utilisé seulement si aria2c est indisponible ou plante)."""
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     async with aiohttp.ClientSession(timeout=_TIMEOUT_DOWNLOAD) as sess:
         async with sess.get(url) as resp:
@@ -331,7 +405,7 @@ async def _download_file(url: str, dest_path: str, progress_cb: ProgressCB = Non
             total = int(resp.headers.get("Content-Length") or 0)
             done = 0
             if progress_cb:
-                await progress_cb(0.0, "Downloading result")
+                await progress_cb(0.0, "Downloading result (mono-connexion)")
             with open(dest_path, "wb") as fh:
                 async for chunk in resp.content.iter_chunked(1024 * 512):
                     fh.write(chunk)
@@ -705,7 +779,15 @@ async def hardsub_remote_url(
     encode_speed: str | None = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
+    url_cb: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> str:
+    """
+    url_cb : optionnel — appelé avec le lien de téléchargement direct dès
+    que CloudConvert a fini son job, AVANT qu'on commence à télécharger le
+    résultat. Filet de sécurité : si le download/upload plante ensuite,
+    l'utilisateur a déjà le lien pour récupérer le fichier lui-même
+    (même principe que freeconvert.py::hardsub_remote_url).
+    """
     keys = parse_api_keys(api_keys)
     api_key, _ = await pick_best_key(keys)
     crf, base_preset = profile_options(quality_profile, cc_mode)
@@ -730,4 +812,11 @@ async def hardsub_remote_url(
     url = _export_url(job)
     if not url:
         raise RuntimeError("CloudConvert finished without an export URL.")
+
+    if url_cb:
+        try:
+            await url_cb(url)
+        except Exception as exc:
+            log.warning("url_cb a échoué (non bloquant): %s", exc)
+
     return await _download_file(url, output_path, download_cb)
