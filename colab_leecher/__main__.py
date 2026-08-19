@@ -16,6 +16,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot, OWNER
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.utility.handler import (
+    Direct_CC_Hardsub_Handler,
     Direct_FC_Hardsub_Handler,
     Local_Compress_Handler,
     Local_ManualShot_Handler,
@@ -307,6 +308,29 @@ def _fc_quality_kb(flow: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("480p", callback_data=f"fc_res|{flow}|480")],
         [InlineKeyboardButton("720p", callback_data=f"fc_res|{flow}|720")],
     ])
+
+
+# Mêmes codes/labels que FreeConvert — juste préfixé cc_res pour ce flow-ci.
+def _cc_direct_quality_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 Qualité d'origine", callback_data="cc_res|direct|orig")],
+        [InlineKeyboardButton("360p", callback_data="cc_res|direct|360"),
+         InlineKeyboardButton("480p", callback_data="cc_res|direct|480")],
+        [InlineKeyboardButton("720p", callback_data="cc_res|direct|720")],
+    ])
+
+
+# code du menu ("orig"/"360"/"480"/"720") -> chaîne attendue par
+# hardsub_remote_url() de CloudConvert ("original"/"360p"/"480p"/"720p").
+_CC_RES_CODE_TO_LABEL: dict[str, str] = {
+    "orig": "original", "360": "360p", "480": "480p", "720": "720p",
+}
+
+# _pending_cc_subtitle : message_id (du prompt "envoie le sous-titre") ->
+# {"url": str, "name": str, "resolution": str|None}. Namespace séparé de
+# _pending_fc_subtitle pour ne pas mélanger les deux moteurs si les deux
+# flows tournent en même temps.
+_pending_cc_subtitle: dict[int, dict] = {}
 
 
 # ── CC Hardsub : résolution puis vitesse d'encodage, choisies avant de lancer ──
@@ -1064,7 +1088,10 @@ def _mode_keyboard():
         ])
     elif is_http:
         rows.append([InlineKeyboardButton("── 🧲 Hardsub ──", callback_data="noop")])
-        rows.append([InlineKeyboardButton("🆓 FC Hardsub", callback_data="fc_hardsub_manual")])
+        rows.append([
+            InlineKeyboardButton("☁️ CC Hardsub", callback_data="cc_hardsub_manual"),
+            InlineKeyboardButton("🆓 FC Hardsub", callback_data="fc_hardsub_manual"),
+        ])
 
     rows.append([InlineKeyboardButton("── 🎞 Autre ──", callback_data="noop")])
     rows.append([InlineKeyboardButton("🎞 Extraire pistes (streams)", callback_data="sx_open")])
@@ -1484,6 +1511,56 @@ async def callbacks(client, cq):
             ]]),
         )
         _pending_fc_subtitle[prompt.id] = {"url": url, "name": name, "resize": resize}
+        return
+
+    # ── CloudConvert Hardsub sur lien direct (sous-titre fourni manuellement) ──
+    # Même UX que le flow FreeConvert ci-dessus, juste le moteur qui change.
+    if data == "cc_hardsub_manual":
+        if not BOT.Options.cc_api_keys:
+            await cq.answer("CloudConvert API key missing — use /addcc YOUR_KEY.", show_alert=True)
+            return
+        url = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            await cq.answer("This option needs a direct HTTP(S) link.", show_alert=True)
+            return
+
+        await cq.message.edit_text(
+            "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Choisis la qualité de sortie :\n"
+            "<i>Une résolution plus basse = traitement plus rapide.</i>",
+            reply_markup=_cc_direct_quality_kb(),
+        )
+        _link_sessions[cq.message.id] = [url]
+        return
+
+    if data.startswith("cc_res|direct|"):
+        code = data.split("|", 2)[2]
+        resolution = _CC_RES_CODE_TO_LABEL.get(code)
+        session = _link_sessions.pop(cq.message.id, None)
+        url = (session or (BOT.SOURCE or [""]))[0].strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
+            return
+
+        name = os.path.basename(urlparse(url).path) or "video.mp4"
+
+        prompt = await cq.message.edit_text(
+            "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<code>{name}</code>\n\n"
+            "📎 <b>Réponds à ce message</b> (reply) avec le fichier de sous-titres "
+            "(<code>.ass</code> ou <code>.srt</code>) à utiliser.\n\n"
+            "<i>Le style (police, gras, contour...) sera appliqué automatiquement. "
+            "Tu peux lancer un autre lien pendant que celui-ci tourne.</i>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Annuler", callback_data="cc_hardsub_cancel"),
+            ]]),
+        )
+        _pending_cc_subtitle[prompt.id] = {"url": url, "name": name, "resolution": resolution}
+        return
+
+    if data == "cc_hardsub_cancel":
+        _pending_cc_subtitle.pop(cq.message.id, None)
+        await cq.message.edit_text("❌ Hardsub annulé.")
         return
 
     if data == "fc_hardsub_cancel":
@@ -2228,6 +2305,34 @@ async def handle_incoming_video(client, message):
 @colab_bot.on_message(filters.document & filters.private)
 async def handle_subtitle_document(client, message):
     if not _owner(message):
+        return
+
+    # ── Sous-titre pour CloudConvert Hardsub sur lien direct ──────────────
+    reply_id_cc = message.reply_to_message_id
+    pending_cc = _pending_cc_subtitle.get(reply_id_cc) if reply_id_cc else None
+    if pending_cc is None and len(_pending_cc_subtitle) == 1:
+        reply_id_cc, pending_cc = next(iter(_pending_cc_subtitle.items()))
+    if pending_cc:
+        file_name = message.document.file_name or ""
+        ext = os.path.splitext(file_name)[1].lower()
+        if ext not in (".ass", ".srt", ".ssa"):
+            await message.reply_text(
+                "❌ Envoie un fichier <code>.ass</code> ou <code>.srt</code> valide.",
+                quote=True,
+            )
+            return
+        _pending_cc_subtitle.pop(reply_id_cc, None)
+        status_msg = await message.reply_text("⏳ <i>Sous-titre reçu, démarrage CloudConvert...</i>")
+        await message.delete()
+        os.makedirs(Paths.WORK_PATH, exist_ok=True)
+        subtitle_path = os.path.join(Paths.WORK_PATH, f"cc_sub_{uuid4().hex[:8]}{ext}")
+        await message.download(file_name=subtitle_path)
+        get_event_loop().create_task(
+            Direct_CC_Hardsub_Handler(
+                pending_cc["url"], pending_cc["name"], subtitle_path, status_msg,
+                resolution=pending_cc.get("resolution"),
+            )
+        )
         return
 
     # ── Sous-titre pour Mux/Burn subs (ffmpeg local sur vidéo déjà envoyée) ──
