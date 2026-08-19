@@ -45,6 +45,7 @@ from colab_leecher.utility.helper import (
     sizeUnit, getTime, is_ytdl_link, fileType, _pct_bar, _speed_emoji,
 )
 from colab_leecher.downlader.aria2 import aria2_Download
+from colab_leecher.house_style import apply_house_style
 from colab_leecher.stream_extractor import (
     analyse, get_session, clear_session,
     kb_type, kb_video, kb_audio, kb_subs,
@@ -95,6 +96,12 @@ _pending_trim: dict[int, dict] = {}
 # (qui gère le hardsub FreeConvert sur lien distant) car ici c'est du
 # ffmpeg local sur une vidéo déjà envoyée au bot.
 _pending_subs: dict[int, dict] = {}
+
+# _pending_style_sub : message_id (du prompt Oui/Non) -> {"path": str, "ext": str}
+# Flow indépendant de tout hardsub — un sous-titre envoyé "à froid" au bot,
+# on propose juste d'appliquer le house style (Trebuchet MS 22) et de le
+# renvoyer, sans lancer aucun job vidéo.
+_pending_style_sub: dict[int, dict] = {}
 
 # _pending_manualshot / _pending_split / _pending_sample / _pending_rename :
 # message_id (du prompt texte) -> {"source_message": Message}. Même pattern
@@ -1515,7 +1522,44 @@ async def callbacks(client, cq):
         )
         return
 
-    if data == "vidtool_cancel":
+    if data in ("style_yes", "style_no"):
+        pending = _pending_style_sub.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée.", show_alert=True)
+            return
+        path, name = pending["path"], pending["name"]
+        try:
+            if data == "style_yes":
+                await cq.answer("🎨 Application du style...")
+                styled = await apply_house_style(path, Paths.WORK_PATH)
+                out_name = os.path.splitext(name)[0] + ".styled.ass"
+                await colab_bot.send_document(
+                    chat_id=OWNER, document=styled,
+                    caption=f"✅ Style maison appliqué (Trebuchet MS 22)\n<code>{out_name}</code>",
+                    file_name=out_name,
+                )
+                await cq.message.edit_text(f"✅ Style appliqué et renvoyé : <code>{out_name}</code>")
+                if os.path.exists(styled) and styled != path:
+                    os.remove(styled)
+            else:
+                await cq.answer()
+                await colab_bot.send_document(
+                    chat_id=OWNER, document=path,
+                    caption=f"↩️ Style inchangé\n<code>{name}</code>",
+                    file_name=name,
+                )
+                await cq.message.edit_text(f"↩️ Style inchangé, fichier renvoyé tel quel : <code>{name}</code>")
+        except Exception as exc:
+            await cq.message.edit_text(f"❌ <b>Style sub failed</b>\n\n<code>{exc}</code>")
+        finally:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        return
+
+
         _pending_video.pop(cq.message.id, None)
         _pending_merge.pop(cq.message.id, None)
         _pending_trim.pop(cq.message.id, None)
@@ -2213,7 +2257,30 @@ async def handle_subtitle_document(client, message):
         return
 
     if not _pending_fc_subtitle:
-        return  # Aucun hardsub en attente de sous-titre, on ignore ce fichier
+        # Aucun hardsub/mux/burn en attente : on propose le flow autonome
+        # "Add Style Sub" — appliquer (ou pas) le house style et renvoyer
+        # le fichier, sans lancer aucun job vidéo.
+        file_name = message.document.file_name or ""
+        ext = os.path.splitext(file_name)[1].lower()
+        if ext not in (".ass", ".srt", ".ssa"):
+            return  # fichier non reconnu, on ignore silencieusement
+        os.makedirs(Paths.WORK_PATH, exist_ok=True)
+        subtitle_path = os.path.join(Paths.WORK_PATH, f"style_sub_{uuid4().hex[:8]}{ext}")
+        await message.download(file_name=subtitle_path)
+        await message.delete()
+        prompt = await colab_bot.send_message(
+            chat_id=OWNER,
+            text=(
+                f"🎨 <code>{file_name}</code>\n\n"
+                "Appliquer le <b>house style</b> (Trebuchet MS 22) sur ce sous-titre ?"
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Oui", callback_data="style_yes"),
+                InlineKeyboardButton("❌ Non", callback_data="style_no"),
+            ]]),
+        )
+        _pending_style_sub[prompt.id] = {"path": subtitle_path, "name": file_name}
+        return
 
     # 1. Priorité au reply explicite (lève l'ambiguïté si plusieurs en attente)
     reply_id = message.reply_to_message_id
