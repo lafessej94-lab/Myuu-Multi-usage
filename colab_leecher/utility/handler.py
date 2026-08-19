@@ -28,6 +28,7 @@ from colab_leecher.freeconvert import (
     quality_label as fc_quality_label,
 )
 from colab_leecher.local_convert import convert_resolution, merge_audio_video
+from colab_leecher.house_style import apply_house_style
 from colab_leecher.local_video_tools import (
     burn_subtitles,
     burn_text_overlay,
@@ -1085,6 +1086,9 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
                 async def _progress_cb(pct: float, detail: str) -> None:
                     overall = 15.0 + (max(0.0, min(pct, 100.0)) * 0.75)
                     await _fc_job_status(status_msg, kind, "Hardsub", overall, detail)
+
+                await _fc_job_status(status_msg, kind, "Style", 8.0, "Application du house style")
+                sub_path = await apply_house_style(sub_path, job_dir)
 
                 output_path = ospath.join(job_dir, f"{base}.hardsub.mp4")
                 await _fc_job_status(status_msg, kind, "Hardsub", 10.0, "ffmpeg -> incrustation")
