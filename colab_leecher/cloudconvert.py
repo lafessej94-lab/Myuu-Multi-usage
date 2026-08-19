@@ -13,7 +13,7 @@ from typing import Awaitable, Callable, Optional
 
 import aiohttp
 
-from colab_leecher.subtitle_style import DEFAULT_HARDSUB_STYLE, AssStyle, apply_hardsub_style
+from colab_leecher.house_style import DEFAULT_HARDSUB_STYLE, AssStyle, apply_hardsub_style
 
 log = logging.getLogger(__name__)
 
