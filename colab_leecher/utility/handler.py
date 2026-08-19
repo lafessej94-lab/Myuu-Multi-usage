@@ -370,6 +370,11 @@ async def _seedr_status(kind: str, stage: str, pct: float, detail: str, filename
 FC_HARDSUB_CONCURRENCY = 5
 _fc_hardsub_semaphore = asyncio.Semaphore(FC_HARDSUB_CONCURRENCY)
 
+# Même principe pour le hardsub CloudConvert sur lien direct — traitement
+# côté serveurs CloudConvert, pas sur Colab, donc parallélisable pareil.
+CC_HARDSUB_CONCURRENCY = 5
+_cc_hardsub_semaphore = asyncio.Semaphore(CC_HARDSUB_CONCURRENCY)
+
 
 async def _fc_job_status(status_msg, kind: str, stage: str, pct: float, detail: str, filename: str = "") -> None:
     """Comme _seedr_status, mais édite un message dédié à CE job précis
@@ -726,6 +731,76 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
             for d in (job_dir, subtitle_dir):
                 if ospath.exists(d):
                     shutil.rmtree(d, ignore_errors=True)
+
+
+async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: str, status_msg, resolution: str | None = None) -> None:
+    """
+    Équivalent CloudConvert de Direct_FC_Hardsub_Handler : hardsub sur un
+    lien direct (Seedr, HTTP classique...) avec sous-titre fourni
+    manuellement. Mêmes paramètres/UX que le flow FreeConvert (choix de
+    résolution avant d'envoyer le sous-titre) — juste le moteur qui change.
+
+    Conçu pour tourner en PARALLÈLE avec d'autres jobs CC hardsub (jusqu'à
+    CC_HARDSUB_CONCURRENCY à la fois) : dossier de travail et message de
+    statut dédiés à ce job.
+    """
+    if not BOT.Options.cc_api_keys:
+        try:
+            await status_msg.edit_text("❌ CloudConvert API key is missing in your Colab launcher.")
+        except Exception:
+            pass
+        return
+
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "CloudConvert Hardsub", "Queue", 0.0, "En attente d'un slot disponible...", name)
+
+    async with _cc_hardsub_semaphore:
+        try:
+            async def _process_cb(pct: float, detail: str) -> None:
+                overall = 10.0 + (max(0.0, min(pct, 100.0)) * 0.75)
+                await _fc_job_status(status_msg, "CloudConvert Hardsub", "CloudConvert", overall, detail, name)
+
+            async def _download_cb(pct: float, detail: str) -> None:
+                overall = 85.0 + (max(0.0, min(pct, 100.0)) * 0.15)
+                await _fc_job_status(status_msg, "CloudConvert Hardsub", "Download", overall, detail, name)
+
+            await _fc_job_status(status_msg, "CloudConvert Hardsub", "Queue", 5.0, "Submitting CloudConvert hardsub job", name)
+
+            await hardsub_remote_url(
+                ",".join(BOT.Options.cc_api_keys),
+                video_url,
+                name,
+                subtitle_path,
+                job_dir,
+                cc_mode=BOT.Options.cc_engine_mode,
+                quality_profile=BOT.Options.cc_quality_profile,
+                resolution=resolution,
+                process_cb=_process_cb,
+                download_cb=_download_cb,
+            )
+
+            await _fc_job_status(status_msg, "CloudConvert Hardsub", "Upload", 100.0, "Uploading to Telegram", name)
+            await Leech(job_dir, True, convert_videos=False, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>CloudConvert hardsub failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(subtitle_path):
+                try:
+                    os.remove(subtitle_path)
+                except Exception:
+                    pass
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
 
 
 async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: str, status_msg, resize: tuple[int, int] | None = None) -> None:
