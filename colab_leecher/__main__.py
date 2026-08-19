@@ -311,12 +311,19 @@ def _fc_quality_kb(flow: str) -> InlineKeyboardMarkup:
 
 
 # Mêmes codes/labels que FreeConvert — juste préfixé cc_res pour ce flow-ci.
-def _cc_direct_quality_kb() -> InlineKeyboardMarkup:
+# _cc_direct_sessions : token (8 hex chars, embedded dans callback_data) ->
+# url. Volontairement PAS indexé par message_id (contrairement à
+# _link_sessions) — le token voyage dans le bouton lui-même, donc aucune
+# dépendance à ce que message.id reste stable entre les callbacks.
+_cc_direct_sessions: dict[str, str] = {}
+
+
+def _cc_direct_quality_kb(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 Qualité d'origine", callback_data="cc_res|direct|orig")],
-        [InlineKeyboardButton("360p", callback_data="cc_res|direct|360"),
-         InlineKeyboardButton("480p", callback_data="cc_res|direct|480")],
-        [InlineKeyboardButton("720p", callback_data="cc_res|direct|720")],
+        [InlineKeyboardButton("🎬 Qualité d'origine", callback_data=f"ccdirect_res|{token}|orig")],
+        [InlineKeyboardButton("360p", callback_data=f"ccdirect_res|{token}|360"),
+         InlineKeyboardButton("480p", callback_data=f"ccdirect_res|{token}|480")],
+        [InlineKeyboardButton("720p", callback_data=f"ccdirect_res|{token}|720")],
     ])
 
 
@@ -1524,20 +1531,20 @@ async def callbacks(client, cq):
             await cq.answer("This option needs a direct HTTP(S) link.", show_alert=True)
             return
 
+        token = uuid4().hex[:8]
+        _cc_direct_sessions[token] = url
         await cq.message.edit_text(
             "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "Choisis la qualité de sortie :\n"
             "<i>Une résolution plus basse = traitement plus rapide.</i>",
-            reply_markup=_cc_direct_quality_kb(),
+            reply_markup=_cc_direct_quality_kb(token),
         )
-        _link_sessions[cq.message.id] = [url]
         return
 
-    if data.startswith("cc_res|direct|"):
-        code = data.split("|", 2)[2]
+    if data.startswith("ccdirect_res|"):
+        _, token, code = data.split("|", 2)
         resolution = _CC_RES_CODE_TO_LABEL.get(code)
-        session = _link_sessions.pop(cq.message.id, None)
-        url = (session or (BOT.SOURCE or [""]))[0].strip()
+        url = _cc_direct_sessions.pop(token, "")
         if not (url.startswith("http://") or url.startswith("https://")):
             await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
             return
