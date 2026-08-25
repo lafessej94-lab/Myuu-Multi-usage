@@ -183,13 +183,13 @@ def _probe_duration(file_path: str) -> float:
 
 
 def _extract_frame_ffmpeg(file_path: str, output_path: str, timestamp: float) -> bool:
-    """Extrait une frame en vrai 1080p (max 1920px de large, qualité quasi-lossless) via ffmpeg."""
+    """Extrait une frame en 320px max (norme Telegram) via ffmpeg."""
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(int(timestamp)),
         "-i", file_path,
         "-vframes", "1",
-        "-vf", "scale='min(1920,iw)':-2",
+        "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
         "-q:v", "2",
         output_path,
     ]
@@ -204,7 +204,7 @@ def _extract_frame_ffmpeg(file_path: str, output_path: str, timestamp: float) ->
 def thumbMaintainer(file_path):
     """
     Génère/retourne la thumbnail à utiliser pour l'upload.
-    Ordre de priorité: thumbnail custom utilisateur > thumbnail ytdl > extraction ffmpeg HD.
+    Ordre de priorité: thumbnail custom utilisateur > thumbnail ytdl > extraction ffmpeg (320px, norme Telegram).
     La frame est prise à un instant ALÉATOIRE de la vidéo (entre 10% et 90%
     de la durée, pour éviter les génériques/écrans noirs en tout début/fin)
     plutôt que toujours au milieu exact — chaque upload a donc une thumbnail
