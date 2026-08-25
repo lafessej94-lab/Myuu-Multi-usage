@@ -183,14 +183,16 @@ def _probe_duration(file_path: str) -> float:
 
 
 def _extract_frame_ffmpeg(file_path: str, output_path: str, timestamp: float) -> bool:
-    """Extrait une frame en 320px max (norme Telegram) via ffmpeg, compressée pour rester légère."""
+    """Extrait une frame réduite (200px max) via ffmpeg, avec une bonne qualité JPEG.
+    On réduit la résolution plutôt que d'écraser la qualité, pour garder une
+    thumb nette tout en restant légère en poids."""
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(int(timestamp)),
         "-i", file_path,
         "-vframes", "1",
-        "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
-        "-q:v", "10",
+        "-vf", "scale=200:200:force_original_aspect_ratio=decrease",
+        "-q:v", "4",
         output_path,
     ]
     try:
