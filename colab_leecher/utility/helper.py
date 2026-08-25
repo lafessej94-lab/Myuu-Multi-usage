@@ -183,18 +183,14 @@ def _probe_duration(file_path: str) -> float:
 
 
 def _extract_frame_ffmpeg(file_path: str, output_path: str, timestamp: float) -> bool:
-    """Extrait une frame carrée (200x200) via ffmpeg, avec une bonne qualité JPEG.
-    On agrandit l'image pour qu'elle remplisse le cadre carré (scale increase)
-    puis on rogne le centre (crop) - c'est ce qui donne le rendu propre et
-    bien rempli comme les thumbs générées nativement par Telegram, sans
-    distorsion ni bandes vides."""
+    """Extrait une frame en vrai 1080p (max 1920px de large, qualité quasi-lossless) via ffmpeg."""
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(int(timestamp)),
         "-i", file_path,
         "-vframes", "1",
-        "-vf", "scale=200:200:force_original_aspect_ratio=increase,crop=200:200",
-        "-q:v", "4",
+        "-vf", "scale='min(1920,iw)':-2",
+        "-q:v", "2",
         output_path,
     ]
     try:
@@ -208,7 +204,7 @@ def _extract_frame_ffmpeg(file_path: str, output_path: str, timestamp: float) ->
 def thumbMaintainer(file_path):
     """
     Génère/retourne la thumbnail à utiliser pour l'upload.
-    Ordre de priorité: thumbnail custom utilisateur > thumbnail ytdl > extraction ffmpeg (320px, norme Telegram).
+    Ordre de priorité: thumbnail custom utilisateur > thumbnail ytdl > extraction ffmpeg HD.
     La frame est prise à un instant ALÉATOIRE de la vidéo (entre 10% et 90%
     de la durée, pour éviter les génériques/écrans noirs en tout début/fin)
     plutôt que toujours au milieu exact — chaque upload a donc une thumbnail
