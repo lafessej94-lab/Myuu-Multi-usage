@@ -183,15 +183,17 @@ def _probe_duration(file_path: str) -> float:
 
 
 def _extract_frame_ffmpeg(file_path: str, output_path: str, timestamp: float) -> bool:
-    """Extrait une frame réduite (200px max) via ffmpeg, avec une bonne qualité JPEG.
-    On réduit la résolution plutôt que d'écraser la qualité, pour garder une
-    thumb nette tout en restant légère en poids."""
+    """Extrait une frame carrée (200x200) via ffmpeg, avec une bonne qualité JPEG.
+    On agrandit l'image pour qu'elle remplisse le cadre carré (scale increase)
+    puis on rogne le centre (crop) - c'est ce qui donne le rendu propre et
+    bien rempli comme les thumbs générées nativement par Telegram, sans
+    distorsion ni bandes vides."""
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(int(timestamp)),
         "-i", file_path,
         "-vframes", "1",
-        "-vf", "scale=200:200:force_original_aspect_ratio=decrease",
+        "-vf", "scale=200:200:force_original_aspect_ratio=increase,crop=200:200",
         "-q:v", "4",
         output_path,
     ]
