@@ -11,7 +11,7 @@ from typing import Awaitable, Callable, Optional
 
 import aiohttp
 
-from colab_leecher.house_style import DEFAULT_HARDSUB_STYLE, AssStyle, apply_hardsub_style
+from colab_leecher.house_style import apply_hardsub_style
 
 log = logging.getLogger(__name__)
 
@@ -333,7 +333,6 @@ async def hardsub_remote_url(
     dest_dir: str,
     *,
     quality_profile: str = "balanced",
-    style: AssStyle = DEFAULT_HARDSUB_STYLE,
     resize: Optional[tuple[int, int]] = None,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
@@ -343,6 +342,13 @@ async def hardsub_remote_url(
     Brûle des sous-titres dans une vidéo via FreeConvert, en forçant le style
     ASS (police/contour/ombre) avant envoi puisque FreeConvert applique
     tel quel le style écrit dans le fichier sous-titre reçu.
+
+    Le style appliqué n'est plus un profil unique passé en paramètre : depuis
+    la refonte de `house_style.apply_hardsub_style`, chaque nom de style
+    trouvé dans le fichier source (TopLeft, TopCenter, ..., BottomCenter,
+    Default, ou un nom tiers inconnu) reçoit automatiquement le bon profil
+    (dialogue ou accent) avec le bon alignment — fidèle au fichier ASS
+    Crunchyroll de référence. On ne force donc plus un `style=` ici.
 
     resize : optionnel — (largeur, hauteur) cible, ex (854, 480) pour du
     480p. Réduit le temps de traitement FreeConvert ET le poids du fichier
@@ -362,9 +368,11 @@ async def hardsub_remote_url(
     output_name = f"{base}.VOSTFR.mp4"
     output_path = os.path.join(dest_dir, output_name)
 
-    # Pré-stylage : force le rendu, indépendamment de ce que contenait le fichier source
+    # Pré-stylage : force le rendu, indépendamment de ce que contenait le fichier source.
+    # apply_hardsub_style() n'accepte plus de paramètre `style` : elle applique
+    # elle-même le bon profil par position (voir house_style.py).
     styled_sub_path = os.path.join(dest_dir, f"{base}.styled.ass")
-    apply_hardsub_style(subtitle_path, styled_sub_path, style=style)
+    apply_hardsub_style(subtitle_path, styled_sub_path)
     subtitle_b64 = _encode_subtitle_b64(styled_sub_path)
 
     payload = _create_hardsub_payload(
