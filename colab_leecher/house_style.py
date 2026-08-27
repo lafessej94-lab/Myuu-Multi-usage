@@ -23,6 +23,17 @@ bas d'écran), cette version conserve un profil par position ASS standard
 (TopLeft, TopCenter, ..., BottomRight) et ne retombe sur le profil dialogue
 bas-centré que pour un nom de style inconnu (raw non-CR, style "Italique",
 "Sign", etc.).
+
+MAJ : le profil visuel (police, taille, contour, ombre, marges) est
+désormais IDENTIQUE quelle que soit la position ASS. Seuls l'alignment
+(numpad) et les marges associées changent selon le nom de style trouvé dans
+la source. Avant ce correctif, les lignes non-BottomCenter/Default (ex:
+TopCenter) recevaient un profil "accent" différent (taille 23 au lieu de 22,
+outline 2 sans ombre au lieu de outline 1 + ombre 1), ce qui rendait ces
+lignes visiblement différentes du reste du sous-titre (rendu plus épais et
+sans ombre) alors qu'elles font pourtant partie du même sous-titrage. Le but
+recherché est un seul et même "style maison" partout, avec juste le
+positionnement à l'écran qui change.
 """
 import os
 import subprocess
@@ -49,18 +60,21 @@ class AssStyle:
     margin_v: int = 20
 
 
-# ── Profils de base ──────────────────────────────────────────────────────────
-# BottomCenter (dialogue) : plus fin, avec ombre — pour le gros volume de texte
-# affiché en continu sans surcharger l'image.
-DIALOGUE_STYLE = AssStyle(fontsize=22, outline=1, shadow=1, alignment=2)
+# ── Profil unique ─────────────────────────────────────────────────────────
+# Un seul et même rendu visuel (police, taille, contour, ombre) pour TOUTES
+# les positions ASS. Seul l'alignment (et donc la position à l'écran) varie
+# selon le nom de style trouvé dans la source — voir _profile_for_style_name.
+HOUSE_STYLE = AssStyle(fontsize=22, outline=1, shadow=1, alignment=2)
 
-# Toutes les autres positions (titres, cartons, signs) : plus épais, sans
-# ombre — reste net même en gros texte statique.
-ACCENT_STYLE = AssStyle(fontsize=23, outline=2, shadow=0, alignment=2)
+# Alias conservés pour compat (ancien code/imports qui référencerait encore
+# ces noms) : les deux profils "dialogue" et "accent" sont désormais
+# strictement identiques.
+DIALOGUE_STYLE = HOUSE_STYLE
+ACCENT_STYLE = HOUSE_STYLE
 
 # Style par défaut utilisé pour tout nom de style non reconnu (fallback sûr,
 # identique au comportement de l'ancienne version).
-DEFAULT_HARDSUB_STYLE = DIALOGUE_STYLE
+DEFAULT_HARDSUB_STYLE = HOUSE_STYLE
 
 # Alignment ASS (numpad layout) par nom de style CR standard.
 STYLE_NAME_ALIGNMENT = {
@@ -69,9 +83,6 @@ STYLE_NAME_ALIGNMENT = {
     "BottomLeft": 1, "BottomCenter": 2, "BottomRight": 3,
     "Default": 2,
 }
-
-# Noms qui utilisent le profil dialogue plutôt que le profil accent.
-_DIALOGUE_PROFILE_NAMES = {"BottomCenter", "Default"}
 
 # Résolution de référence du script — DOIT matcher celle du fichier source
 # (640x360), sinon la taille de police ne sera pas à l'échelle correcte une
@@ -85,14 +96,14 @@ def _profile_for_style_name(name: str) -> AssStyle:
     """
     Retourne l'AssStyle à utiliser pour un nom de style donné.
 
-    - Nom reconnu (les 9 positions CR + Default) -> bon profil (dialogue ou
-      accent) avec le bon alignment.
-    - Nom inconnu (style d'un raw tiers, ex: "Italique", "Sign") -> profil
-      dialogue bas-centré par défaut, comme avant (fallback sûr).
+    Le rendu (police, taille, contour, ombre, marges) est toujours celui de
+    HOUSE_STYLE. Seul l'alignment change :
+    - Nom reconnu (les 9 positions CR + Default) -> alignment correspondant.
+    - Nom inconnu (style d'un raw tiers, ex: "Italique", "Sign") -> alignment
+      par défaut (bas-centré), comme avant (fallback sûr).
     """
-    base = DIALOGUE_STYLE if name in _DIALOGUE_PROFILE_NAMES else ACCENT_STYLE
-    alignment = STYLE_NAME_ALIGNMENT.get(name, DIALOGUE_STYLE.alignment)
-    return replace(base, alignment=alignment)
+    alignment = STYLE_NAME_ALIGNMENT.get(name, HOUSE_STYLE.alignment)
+    return replace(HOUSE_STYLE, alignment=alignment)
 
 
 def _ass_style_line(style: AssStyle, name: str = "Default") -> str:
@@ -141,10 +152,12 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
     Force le style de rendu d'un sous-titre (.srt ou .ass) et écrit le résultat
     en .ass prêt à être envoyé au burn-in (FC, CC, ou FFmpeg local).
 
-    Chaque nom de style trouvé dans le fichier source reçoit le profil qui lui
-    correspond (voir _profile_for_style_name) : un style "BottomCenter" ou
-    "TopCenter" garde son positionnement d'origine, un style non reconnu
-    retombe sur le profil dialogue bas-centré.
+    Chaque nom de style trouvé dans le fichier source reçoit le même rendu
+    visuel (HOUSE_STYLE) ; seul l'alignment change selon le nom (voir
+    _profile_for_style_name) : un style "BottomCenter" ou "TopCenter" garde
+    son positionnement d'origine mais un rendu strictement identique
+    (police, taille, contour, ombre), un style non reconnu retombe sur
+    l'alignment bas-centré par défaut.
 
     Retourne le chemin du fichier .ass stylé (= output_path).
     """
@@ -162,7 +175,7 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
         lines = fh.readlines()
 
     # 1er passage : on récupère les noms de tous les styles définis dans le
-    # fichier source, pour pouvoir leur appliquer à chacun le bon profil.
+    # fichier source, pour pouvoir leur appliquer à chacun le bon alignment.
     style_names: list[str] = []
     in_styles_scan = False
     for line in lines:
@@ -182,7 +195,7 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
         style_names = ["Default"]
 
     # 2e passage : on reconstruit le fichier en remplaçant tout le bloc de
-    # styles par une ligne "Style:" par nom trouvé, chacune avec son profil.
+    # styles par une ligne "Style:" par nom trouvé, chacune avec son alignment.
     out_lines: list[str] = []
     in_styles_section = False
     styles_written = False
