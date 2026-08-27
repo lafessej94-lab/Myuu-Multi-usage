@@ -14,10 +14,19 @@ sa capacité à accepter des options de style en paramètre.
 
 Si le fichier source est un .srt (pas de style), on le convertit d'abord en
 .ass via ffmpeg pour obtenir un header standard, qu'on écrase ensuite.
+
+House style basée sur le fichier ASS Crunchyroll de Mushoku Tensei S3E9
+(PlayRes 640x360). Contrairement à l'ancienne version qui appliquait un style
+UNIQUE et uniforme à tous les noms de style trouvés dans la source (ce qui
+cassait le positionnement des lignes non-dialogue, ex: TopCenter réécrit en
+bas d'écran), cette version conserve un profil par position ASS standard
+(TopLeft, TopCenter, ..., BottomRight) et ne retombe sur le profil dialogue
+bas-centré que pour un nom de style inconnu (raw non-CR, style "Italique",
+"Sign", etc.).
 """
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from os import path as ospath
 
 
@@ -26,7 +35,7 @@ class AssStyle:
     fontname: str = "Trebuchet MS"
     fontsize: int = 22
     primary_colour: str = "&H00FFFFFF"   # blanc pur (format ASS: &HAABBGGRR)
-    secondary_colour: str = "&H000000FF"
+    secondary_colour: str = "&H00FFFFFF"
     outline_colour: str = "&H00000000"   # contour noir
     back_colour: str = "&H00000000"      # couleur de l'ombre portée (utilisée aussi comme back-color de la boîte en BorderStyle=3)
     bold: int = -1                       # -1 = gras activé en ASS (0 = désactivé)
@@ -34,14 +43,35 @@ class AssStyle:
     border_style: int = 1                # 1 = contour + ombre, 3 = boîte pleine
     outline: float = 1
     shadow: float = 1
-    alignment: int = 2                   # 2 = bas centré (numpad ASS)
-    margin_l: int = 2
-    margin_r: int = 2
-    margin_v: int = 25
+    alignment: int = 2                   # numpad ASS (voir STYLE_NAME_ALIGNMENT)
+    margin_l: int = 20
+    margin_r: int = 20
+    margin_v: int = 20
 
 
-# Style par défaut appliqué à tous les hardsubs.
-DEFAULT_HARDSUB_STYLE = AssStyle()
+# ── Profils de base ──────────────────────────────────────────────────────────
+# BottomCenter (dialogue) : plus fin, avec ombre — pour le gros volume de texte
+# affiché en continu sans surcharger l'image.
+DIALOGUE_STYLE = AssStyle(fontsize=22, outline=1, shadow=1, alignment=2)
+
+# Toutes les autres positions (titres, cartons, signs) : plus épais, sans
+# ombre — reste net même en gros texte statique.
+ACCENT_STYLE = AssStyle(fontsize=23, outline=2, shadow=0, alignment=2)
+
+# Style par défaut utilisé pour tout nom de style non reconnu (fallback sûr,
+# identique au comportement de l'ancienne version).
+DEFAULT_HARDSUB_STYLE = DIALOGUE_STYLE
+
+# Alignment ASS (numpad layout) par nom de style CR standard.
+STYLE_NAME_ALIGNMENT = {
+    "TopLeft": 7, "TopCenter": 8, "TopRight": 9,
+    "CenterLeft": 4, "CenterCenter": 5, "CenterRight": 6,
+    "BottomLeft": 1, "BottomCenter": 2, "BottomRight": 3,
+    "Default": 2,
+}
+
+# Noms qui utilisent le profil dialogue plutôt que le profil accent.
+_DIALOGUE_PROFILE_NAMES = {"BottomCenter", "Default"}
 
 # Résolution de référence du script — DOIT matcher celle du fichier source
 # (640x360), sinon la taille de police ne sera pas à l'échelle correcte une
@@ -49,6 +79,20 @@ DEFAULT_HARDSUB_STYLE = AssStyle()
 # le ratio actual_resolution / PlayRes).
 PLAY_RES_X = 640
 PLAY_RES_Y = 360
+
+
+def _profile_for_style_name(name: str) -> AssStyle:
+    """
+    Retourne l'AssStyle à utiliser pour un nom de style donné.
+
+    - Nom reconnu (les 9 positions CR + Default) -> bon profil (dialogue ou
+      accent) avec le bon alignment.
+    - Nom inconnu (style d'un raw tiers, ex: "Italique", "Sign") -> profil
+      dialogue bas-centré par défaut, comme avant (fallback sûr).
+    """
+    base = DIALOGUE_STYLE if name in _DIALOGUE_PROFILE_NAMES else ACCENT_STYLE
+    alignment = STYLE_NAME_ALIGNMENT.get(name, DIALOGUE_STYLE.alignment)
+    return replace(base, alignment=alignment)
 
 
 def _ass_style_line(style: AssStyle, name: str = "Default") -> str:
@@ -92,20 +136,15 @@ def _srt_to_ass(srt_path: str, ass_path: str) -> None:
         raise RuntimeError(f"Échec conversion srt->ass: {result.stderr.decode(errors='ignore')[:300]}")
 
 
-def apply_hardsub_style(
-    subtitle_path: str,
-    output_path: str,
-    style: AssStyle = DEFAULT_HARDSUB_STYLE,
-) -> str:
+def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
     """
     Force le style de rendu d'un sous-titre (.srt ou .ass) et écrit le résultat
     en .ass prêt à être envoyé au burn-in (FC, CC, ou FFmpeg local).
 
-    Tous les styles nommés trouvés dans le fichier source (Default, Italique,
-    Sign, etc.) reçoivent le MÊME style uniforme (celui passé en paramètre) —
-    ça évite qu'une ligne de dialogue référencant un style autre que "Default"
-    (ex: un style "Italique" du fichier d'origine) ne tombe sur un style
-    manquant ou conserve un rendu non désiré (italique, police différente...).
+    Chaque nom de style trouvé dans le fichier source reçoit le profil qui lui
+    correspond (voir _profile_for_style_name) : un style "BottomCenter" ou
+    "TopCenter" garde son positionnement d'origine, un style non reconnu
+    retombe sur le profil dialogue bas-centré.
 
     Retourne le chemin du fichier .ass stylé (= output_path).
     """
@@ -123,7 +162,7 @@ def apply_hardsub_style(
         lines = fh.readlines()
 
     # 1er passage : on récupère les noms de tous les styles définis dans le
-    # fichier source, pour pouvoir leur appliquer à tous notre style uniforme.
+    # fichier source, pour pouvoir leur appliquer à chacun le bon profil.
     style_names: list[str] = []
     in_styles_scan = False
     for line in lines:
@@ -143,8 +182,7 @@ def apply_hardsub_style(
         style_names = ["Default"]
 
     # 2e passage : on reconstruit le fichier en remplaçant tout le bloc de
-    # styles par une ligne "Style:" par nom trouvé, toutes identiques (notre
-    # style forcé).
+    # styles par une ligne "Style:" par nom trouvé, chacune avec son profil.
     out_lines: list[str] = []
     in_styles_section = False
     styles_written = False
@@ -169,7 +207,7 @@ def apply_hardsub_style(
             out_lines.append("[V4+ Styles]\n")
             out_lines.append(_STYLE_FORMAT_HEADER + "\n")
             for name in style_names:
-                out_lines.append(_ass_style_line(style, name=name) + "\n")
+                out_lines.append(_ass_style_line(_profile_for_style_name(name), name=name) + "\n")
             styles_written = True
             continue
 
@@ -192,7 +230,7 @@ def apply_hardsub_style(
                 final_lines.append("[V4+ Styles]\n")
                 final_lines.append(_STYLE_FORMAT_HEADER + "\n")
                 for name in style_names:
-                    final_lines.append(_ass_style_line(style, name=name) + "\n")
+                    final_lines.append(_ass_style_line(_profile_for_style_name(name), name=name) + "\n")
                 final_lines.append("\n")
                 inserted = True
             final_lines.append(line)
@@ -215,11 +253,10 @@ def apply_hardsub_style(
 #
 # Ce wrapper garde ce point d'entrée fonctionnel sans toucher aux call sites,
 # en le faisant passer par la nouvelle logique apply_hardsub_style() ci-dessus.
-# À supprimer si tu migres les appelants vers apply_hardsub_style() directement.
 async def apply_house_style(sub_path: str, tmp_dir: str) -> str:
     out_path = os.path.join(tmp_dir, "hs_house_styled.ass")
     try:
-        return apply_hardsub_style(sub_path, out_path, DEFAULT_HARDSUB_STYLE)
+        return apply_hardsub_style(sub_path, out_path)
     except Exception:
         # Fallback silencieux comme l'ancien module : le job continue avec
         # le sous-titre original plutôt que de planter.
