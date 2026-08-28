@@ -8,6 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
+from urllib.parse import unquote
 
 import aiohttp
 
@@ -363,15 +364,25 @@ async def hardsub_remote_url(
     api_key = await pick_working_key(keys)
     cfg = QUALITY_PROFILES[normalize_quality_profile(quality_profile)]
 
-    base = os.path.splitext(os.path.basename(source_name))[0]
-    input_format = os.path.splitext(source_name)[1].lstrip(".").lower() or "mkv"
+    # source_name arrive parfois encore URL-encodé (ex: "%20" au lieu
+    # d'espace) quand il provient d'une URL ou d'un nom de fichier extrait
+    # d'un lien. On le décode AVANT de construire le nom final, sinon la
+    # vidéo (et le sous-titre, voir plus bas) ressortent avec des "%20"
+    # littéraux dans leur nom une fois envoyés sur Telegram.
+    clean_source_name = unquote(source_name)
+
+    base = os.path.splitext(os.path.basename(clean_source_name))[0]
+    input_format = os.path.splitext(clean_source_name)[1].lstrip(".").lower() or "mkv"
     output_name = f"{base}.VOSTFR.mp4"
     output_path = os.path.join(dest_dir, output_name)
 
     # Pré-stylage : force le rendu, indépendamment de ce que contenait le fichier source.
     # apply_hardsub_style() n'accepte plus de paramètre `style` : elle applique
     # elle-même le bon profil par position (voir house_style.py).
-    styled_sub_path = os.path.join(dest_dir, f"{base}.styled.ass")
+    # Le sous-titre stylé reprend le MÊME nom de base que la vidéo finale
+    # (juste l'extension .ass à la place de .mp4), pour que les deux fichiers
+    # envoyés à l'utilisateur soient facilement associables l'un à l'autre.
+    styled_sub_path = os.path.join(dest_dir, f"{base}.VOSTFR.ass")
     apply_hardsub_style(subtitle_path, styled_sub_path)
     subtitle_b64 = _encode_subtitle_b64(styled_sub_path)
 
