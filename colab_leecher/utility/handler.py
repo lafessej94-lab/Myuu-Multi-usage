@@ -54,7 +54,7 @@ from colab_leecher.utility.variables import (
 from colab_leecher.utility.converters import archive, extract, videoConverter, sizeChecker
 from colab_leecher.utility.helper import (
     fileType, getSize, getTime, keyboard,
-    shortFileName, sizeUnit, sysINFO,
+    render_task_status, shortFileName, sizeUnit, sysINFO,
 )
 
 
@@ -376,18 +376,32 @@ CC_HARDSUB_CONCURRENCY = 5
 _cc_hardsub_semaphore = asyncio.Semaphore(CC_HARDSUB_CONCURRENCY)
 
 
+_KIND_EMOJI = {
+    "FreeConvert Hardsub": "🆓",
+    "CloudConvert Hardsub": "☁️",
+    "Seedr + FreeConvert Hardsub": "🆓",
+    "Burn Subs": "🖥️",
+    "Mux Subs": "🖥️",
+}
+
+
 async def _fc_job_status(status_msg, kind: str, stage: str, pct: float, detail: str, filename: str = "") -> None:
     """Comme _seedr_status, mais édite un message dédié à CE job précis
     plutôt que le MSG.status_msg global — permet à plusieurs jobs FreeConvert
     de tourner en parallèle sans que leurs messages de statut ne s'écrasent."""
     pct = max(0.0, min(float(pct), 100.0))
-    text = (
-        f"🆓 <b>{kind}</b>\n\n"
-        f"<code>{filename or 'FreeConvert job'}</code>\n\n"
-        f"<b>Stage</b>  <code>{stage}</code>\n"
-        f"<b>Progress</b>  <code>{pct:.1f}%</code>\n"
-        f"<b>Preset</b>  <code>{fc_quality_label(BOT.Options.cc_quality_profile)}</code>\n"
-        f"<b>Detail</b>  <code>{detail}</code>"
+    emoji = _KIND_EMOJI.get(kind, "⚙️")
+    text = render_task_status(
+        emoji=emoji,
+        title=kind.upper(),
+        filename=filename or "job",
+        pct=pct,
+        lines=[
+            ("Stage", stage),
+            ("Detail", detail),
+            ("Preset", fc_quality_label(BOT.Options.cc_quality_profile)),
+            ("Engine", kind),
+        ],
     )
     try:
         await status_msg.edit_text(text, disable_web_page_preview=True)
