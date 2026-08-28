@@ -1,4 +1,4 @@
-"""
+r"""
 services/subtitle_style.py
 
 Pré-stylage des sous-titres avant hardsub (tous moteurs : CC, FC, FFmpeg local).
@@ -24,7 +24,7 @@ bas d'écran), cette version conserve un profil par position ASS standard
 bas-centré que pour un nom de style inconnu (raw non-CR, style "Italique",
 "Sign", etc.).
 
-MAJ : le profil visuel (police, taille, contour, ombre, marges) est
+MAJ 1 : le profil visuel (police, taille, contour, ombre, marges) est
 désormais IDENTIQUE quelle que soit la position ASS. Seuls l'alignment
 (numpad) et les marges associées changent selon le nom de style trouvé dans
 la source. Avant ce correctif, les lignes non-BottomCenter/Default (ex:
@@ -34,6 +34,22 @@ lignes visiblement différentes du reste du sous-titre (rendu plus épais et
 sans ombre) alors qu'elles font pourtant partie du même sous-titrage. Le but
 recherché est un seul et même "style maison" partout, avec juste le
 positionnement à l'écran qui change.
+
+MAJ 2 : on ne réécrit plus PlayResX/PlayResY à une valeur fixe (640x360).
+Sur des sources autres que Mushoku Tensei S3E9 (raws/fansubs calibrés en
+1920x1080 ou autre), forcer le PlayRes cassait le positionnement de toute
+ligne utilisant des tags \pos()/\move() en coordonnées absolues : ces
+coordonnées sont écrites par rapport au PlayRes DÉCLARÉ par la source, donc
+changer ce PlayRes après coup décale le texte à l'écran, indépendamment du
+style appliqué.
+
+Le moteur de rendu ASS scale de toute façon le rendu (texte ET \pos())
+proportionnellement au ratio "résolution vidéo réelle / PlayRes déclaré".
+On garde donc le PlayRes d'origine du fichier source intact (les \pos()
+restent justes), et on scale à la place fontsize/outline/shadow/margins de
+HOUSE_STYLE selon le ratio "PlayResY_source / 360" (360 = référence
+Mushoku Tensei) pour obtenir la même taille apparente à l'écran, quelle que
+soit la résolution dans laquelle la source a été calibrée.
 """
 import os
 import subprocess
@@ -92,18 +108,47 @@ PLAY_RES_X = 640
 PLAY_RES_Y = 360
 
 
-def _profile_for_style_name(name: str) -> AssStyle:
+def _scale_house_style(source_play_res_y: int) -> AssStyle:
     """
-    Retourne l'AssStyle à utiliser pour un nom de style donné.
+    Renvoie HOUSE_STYLE mis à l'échelle pour que sa taille apparente à
+    l'écran reste identique quel que soit le PlayResY déclaré par la
+    source (au lieu de forcer un PlayRes fixe, ce qui casserait les
+    \\pos()/\\move() en coordonnées absolues déjà présents dans le fichier).
+
+    Le ratio est calculé par rapport à PLAY_RES_Y (360, la résolution de
+    référence de Mushoku Tensei) : une source calibrée en 1080p (PlayResY
+    ~1080) aura donc un fontsize/outline/shadow/margins x3 par rapport aux
+    valeurs de base de HOUSE_STYLE, pour un rendu visuellement équivalent.
+    """
+    if not source_play_res_y or source_play_res_y <= 0:
+        scale = 1.0
+    else:
+        scale = source_play_res_y / PLAY_RES_Y
+
+    return replace(
+        HOUSE_STYLE,
+        fontsize=max(1, round(HOUSE_STYLE.fontsize * scale)),
+        outline=round(HOUSE_STYLE.outline * scale, 2),
+        shadow=round(HOUSE_STYLE.shadow * scale, 2),
+        margin_l=max(0, round(HOUSE_STYLE.margin_l * scale)),
+        margin_r=max(0, round(HOUSE_STYLE.margin_r * scale)),
+        margin_v=max(0, round(HOUSE_STYLE.margin_v * scale)),
+    )
+
+
+def _profile_for_style_name(name: str, scaled_style: AssStyle) -> AssStyle:
+    """
+    Retourne l'AssStyle à utiliser pour un nom de style donné, à partir du
+    HOUSE_STYLE déjà mis à l'échelle (scaled_style) pour ce fichier source.
 
     Le rendu (police, taille, contour, ombre, marges) est toujours celui de
-    HOUSE_STYLE. Seul l'alignment change :
+    scaled_style. Seul l'alignment change :
     - Nom reconnu (les 9 positions CR + Default) -> alignment correspondant.
     - Nom inconnu (style d'un raw tiers, ex: "Italique", "Sign") -> alignment
       par défaut (bas-centré), comme avant (fallback sûr).
     """
-    alignment = STYLE_NAME_ALIGNMENT.get(name, HOUSE_STYLE.alignment)
-    return replace(HOUSE_STYLE, alignment=alignment)
+    alignment = STYLE_NAME_ALIGNMENT.get(name, scaled_style.alignment)
+    return replace(scaled_style, alignment=alignment)
 
 
 def _ass_style_line(style: AssStyle, name: str = "Default") -> str:
@@ -175,11 +220,20 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
         lines = fh.readlines()
 
     # 1er passage : on récupère les noms de tous les styles définis dans le
-    # fichier source, pour pouvoir leur appliquer à chacun le bon alignment.
+    # fichier source (pour l'alignment) ET le PlayResY déclaré par la source
+    # (pour scaler HOUSE_STYLE à une taille apparente équivalente, sans
+    # jamais réécrire le PlayRes lui-même -- voir _scale_house_style).
     style_names: list[str] = []
+    source_play_res_y: int = 0
     in_styles_scan = False
     for line in lines:
         stripped = line.strip()
+        if stripped.lower().startswith("playresy:"):
+            try:
+                source_play_res_y = int(float(stripped.split(":", 1)[1].strip()))
+            except (ValueError, IndexError):
+                pass
+            continue
         if stripped.lower() in ("[v4+ styles]", "[v4 styles]"):
             in_styles_scan = True
             continue
@@ -194,6 +248,11 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
     if not style_names:
         style_names = ["Default"]
 
+    # PlayResY absent/à 0 (rare, certains raws n'en déclarent pas) -> on
+    # suppose la référence Mushoku Tensei (360), donc scale = 1.0, aucun
+    # changement de taille par rapport au comportement actuel.
+    scaled_style = _scale_house_style(source_play_res_y or PLAY_RES_Y)
+
     # 2e passage : on reconstruit le fichier en remplaçant tout le bloc de
     # styles par une ligne "Style:" par nom trouvé, chacune avec son alignment.
     out_lines: list[str] = []
@@ -203,24 +262,21 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
     for line in lines:
         stripped = line.strip()
 
-        # On force PlayResX/PlayResY à notre résolution de référence, quelle
-        # que soit celle déclarée par la source. Sans ça, un fichier calibré
-        # nativement en 1920x1080 (ex: Tsundere Raws) fait apparaître notre
-        # fontsize (calibré pour 640x360) minuscule à l'écran, puisque ASS
-        # calcule la taille du texte proportionnellement au PlayRes déclaré.
-        if stripped.lower().startswith("playresx:"):
-            out_lines.append(f"PlayResX: {PLAY_RES_X}\n")
-            continue
-        if stripped.lower().startswith("playresy:"):
-            out_lines.append(f"PlayResY: {PLAY_RES_Y}\n")
-            continue
+        # PlayResX/PlayResY de la source ne sont PLUS réécrits : les
+        # \pos()/\move() déjà présents dans le fichier sont calculés par
+        # rapport à ce PlayRes d'origine. Le renderer ASS scale de toute
+        # façon tout le rendu (texte + coordonnées) selon le ratio
+        # résolution_vidéo/PlayRes, donc garder le PlayRes source préserve
+        # le positionnement -- c'est le scaling de HOUSE_STYLE
+        # (_scale_house_style) qui compense pour garder la même taille
+        # apparente de police.
 
         if stripped.lower() in ("[v4+ styles]", "[v4 styles]"):
             in_styles_section = True
             out_lines.append("[V4+ Styles]\n")
             out_lines.append(_STYLE_FORMAT_HEADER + "\n")
             for name in style_names:
-                out_lines.append(_ass_style_line(_profile_for_style_name(name), name=name) + "\n")
+                out_lines.append(_ass_style_line(_profile_for_style_name(name, scaled_style), name=name) + "\n")
             styles_written = True
             continue
 
@@ -243,7 +299,7 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
                 final_lines.append("[V4+ Styles]\n")
                 final_lines.append(_STYLE_FORMAT_HEADER + "\n")
                 for name in style_names:
-                    final_lines.append(_ass_style_line(_profile_for_style_name(name), name=name) + "\n")
+                    final_lines.append(_ass_style_line(_profile_for_style_name(name, scaled_style), name=name) + "\n")
                 final_lines.append("\n")
                 inserted = True
             final_lines.append(line)
