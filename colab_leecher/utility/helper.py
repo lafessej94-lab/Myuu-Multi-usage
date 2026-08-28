@@ -24,6 +24,50 @@ def _pct_bar(percentage: float, length: int = 12) -> str:
     return "█" * filled + "░" * (length - filled)
 
 
+def _hex_bar(percentage: float, length: int = 12) -> str:
+    """Barre de progression en hexagones (style mltb) : ⬢ rempli / ⬡ vide."""
+    filled = int(max(0.0, min(percentage, 100.0)) / 100 * length)
+    return "⬢" * filled + "⬡" * (length - filled)
+
+
+def render_task_status(
+    *,
+    emoji: str,
+    title: str,
+    filename: str = "",
+    subheader: str = "",
+    pct: float = 0.0,
+    lines: list[tuple[str, str]],
+    stop_hint: str = "Tap ❌ Cancel below",
+) -> str:
+    """
+    Gabarit de statut unifié (leech + hardsub FC/CC/local) inspiré du style
+    mltb : titre + barre hexagonale + liste de champs en arbre (┟/┠/┖).
+
+    `subheader` : bloc HTML riche déjà formaté (label + nom de fichier), tel
+    que produit par les différents call sites historiques (Messages.status_head).
+    Prioritaire sur `filename` si les deux sont fournis.
+    `lines` est une liste ordonnée de tuples (label, value) affichés un par
+    ligne ; le dernier "Stop" est toujours ajouté automatiquement à la fin.
+    """
+    bar = _hex_bar(pct)
+    header = f"{emoji} <b>{title}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    if subheader:
+        body = f"\n{subheader}\n"
+    elif filename:
+        body = f"\n<code>{filename}</code>\n\n"
+    else:
+        body = "\n"
+    body += f"┟ [{bar}] {pct:.0f}%\n"
+
+    all_lines = list(lines) + [("Stop", stop_hint)]
+    for idx, (label, value) in enumerate(all_lines):
+        branch = "┖" if idx == len(all_lines) - 1 else "┠"
+        body += f"{branch} {label} → {value}\n"
+
+    return header + body
+
+
 def _speed_emoji(speed_str: str) -> str:
     if "GiB" in speed_str or "TiB" in speed_str:
         return "🚀"
@@ -373,19 +417,24 @@ async def status_bar(down_msg, speed, percentage, eta, done, left, engine, statu
     """
     target_msg = status_msg or MSG.status_msg
     pct_f = max(0.0, min(float(percentage), 100.0))
-    bar = _pct_bar(pct_f, 16)
     elapsed = getTime((datetime.now() - BotTimes.start_time).seconds)
 
-    text = (
-        f"\n<code>[{bar}]</code>\n"
-        f"<code>{done} / {left}</code>   <b>{pct_f:.0f}%</b>\n\n"
-        f"⚡️ <code>{speed}</code>   ⏳ <code>{eta}</code>\n"
-        f"🕐 <code>{elapsed}</code>   ⚙️ <code>{engine}</code>\n"
+    text = render_task_status(
+        emoji="📥",
+        title="LEECH",
+        subheader=down_msg,
+        pct=pct_f,
+        lines=[
+            ("Processed", f"{done} of {left}"),
+            ("Speed", speed),
+            ("Time", f"{elapsed} of {eta}"),
+            ("Engine", engine),
+        ],
     )
     try:
         if isTimeOver():
             await target_msg.edit_text(
-                text=Messages.task_msg + down_msg + text + sysINFO(),
+                text=Messages.task_msg + text + sysINFO(),
                 disable_web_page_preview=True,
                 reply_markup=keyboard(),
             )
