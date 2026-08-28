@@ -445,55 +445,58 @@ async def status_bar(down_msg, speed, percentage, eta, done, left, engine, statu
 
 
 async def send_settings(client, message, msg_id, command: bool, readonly: bool = False):
+    up_toggle_label = "📄 -> Document" if BOT.Options.stream_upload else "🎞 -> Media"
     up_mode = "document" if BOT.Options.stream_upload else "media"
-    up_toggle = "📄 -> Media" if not BOT.Options.stream_upload else "🎞 -> Document"
-    pr = "—" if BOT.Setting.prefix == "" else BOT.Setting.prefix
-    su = "—" if BOT.Setting.suffix == "" else BOT.Setting.suffix
-    thmb = "✅ Définie" if BOT.Setting.thumbnail else "❌ Non définie"
+    pr = "Not Exists" if BOT.Setting.prefix == "" else BOT.Setting.prefix
+    su = "Not Exists" if BOT.Setting.suffix == "" else BOT.Setting.suffix
+    thmb = "✅ Exists" if BOT.Setting.thumbnail else "Not Exists"
     cc_ready = f"✅ {len(BOT.Options.cc_api_keys)} clé(s)" if BOT.Options.cc_api_keys else "❌ Aucune"
     fc_ready = f"✅ {len(BOT.Options.fc_api_keys)} clé(s)" if BOT.Options.fc_api_keys else "❌ Aucune"
     seedr_ready = "✅ Prêt" if str(SEEDR_USERNAME or "").strip() and str(SEEDR_PASSWORD or "").strip() else "❌ Manquant"
     n_dumps = len(BOT.Options.dump_ids)
-    dump_status = f"✅ {n_dumps} configuré(s)" if n_dumps else "❌ Aucun"
+    dump_status = f"{n_dumps} configuré(s)" if n_dumps else "Not Exists"
     autofwd_toggle = "📨 Transfert : ON" if BOT.Options.auto_forward else "📨 Transfert : OFF"
 
     if readonly:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Fermer", callback_data="close")]])
     else:
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(up_toggle, callback_data=up_mode),
-             InlineKeyboardButton("🎥 Vidéo", callback_data="video")],
-            [InlineKeyboardButton("☁️ CloudConvert", callback_data="cc"),
-             InlineKeyboardButton("🖼 Miniature", callback_data="thumb")],
+            [InlineKeyboardButton("🖼 Miniature", callback_data="thumb"),
+             InlineKeyboardButton("🎥 Vidéo (Split/Convert)", callback_data="video")],
+            [InlineKeyboardButton("📦 Destination", callback_data="dumps"),
+             InlineKeyboardButton("⬅️ Préfixe", callback_data="set-prefix")],
+            [InlineKeyboardButton("Suffixe ➡️", callback_data="set-suffix"),
+             InlineKeyboardButton("✏️ Légende", callback_data="caption")],
+            [InlineKeyboardButton(up_toggle_label, callback_data=up_mode),
+             InlineKeyboardButton("☁️ CloudConvert", callback_data="cc")],
             [InlineKeyboardButton(autofwd_toggle, callback_data="autofwd"),
-             InlineKeyboardButton("📦 Dumps", callback_data="dumps")],
-            [InlineKeyboardButton("🔑 Clés API", callback_data="apikeys")],
-            [InlineKeyboardButton("✏️ Légende", callback_data="caption")],
-            [InlineKeyboardButton("⬅️ Préfixe", callback_data="set-prefix"),
-             InlineKeyboardButton("Suffixe ➡️", callback_data="set-suffix")],
+             InlineKeyboardButton("🔑 Clés API", callback_data="apikeys")],
             [InlineKeyboardButton("✖️ Fermer", callback_data="close")],
         ])
 
+    setting_lines = [
+        ("Leech Type", BOT.Setting.stream_upload),
+        ("Custom Thumbnail", thmb),
+        ("Leech Split Size", BOT.Setting.split_video),
+        ("Leech Prefix", pr),
+        ("Leech Suffix", su),
+        ("Leech Caption", BOT.Setting.caption),
+        ("Leech Destination", dump_status),
+        ("Auto-Forward", BOT.Setting.auto_forward),
+        ("CloudConvert", cc_ready),
+        ("FreeConvert", fc_ready),
+        ("Seedr", seedr_ready),
+    ]
+    body = "\n".join(
+        f"{'┖' if i == len(setting_lines) - 1 else '┠'} {label} → <code>{value}</code>"
+        for i, (label, value) in enumerate(setting_lines)
+    )
+
     text = (
-        "⚙️ <b>Réglages du bot</b>"
+        "⚙️ <b>Leech Settings</b>"
         + (" <i>(lecture seule)</i>" if readonly else "")
-        + "\n\n"
-        "<b>🎬 Vidéo</b>\n"
-        f"Conversion       <code>{BOT.Setting.convert_video}</code>\n"
-        f"Découpage        <code>{BOT.Setting.split_video}</code>\n\n"
-        "<b>☁️ Conversion</b>\n"
-        f"Mode · Preset    <code>{cc_mode_label(BOT.Options.cc_engine_mode)} · {quality_label(BOT.Options.cc_quality_profile)}</code>\n"
-        f"Resize · Cible   <code>{resize_label(BOT.Options.cc_resize)} · {BOT.Setting.cc_target_size}</code>\n"
-        f"CloudConvert     {cc_ready}\n"
-        f"FreeConvert      {fc_ready}\n\n"
-        "<b>🔌 Intégrations</b>\n"
-        f"Seedr            {seedr_ready}\n"
-        f"Transfert auto   <code>{BOT.Setting.auto_forward}</code>\n"
-        f"Canaux dump      {dump_status}\n\n"
-        "<b>📤 Upload</b>\n"
-        f"Légende          <code>{BOT.Setting.caption}</code>\n"
-        f"Préfixe · Suffixe <code>{pr} · {su}</code>\n"
-        f"Miniature        {thmb}"
+        + "\n"
+        + body
     )
     try:
         if command:
