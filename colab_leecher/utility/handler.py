@@ -1190,8 +1190,14 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
                 await _fc_job_status(status_msg, kind, "Mux", 40.0, "ffmpeg -> ajout de la piste")
                 await mux_subtitles(video_path, sub_path, output_path)
 
+            if BOT.Options.custom_name:
+                out_ext = ospath.splitext(output_path)[1]
+                has_ext = bool(ospath.splitext(BOT.Options.custom_name)[1])
+                upload_name = BOT.Options.custom_name if has_ext else f"{BOT.Options.custom_name}{out_ext}"
+            else:
+                upload_name = ospath.basename(output_path)
             await _fc_job_status(status_msg, kind, "Upload", 95.0, "Uploading to Telegram")
-            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            await upload_file(output_path, upload_name, is_last=True, status_msg=status_msg)
             try:
                 await status_msg.delete()
             except Exception:
