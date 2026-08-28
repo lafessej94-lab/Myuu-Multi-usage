@@ -1590,18 +1590,63 @@ async def cancelTask(reason: str):
     logging.info("[Cancel] Task cancelled: %s - killed %s procs", reason, killed)
 
 
+_OUT_MODE_TAGS = {
+    "normal": "#Leech",
+    "zip": "#Zip",
+    "undzip": "#Unzip",
+    "cc_convert": "#Convert",
+    "cc_resize": "#Resize",
+    "cc_compress": "#Compress",
+}
+
+_owner_tag_cache: str | None = None
+
+
+def _in_mode_tag() -> str:
+    if BOT.Mode.ytdl:
+        return "#YTDL"
+    src = (BOT.SOURCE or [""])[0] if BOT.SOURCE else ""
+    if src.startswith("magnet:") or src.lower().endswith(".torrent"):
+        return "#Torrent"
+    if "drive.google.com" in src:
+        return "#GDrive"
+    if "mega.nz" in src or "mega.co.nz" in src:
+        return "#Mega"
+    return "#Aria2"
+
+
+async def _owner_tag() -> str:
+    """@username du propriétaire du bot, mis en cache après le 1er appel
+    (évite un appel API get_users à chaque tâche terminée)."""
+    global _owner_tag_cache
+    if _owner_tag_cache is not None:
+        return _owner_tag_cache
+    try:
+        user = await colab_bot.get_users(OWNER)
+        _owner_tag_cache = f"@{user.username}" if user.username else (user.first_name or "Owner")
+    except Exception:
+        _owner_tag_cache = "Owner"
+    return _owner_tag_cache
+
+
 async def SendLogs(is_leech: bool):
     spent = getTime((datetime.now() - BotTimes.start_time).seconds)
+    filename = Transfer.sent_file_names[-1] if Transfer.sent_file_names else "—"
+    total_files = len(Transfer.sent_file_names)
+    out_mode = _OUT_MODE_TAGS.get(BOT.Mode.type, "#Leech" if is_leech else "#Convert")
+
     summary = (
-        "✅ <b>TASK COMPLETED</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"⏱  <b>Spent</b>  <code>{spent}</code>\n"
-        f"📤  <b>Files</b>  <code>{len(Transfer.sent_file_names)}</code>\n"
-        f"💾  <b>Total</b>  <code>{sizeUnit(Transfer.total_down_size)}</code>\n"
+        f"<code>{filename}</code>\n"
+        "│\n"
+        f"┟ Task Size → <code>{sizeUnit(Transfer.total_down_size)}</code>\n"
+        f"┠ Time Taken → <code>{spent}</code>\n"
+        f"┠ In Mode → <code>{_in_mode_tag()}</code>\n"
+        f"┠ Out Mode → <code>{out_mode}</code>\n"
+        f"Total Files: <code>{total_files}</code>\n"
+        f"┖ Task By → <code>{await _owner_tag()}</code>\n\n"
+        "〶 <b>Action Performed :</b>\n"
+        "⋗ File(s) have been sent to User PM"
     )
-    if Transfer.sent_file_names:
-        recent = "\n".join(f"· <code>{name}</code>" for name in Transfer.sent_file_names[-5:])
-        summary += f"\n<b>Recent files</b>\n{recent}"
     if _tail_log(10):
         summary += "\n\n📜 <b>Need details?</b> Use <code>/logs</code>"
 
