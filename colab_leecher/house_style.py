@@ -100,6 +100,20 @@ STYLE_NAME_ALIGNMENT = {
     "Default": 2,
 }
 
+# Noms de style (hors les 9 positions CR standard) qui désignent en réalité
+# des incrustations à l'écran (cartons de titre, panneaux, texte visible
+# dans l'image) plutôt que du dialogue -- ex: "Sign" chez Erai-raws et la
+# plupart des fansubs. Si on les laisse retomber sur l'alignment bas-centré
+# par défaut (identique au dialogue), ils se superposent littéralement au
+# texte parlé chaque fois qu'un carton et une ligne de dialogue coexistent
+# dans le temps (cas fréquent : panneau visible pendant qu'un personnage
+# parle). On les route donc en haut de l'écran (alignment 8, top-center)
+# pour ne jamais entrer en collision avec le dialogue.
+# Détection par sous-chaîne insensible à la casse -> couvre "Sign", "Signs",
+# "OP_Sign", "signe", etc. sans avoir à lister tous les noms possibles.
+_SIGN_STYLE_MARKERS = ("sign", "signe", "carton", "panneau", "onscreen", "on-screen")
+_SIGN_ALIGNMENT = 8  # top-center
+
 # Résolution de référence du script — DOIT matcher celle du fichier source
 # (640x360), sinon la taille de police ne sera pas à l'échelle correcte une
 # fois le style appliqué à une vraie vidéo 1080p (ASS scale le rendu selon
@@ -143,11 +157,21 @@ def _profile_for_style_name(name: str, scaled_style: AssStyle) -> AssStyle:
 
     Le rendu (police, taille, contour, ombre, marges) est toujours celui de
     scaled_style. Seul l'alignment change :
-    - Nom reconnu (les 9 positions CR + Default) -> alignment correspondant.
-    - Nom inconnu (style d'un raw tiers, ex: "Italique", "Sign") -> alignment
-      par défaut (bas-centré), comme avant (fallback sûr).
+    - Nom reconnu parmi les 9 positions CR + Default -> alignment correspondant.
+    - Nom qui ressemble à une incrustation (Sign, Panneau, ...) -> alignment
+      haut-centré, pour ne jamais chevaucher le dialogue en bas de l'écran
+      (voir _SIGN_STYLE_MARKERS).
+    - Autre nom inconnu (ex: "Italique", "TiretsDefault" -- variantes de
+      dialogue) -> alignment par défaut (bas-centré), comme le dialogue.
     """
-    alignment = STYLE_NAME_ALIGNMENT.get(name, scaled_style.alignment)
+    if name in STYLE_NAME_ALIGNMENT:
+        alignment = STYLE_NAME_ALIGNMENT[name]
+    else:
+        lname = name.lower()
+        if any(marker in lname for marker in _SIGN_STYLE_MARKERS):
+            alignment = _SIGN_ALIGNMENT
+        else:
+            alignment = scaled_style.alignment
     return replace(scaled_style, alignment=alignment)
 
 
