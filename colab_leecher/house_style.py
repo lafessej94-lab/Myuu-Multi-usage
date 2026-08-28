@@ -52,6 +52,7 @@ Mushoku Tensei) pour obtenir la même taille apparente à l'écran, quelle que
 soit la résolution dans laquelle la source a été calibrée.
 """
 import os
+import re
 import subprocess
 from dataclasses import dataclass, replace
 from os import path as ospath
@@ -103,16 +104,39 @@ STYLE_NAME_ALIGNMENT = {
 # Noms de style (hors les 9 positions CR standard) qui désignent en réalité
 # des incrustations à l'écran (cartons de titre, panneaux, texte visible
 # dans l'image) plutôt que du dialogue -- ex: "Sign" chez Erai-raws et la
-# plupart des fansubs. Si on les laisse retomber sur l'alignment bas-centré
-# par défaut (identique au dialogue), ils se superposent littéralement au
-# texte parlé chaque fois qu'un carton et une ligne de dialogue coexistent
-# dans le temps (cas fréquent : panneau visible pendant qu'un personnage
-# parle). On les route donc en haut de l'écran (alignment 8, top-center)
-# pour ne jamais entrer en collision avec le dialogue.
-# Détection par sous-chaîne insensible à la casse -> couvre "Sign", "Signs",
-# "OP_Sign", "signe", etc. sans avoir à lister tous les noms possibles.
+# plupart des fansubs. Gardé comme signal supplémentaire en complément de la
+# détection par tags (voir _classify_style_names) : un nom qui matche ici est
+# toujours traité comme overlay même si ses lignes n'ont, par coïncidence,
+# aucun tag graphique (fichier très simple, ex: juste "SIGN" en texte brut).
 _SIGN_STYLE_MARKERS = ("sign", "signe", "carton", "panneau", "onscreen", "on-screen")
-_SIGN_ALIGNMENT = 8  # top-center
+_OVERLAY_ALIGNMENT = 8  # top-center — évite la collision avec le dialogue en bas
+
+# Tags ASS qui trahissent une incrustation stylée "à la main" (statut de jeu,
+# nom de compétence/monstre, carton de titre...) plutôt qu'une simple ligne
+# de dialogue : changement de couleur, taille de police custom, flou,
+# masque de révélation, fondu, animation, échelle horizontale/verticale.
+# Une ligne de dialogue normale (même "Italique" ou "TiretsDefault") n'a
+# jamais ces tags — au pire un simple {\i1}/{\i0}.
+_OVERLAY_TAG_PATTERN = re.compile(
+    r"\\c&|\\[1234]c&|\\fs\d|\\blur|\\clip\(|\\fad\(|\\t\(|\\fscx|\\fscy"
+)
+# \pos()/\move() sans \an accompagnant sur la même ligne : la position réelle
+# à l'écran dépend alors de l'Alignment du Style (c'est lui qui définit quel
+# point du texte correspond aux coordonnées données). Changer l'alignment
+# d'un tel style casserait le placement calculé par le fansubber -- il faut
+# impérativement garder l'alignment déclaré par la source pour ces noms-là.
+_POS_TAG_PATTERN = re.compile(r"\\pos\(|\\move\(")
+_AN_TAG_PATTERN = re.compile(r"\\an[0-9]")
+
+# Noms de style qui désignent une variante EN ITALIQUE du dialogue (pensées,
+# narration, voix off...) -- ex: "Italique" chez Erai-raws et la plupart des
+# fansubs FR. HOUSE_STYLE a italic=0 par défaut (texte droit) : sans ce
+# correctif, un style nommé "Italique" perdrait son italique après passage
+# dans notre outil, quelle que soit la valeur Italic déclarée par la source,
+# puisqu'on réécrit tout le bloc [V4+ Styles] avec un seul profil commun.
+# Détection par sous-chaîne insensible à la casse -> couvre "Italique",
+# "Italic", "ItaliqueDefault", etc.
+_ITALIC_STYLE_MARKERS = ("italiq", "italic")
 
 # Résolution de référence du script — DOIT matcher celle du fichier source
 # (640x360), sinon la taille de police ne sera pas à l'échelle correcte une
@@ -150,29 +174,120 @@ def _scale_house_style(source_play_res_y: int) -> AssStyle:
     )
 
 
-def _profile_for_style_name(name: str, scaled_style: AssStyle) -> AssStyle:
+def _classify_style_names(lines: list[str]) -> tuple[dict[str, int], dict[str, bool], dict[str, bool]]:
+    """
+    Analyse le fichier source (styles déclarés + lignes [Events]) pour
+    déterminer, pour chaque nom de style :
+    - son alignment déclaré à l'origine dans [V4+ Styles] (source_alignment) ;
+    - si au moins une de ses lignes utilise \\pos()/\\move() SANS \\an
+      correspondant (has_unanchored_pos) -> alignment à préserver tel quel ;
+    - si au moins une de ses lignes porte des tags d'incrustation stylée
+      (has_overlay_tags) -> candidat à un repositionnement en haut d'écran
+      pour éviter toute collision avec le dialogue.
+
+    Ça permet de distinguer automatiquement, sans liste de noms à maintenir
+    à la main :
+    - un vrai variant de dialogue (ex: "Italique", "TiretsDefault") : pas de
+      tags graphiques -> reste aligné comme le dialogue.
+    - une incrustation positionnée à la main via \\pos() (ex: un carton de
+      titre) : alignment déclaré préservé tel quel, pour ne pas casser le
+      point d'ancrage utilisé par le fansubber.
+    - une incrustation sans \\pos() du tout (ex: un encart de statut/jeu) :
+      remontée en haut d'écran pour ne jamais chevaucher le dialogue.
+    """
+    source_alignment: dict[str, int] = {}
+    in_styles = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() in ("[v4+ styles]", "[v4 styles]"):
+            in_styles = True
+            continue
+        if in_styles:
+            if stripped.startswith("["):
+                in_styles = False
+                continue
+            if stripped.lower().startswith("style:"):
+                fields = stripped.split(":", 1)[1].split(",")
+                if len(fields) > 18:
+                    name = fields[0].strip()
+                    try:
+                        source_alignment[name] = int(float(fields[18].strip()))
+                    except ValueError:
+                        pass
+
+    has_unanchored_pos: dict[str, bool] = {}
+    has_overlay_tags: dict[str, bool] = {}
+    in_events = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() == "[events]":
+            in_events = True
+            continue
+        if in_events and stripped.startswith("[") and stripped.lower() != "[events]":
+            in_events = False
+        if not in_events or not stripped.lower().startswith("dialogue:"):
+            continue
+        rest = stripped[len("dialogue:"):].strip()
+        fields = rest.split(",", 9)
+        if len(fields) < 10:
+            continue
+        style_name = fields[3].strip()
+        text = fields[9]
+
+        if _POS_TAG_PATTERN.search(text) and not _AN_TAG_PATTERN.search(text):
+            has_unanchored_pos[style_name] = True
+        if _OVERLAY_TAG_PATTERN.search(text):
+            has_overlay_tags[style_name] = True
+
+    return source_alignment, has_unanchored_pos, has_overlay_tags
+
+
+def _profile_for_style_name(
+    name: str,
+    scaled_style: AssStyle,
+    source_alignment: dict[str, int],
+    has_unanchored_pos: dict[str, bool],
+    has_overlay_tags: dict[str, bool],
+) -> AssStyle:
     """
     Retourne l'AssStyle à utiliser pour un nom de style donné, à partir du
     HOUSE_STYLE déjà mis à l'échelle (scaled_style) pour ce fichier source.
 
     Le rendu (police, taille, contour, ombre, marges) est toujours celui de
-    scaled_style. Seul l'alignment change :
-    - Nom reconnu parmi les 9 positions CR + Default -> alignment correspondant.
-    - Nom qui ressemble à une incrustation (Sign, Panneau, ...) -> alignment
-      haut-centré, pour ne jamais chevaucher le dialogue en bas de l'écran
-      (voir _SIGN_STYLE_MARKERS).
-    - Autre nom inconnu (ex: "Italique", "TiretsDefault" -- variantes de
-      dialogue) -> alignment par défaut (bas-centré), comme le dialogue.
+    scaled_style. Seul l'alignment change, décidé dans cet ordre :
+    1. Nom reconnu parmi les 9 positions CR + Default -> alignment correspondant.
+    2. Au moins une ligne de ce style utilise \\pos()/\\move() sans \\an
+       -> on garde l'alignment D'ORIGINE déclaré dans la source, pour ne pas
+       casser le point d'ancrage calculé par le fansubber.
+    3. Sinon, si le style porte des tags d'incrustation stylée OU que son nom
+       ressemble à un panneau/carton (_SIGN_STYLE_MARKERS) -> haut d'écran,
+       pour ne jamais chevaucher le dialogue.
+    4. Sinon (vrai variant de dialogue, ex: "Italique") -> alignment par
+       défaut du dialogue (bas-centré), comme avant.
     """
     if name in STYLE_NAME_ALIGNMENT:
-        alignment = STYLE_NAME_ALIGNMENT[name]
+        profile = replace(scaled_style, alignment=STYLE_NAME_ALIGNMENT[name])
+    elif has_unanchored_pos.get(name):
+        alignment = source_alignment.get(name, scaled_style.alignment)
+        profile = replace(scaled_style, alignment=alignment)
     else:
         lname = name.lower()
-        if any(marker in lname for marker in _SIGN_STYLE_MARKERS):
-            alignment = _SIGN_ALIGNMENT
+        is_overlay = has_overlay_tags.get(name, False) or any(
+            marker in lname for marker in _SIGN_STYLE_MARKERS
+        )
+        if is_overlay:
+            profile = replace(scaled_style, alignment=_OVERLAY_ALIGNMENT)
         else:
-            alignment = scaled_style.alignment
-    return replace(scaled_style, alignment=alignment)
+            profile = replace(scaled_style, alignment=scaled_style.alignment)
+
+    # Le flag Italic est ensuite ajusté indépendamment de l'alignment : un
+    # nom de style "Italique" doit garder son rendu en italique même s'il a
+    # aussi été classé "overlay" ou "position préservée" ci-dessus -- les
+    # deux logiques (position et italique) sont orthogonales.
+    if any(marker in name.lower() for marker in _ITALIC_STYLE_MARKERS):
+        profile = replace(profile, italic=-1)
+
+    return profile
 
 
 def _ass_style_line(style: AssStyle, name: str = "Default") -> str:
@@ -277,6 +392,12 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
     # changement de taille par rapport au comportement actuel.
     scaled_style = _scale_house_style(source_play_res_y or PLAY_RES_Y)
 
+    # Analyse des lignes [Events] pour détecter, par nom de style : un \pos()
+    # non ancré (alignment source à préserver) ou des tags d'incrustation
+    # stylée (candidat à un repositionnement en haut d'écran) -- voir
+    # _classify_style_names pour le détail du raisonnement.
+    source_alignment, has_unanchored_pos, has_overlay_tags = _classify_style_names(lines)
+
     # 2e passage : on reconstruit le fichier en remplaçant tout le bloc de
     # styles par une ligne "Style:" par nom trouvé, chacune avec son alignment.
     out_lines: list[str] = []
@@ -300,7 +421,10 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
             out_lines.append("[V4+ Styles]\n")
             out_lines.append(_STYLE_FORMAT_HEADER + "\n")
             for name in style_names:
-                out_lines.append(_ass_style_line(_profile_for_style_name(name, scaled_style), name=name) + "\n")
+                profile = _profile_for_style_name(
+                    name, scaled_style, source_alignment, has_unanchored_pos, has_overlay_tags
+                )
+                out_lines.append(_ass_style_line(profile, name=name) + "\n")
             styles_written = True
             continue
 
@@ -323,7 +447,10 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
                 final_lines.append("[V4+ Styles]\n")
                 final_lines.append(_STYLE_FORMAT_HEADER + "\n")
                 for name in style_names:
-                    final_lines.append(_ass_style_line(_profile_for_style_name(name, scaled_style), name=name) + "\n")
+                    profile = _profile_for_style_name(
+                        name, scaled_style, source_alignment, has_unanchored_pos, has_overlay_tags
+                    )
+                    final_lines.append(_ass_style_line(profile, name=name) + "\n")
                 final_lines.append("\n")
                 inserted = True
             final_lines.append(line)
