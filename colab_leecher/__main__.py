@@ -1,2451 +1,1601 @@
-import logging
-import os
-import platform
-import pathlib
-import psutil
-import shutil
+import asyncio
 import json
-import subprocess
-from datetime import datetime
-from asyncio import sleep, get_event_loop
-from urllib.parse import urlparse
-from uuid import uuid4
-from pyrogram import filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+import os
+import shutil
+import logging
 
-from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot, OWNER
-from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
-from colab_leecher.utility.handler import (
-    Direct_CC_Hardsub_Handler,
-    Direct_FC_Hardsub_Handler,
-    Local_Compress_Handler,
-    Local_ManualShot_Handler,
-    Local_Merge_Handler,
-    Local_Metadata_Handler,
-    Local_Mute_Handler,
-    Local_Rename_Handler,
-    Local_Sample_Handler,
-    Local_Screenshots_Handler,
-    Local_Split_Handler,
-    Local_Subs_Handler,
-    Local_Thumb_Handler,
-    Local_ToAudio_Handler,
-    Local_Trim_Handler,
-    Local_Video_Convert_Handler,
-    Seedr_CC_Convert_Handler,
-    Seedr_CC_Hardsub_Handler,
-    Seedr_FC_Hardsub_Handler,
-    cancelTask,
+log = logging.getLogger(__name__)
+import pathlib
+import uuid
+from asyncio import sleep
+from time import time
+from colab_leecher import OWNER, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot
+from natsort import natsorted
+from datetime import datetime
+from os import makedirs, path as ospath
+from colab_leecher.cloudconvert import (
+    cc_mode_label,
+    compress_file,
+    convert_file,
+    convert_remote_url,
+    hardsub_remote_url,
+    quality_label,
+    resize_file,
+    resize_label,
 )
-from colab_leecher.utility.variables import (
-    BOT, MSG, BotTimes, Paths, Messages, ProcessTracker, TaskInfo, Aria2c,
+from colab_leecher.freeconvert import (
+    hardsub_remote_url as fc_hardsub_remote_url,
+    quality_label as fc_quality_label,
 )
-from colab_leecher.utility.task_manager import taskScheduler
-from colab_leecher.utility.helper import (
-    isLink, setThumbnail, message_deleter, send_settings,
-    sizeUnit, getTime, is_ytdl_link, fileType, _pct_bar, _speed_emoji,
+from colab_leecher.local_convert import convert_resolution, merge_audio_video
+from colab_leecher.house_style import apply_house_style
+from colab_leecher.local_video_tools import (
+    burn_subtitles,
+    burn_text_overlay,
+    compress_video,
+    extract_audio,
+    extract_random_thumbnail,
+    mute_video,
+    mux_subtitles,
+    probe_media_info_text,
+    sample_clip,
+    screenshot_at,
+    split_video,
+    take_screenshots,
+    trim_video,
 )
 from colab_leecher.downlader.aria2 import aria2_Download
-from colab_leecher.house_style import apply_house_style
-from colab_leecher.stream_extractor import (
-    analyse, get_session, clear_session,
-    kb_type, kb_video, kb_audio, kb_subs,
-    dl_video, dl_audio, dl_sub,
+from colab_leecher.seedr import SeedrError, _del_folder, fetch_urls_via_seedr
+from colab_leecher.uploader.telegram import upload_file
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from colab_leecher.utility.variables import (
+    BOT, MSG, BotTimes, Messages, Paths, Transfer, ProcessTracker, TaskInfo,
+)
+from colab_leecher.utility.converters import archive, extract, videoConverter, sizeChecker
+from colab_leecher.utility.helper import (
+    fileType, getSize, getTime, keyboard,
+    shortFileName, sizeUnit, sysINFO,
 )
 
 
-_initial_dump = str(DUMP_ID or "").strip()
-if _initial_dump not in ("", "0"):
-    try:
-        BOT.Options.dump_ids = [int(_initial_dump)]
-    except ValueError:
-        BOT.Options.dump_ids = [_initial_dump]
-BOT.Options.auto_forward = bool(BOT.Options.dump_ids)
-BOT.Setting.auto_forward = "On" if BOT.Options.auto_forward else "Off"
+async def Leech(folder_path: str, remove: bool, convert_videos: bool = True, status_msg=None):
+    """
+    status_msg optionnel : si fourni (cas des jobs FreeConvert concurrents),
+    on édite UNIQUEMENT ce message local, sans jamais toucher au MSG.status_msg
+    global — évite que 2 jobs FC en parallèle ne se marchent dessus sur le
+    message de statut. Si absent, comportement historique inchangé (pipeline
+    leech normal, single-task, utilise le global MSG.status_msg).
+    """
+    is_global = status_msg is None
+    target_msg = status_msg or MSG.status_msg
 
-# Clés API CloudConvert/FreeConvert : reprend celles du launcher Colab comme
-# point de départ, puis gérables en plus depuis le bot via /addcc et /addfc.
-BOT.Options.cc_api_keys = [k.strip() for k in str(CC_API_KEY or "").split(",") if k.strip()]
-BOT.Options.fc_api_keys = [k.strip() for k in str(FC_API_KEY or "").split(",") if k.strip()]
-
-# ── État en mémoire pour le hardsub FreeConvert concurrent ──────────────────
-# _link_sessions : message_id (du message "Choose mode:") -> liste de sources.
-#   Nécessaire pour que plusieurs liens envoyés d'affilée ne se marchent pas
-#   dessus sur le global BOT.SOURCE — chaque bouton "mode" retrouve SON lien
-#   via le message auquel il est attaché, pas via BOT.SOURCE (qui ne reflète
-#   que le tout dernier lien envoyé).
-# _pending_fc_subtitle : message_id (du message "Envoie le sous-titre...") ->
-#   {"url":..., "name":...}. Permet plusieurs hardsub FC en attente de
-#   sous-titre en même temps — l'utilisateur répond (reply) au bon message
-#   avec le bon fichier pour lever l'ambiguïté.
-_link_sessions: dict[int, list[str]] = {}
-_pending_fc_subtitle: dict[int, dict] = {}
-
-# _pending_video : message_id (du menu affiché après réception d'une vidéo)
-# -> {"source_message": Message, "name": str}. Nécessaire pour retrouver la
-# vidéo d'origine une fois qu'un outil (ex: Video Converter) est choisi.
-_pending_video: dict[int, dict] = {}
-
-# _pending_merge : message_id (du prompt "envoie l'audio") -> {"source_message": Message}
-_pending_merge: dict[int, dict] = {}
-
-# _pending_trim : message_id (du prompt "envoie start/end") -> {"source_message": Message}
-_pending_trim: dict[int, dict] = {}
-
-# _pending_subs : message_id (du prompt "envoie le sous-titre") ->
-# {"source_message": Message, "burn": bool}. Séparé de _pending_fc_subtitle
-# (qui gère le hardsub FreeConvert sur lien distant) car ici c'est du
-# ffmpeg local sur une vidéo déjà envoyée au bot.
-_pending_subs: dict[int, dict] = {}
-
-# _pending_style_sub : message_id (du prompt Oui/Non) -> {"path": str, "ext": str}
-# Flow indépendant de tout hardsub — un sous-titre envoyé "à froid" au bot,
-# on propose juste d'appliquer le house style (Trebuchet MS 22) et de le
-# renvoyer, sans lancer aucun job vidéo.
-_pending_style_sub: dict[int, dict] = {}
-
-# _pending_manualshot / _pending_split / _pending_sample / _pending_rename :
-# message_id (du prompt texte) -> {"source_message": Message}. Même pattern
-# que _pending_trim, juste un paramètre texte différent attendu en reply.
-_pending_manualshot: dict[int, dict] = {}
-_pending_split: dict[int, dict] = {}
-_pending_sample: dict[int, dict] = {}
-_pending_rename: dict[int, dict] = {}
-
-LOCAL_RESOLUTIONS: dict[str, int] = {"480": 480, "720": 720, "1080": 1080}
-_AUDIO_EXTS = (".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus")
-
-
-def _video_tools_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎞 Video Converter", callback_data="vidtool_convert"),
-         InlineKeyboardButton("🔊 Merge Audio+Vidéo", callback_data="vidtool_merge")],
-        [InlineKeyboardButton("🖼 Thumb (aléatoire)", callback_data="vidtool_thumb"),
-         InlineKeyboardButton("📸 Screenshots", callback_data="vidtool_shots")],
-        [InlineKeyboardButton("🎯 Manual shot", callback_data="vidtool_manualshot"),
-         InlineKeyboardButton("🎬 Sample", callback_data="vidtool_sample")],
-        [InlineKeyboardButton("✂️ Trim", callback_data="vidtool_trim"),
-         InlineKeyboardButton("🔪 Split", callback_data="vidtool_split")],
-        [InlineKeyboardButton("🗜 Compress", callback_data="vidtool_compress"),
-         InlineKeyboardButton("✏️ Rename", callback_data="vidtool_rename")],
-        [InlineKeyboardButton("🎵 To Audio", callback_data="vidtool_toaudio"),
-         InlineKeyboardButton("🔇 Mute", callback_data="vidtool_mute")],
-        [InlineKeyboardButton("💬 Mux subs", callback_data="vidtool_muxsubs"),
-         InlineKeyboardButton("🔥 Burn subs", callback_data="vidtool_burnsubs")],
-        [InlineKeyboardButton("📊 Metadata", callback_data="vidtool_metadata"),
-         InlineKeyboardButton("🎞 Streams", callback_data="vidtool_streams")],
-        [InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel")],
-    ])
-
-
-def _video_res_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("480p", callback_data="vidres|480"),
-         InlineKeyboardButton("720p", callback_data="vidres|720")],
-        [InlineKeyboardButton("1080p", callback_data="vidres|1080")],
-        [InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel")],
-    ])
-
-
-def _pick_stream_source_file(root: str) -> str | None:
-    files = [str(p) for p in pathlib.Path(root).glob("**/*") if p.is_file()]
+    files = [str(p) for p in pathlib.Path(folder_path).glob("**/*") if p.is_file()]
     if not files:
-        return None
-    videos = [f for f in files if fileType(f) == "video"]
-    pool = videos or files
-    return max(pool, key=lambda p: os.path.getsize(p))
+        raise RuntimeError(f"No files were produced in {folder_path}.")
+    for f in natsorted(files):
+        fp = ospath.join(folder_path, f)
+        if convert_videos and BOT.Options.convert_video and fileType(fp) == "video":
+            await videoConverter(fp)
 
+    Transfer.total_down_size = getSize(folder_path)
 
-async def _prepare_stream_source(url: str) -> str:
-    if not url.startswith("magnet:?xt=urn:btih:"):
-        return url
+    files = natsorted([str(p) for p in pathlib.Path(folder_path).glob("**/*") if p.is_file()])
+    upload_queue = []
 
-    if os.path.exists(Paths.WORK_PATH):
-        shutil.rmtree(Paths.WORK_PATH)
-    os.makedirs(Paths.WORK_PATH, exist_ok=True)
-    os.makedirs(Paths.down_path, exist_ok=True)
+    for f in files:
+        file_path = ospath.join(folder_path, f)
+        leech = await sizeChecker(file_path, remove)
+        if leech:
+            if ospath.exists(file_path) and remove:
+                os.remove(file_path)
+            for part in natsorted(os.listdir(Paths.temp_zpath)):
+                upload_queue.append(("split", ospath.join(Paths.temp_zpath, part)))
+        else:
+            upload_queue.append(("single", file_path))
 
-    Aria2c.link_info = False
-    TaskInfo.reset()
-    TaskInfo.set(phase="download", engine="Aria2c", filename="magnet", started_at=datetime.now().timestamp())
-    await aria2_Download(url, 1)
+    total_uploads    = len(upload_queue)
+    if total_uploads == 0:
+        raise RuntimeError("Nothing to upload after processing.")
+    split_cleaned    = False
 
-    source_file = _pick_stream_source_file(Paths.down_path)
-    if not source_file:
-        raise RuntimeError("Torrent download finished but no media file was found for stream extraction.")
-    return source_file
+    for idx, (kind, file_path) in enumerate(upload_queue):
+        is_last = (idx == total_uploads - 1)
 
-
-def _fmt_hms(seconds: float) -> str:
-    total = int(seconds or 0)
-    h = total // 3600
-    m = (total % 3600) // 60
-    s = total % 60
-    if h:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
-
-
-def _probe_media_info(path: str) -> str:
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_format",
-                "-show_streams",
-                path,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=45,
+        # Update TaskInfo for /status panel
+        TaskInfo.set(
+            phase="upload", engine="Pyrofork",
+            filename=ospath.basename(file_path),
         )
-        if result.returncode != 0 or not result.stdout.strip():
+
+        if kind == "split":
+            file_name = ospath.basename(file_path)
+            new_path  = shortFileName(file_path)
+            os.rename(file_path, new_path)
+            BotTimes.current_time = time()
+            Messages.status_head  = (
+                f"📤 <b>UPLOADING</b>  <i>{idx+1} / {total_uploads}</i>\n\n"
+                f"<code>{file_name}</code>\n"
+            )
+            try:
+                edited = await target_msg.edit_text(
+                    text=Messages.task_msg + Messages.status_head
+                    + "\n⏳ <i>Starting...</i>" + sysINFO(),
+                    reply_markup=keyboard(),
+                )
+                target_msg = edited
+                if is_global:
+                    MSG.status_msg = edited
+            except Exception: pass
+            await upload_file(new_path, file_name, is_last=is_last, status_msg=target_msg)
+            Transfer.up_bytes.append(os.stat(new_path).st_size)
+            if is_last and not split_cleaned:
+                if ospath.exists(Paths.temp_zpath): shutil.rmtree(Paths.temp_zpath)
+                split_cleaned = True
+        else:
+            if not ospath.exists(Paths.temp_files_dir): makedirs(Paths.temp_files_dir)
+            if not remove: file_path = shutil.copy(file_path, Paths.temp_files_dir)
+            file_name = ospath.basename(file_path)
+            new_path  = shortFileName(file_path)
+            os.rename(file_path, new_path)
+            BotTimes.current_time = time()
+            Messages.status_head  = f"📤 <b>UPLOADING</b>\n\n<code>{file_name}</code>\n"
+            try:
+                edited = await target_msg.edit_text(
+                    text=Messages.task_msg + Messages.status_head
+                    + "\n⏳ <i>Starting...</i>" + sysINFO(),
+                    reply_markup=keyboard(),
+                )
+                target_msg = edited
+                if is_global:
+                    MSG.status_msg = edited
+            except Exception: pass
+            file_size = os.stat(new_path).st_size
+            await upload_file(new_path, file_name, is_last=is_last, status_msg=target_msg)
+            Transfer.up_bytes.append(file_size)
+            if remove and ospath.exists(new_path): os.remove(new_path)
+            elif not remove:
+                for fi in os.listdir(Paths.temp_files_dir):
+                    os.remove(ospath.join(Paths.temp_files_dir, fi))
+
+    if remove and ospath.exists(folder_path): shutil.rmtree(folder_path)
+    if is_global:
+        for d in (Paths.thumbnail_ytdl, Paths.temp_files_dir):
+            if ospath.exists(d): shutil.rmtree(d)
+
+
+async def CloudConvert_Handler(folder_path: str, remove: bool):
+    if not BOT.Options.cc_api_keys:
+        await cancelTask("CloudConvert API key is missing in your Colab launcher.")
+        return
+
+    files = natsorted([str(p) for p in pathlib.Path(folder_path).glob("**/*") if p.is_file()])
+    video_files = [f for f in files if fileType(f) == "video"]
+    if not video_files:
+        await cancelTask("CloudConvert mode needs at least one video file.")
+        return
+
+    if ospath.exists(Paths.temp_cc_path):
+        shutil.rmtree(Paths.temp_cc_path)
+    makedirs(Paths.temp_cc_path)
+
+    for f in files:
+        if fileType(f) == "video":
+            continue
+        rel = ospath.relpath(f, folder_path)
+        dest = ospath.join(Paths.temp_cc_path, rel)
+        os.makedirs(ospath.dirname(dest), exist_ok=True)
+        shutil.copy2(f, dest)
+
+    total_videos = len(video_files)
+
+    for idx, video_path in enumerate(video_files):
+        rel = ospath.relpath(video_path, folder_path)
+        out_dir = ospath.join(Paths.temp_cc_path, ospath.dirname(rel))
+        os.makedirs(out_dir, exist_ok=True)
+        display_name = ospath.basename(video_path)
+        chunk_start = idx / total_videos * 100.0
+        chunk_end = (idx + 1) / total_videos * 100.0
+        stage_state = {"last": 0.0}
+
+        async def _cc_update(stage: str, pct: float, detail: str) -> None:
+            now = time()
+            if now - stage_state["last"] < 2 and pct < 100:
+                return
+            stage_state["last"] = now
+            overall = chunk_start + ((chunk_end - chunk_start) * max(0.0, min(pct, 100.0)) / 100.0)
+            TaskInfo.set(
+                phase="process",
+                engine="CloudConvert",
+                filename=display_name,
+                percentage=overall,
+                speed=detail,
+                eta="-",
+            )
+            text = (
+                f"☁️ <b>CLOUDCONVERT</b>\n\n"
+                f"<code>{display_name}</code>\n\n"
+                f"<b>Stage</b>  <code>{stage}</code>\n"
+                f"<b>Progress</b>  <code>{overall:.1f}%</code>\n"
+                f"<b>Mode</b>  <code>{cc_mode_label(BOT.Options.cc_engine_mode)}</code>\n"
+                f"<b>Preset</b>  <code>{quality_label(BOT.Options.cc_quality_profile)}</code>\n"
+                f"<b>Detail</b>  <code>{detail}</code>"
+            )
+            try:
+                await MSG.status_msg.edit_text(
+                    text=Messages.task_msg + text + sysINFO(),
+                    reply_markup=keyboard(),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+
+        upload_cb = lambda pct, detail: _cc_update("Upload", pct * 0.35, detail)
+        process_cb = lambda pct, detail: _cc_update("Process", 35.0 + (pct * 0.5), detail)
+        download_cb = lambda pct, detail: _cc_update("Download", 85.0 + (pct * 0.15), detail)
+
+        try:
+            if BOT.Mode.type == "cc_convert":
+                await _cc_update("Convert", 0.0, "Preparing CloudConvert job")
+                await convert_file(
+                    ",".join(BOT.Options.cc_api_keys),
+                    video_path,
+                    out_dir,
+                    output_ext=BOT.Options.video_out,
+                    cc_mode=BOT.Options.cc_engine_mode,
+                    quality_profile=BOT.Options.cc_quality_profile,
+                    upload_cb=upload_cb,
+                    process_cb=process_cb,
+                    download_cb=download_cb,
+                )
+            elif BOT.Mode.type == "cc_resize":
+                await _cc_update("Resize", 0.0, f"Target {resize_label(BOT.Options.cc_resize)}")
+                await resize_file(
+                    ",".join(BOT.Options.cc_api_keys),
+                    video_path,
+                    out_dir,
+                    height=BOT.Options.cc_resize,
+                    output_ext=BOT.Options.video_out,
+                    cc_mode=BOT.Options.cc_engine_mode,
+                    quality_profile=BOT.Options.cc_quality_profile,
+                    upload_cb=upload_cb,
+                    process_cb=process_cb,
+                    download_cb=download_cb,
+                )
+            else:
+                await _cc_update("Compress", 0.0, f"Target {BOT.Setting.cc_target_size}")
+                await compress_file(
+                    ",".join(BOT.Options.cc_api_keys),
+                    video_path,
+                    out_dir,
+                    target_mb=BOT.Options.cc_target_size_mb,
+                    cc_mode=BOT.Options.cc_engine_mode,
+                    upload_cb=upload_cb,
+                    process_cb=process_cb,
+                    download_cb=download_cb,
+                )
+        except Exception as exc:
+            await cancelTask(f"CloudConvert failed: {display_name}\n\n{exc}")
+            return
+
+    await Leech(Paths.temp_cc_path, True, convert_videos=False)
+    if remove and ospath.exists(folder_path):
+        shutil.rmtree(folder_path)
+
+
+def _seedr_ready() -> bool:
+    return bool((SEEDR_USERNAME or os.environ.get("SEEDR_USERNAME", "")).strip()) and bool(
+        (SEEDR_PASSWORD or os.environ.get("SEEDR_PASSWORD", "")).strip()
+    )
+
+
+def _seedr_video_files(files: list[dict]) -> list[dict]:
+    videos = [f for f in files if fileType(f.get("name", "")) == "video" and f.get("url")]
+    return sorted(videos, key=lambda item: int(item.get("size", 0) or 0), reverse=True)
+
+
+async def _run_tracked_process(args: list[str], label: str) -> tuple[str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    ProcessTracker.register(proc.pid, label)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
+    except asyncio.TimeoutError as exc:
+        proc.kill()
+        raise RuntimeError(f"{label} timed out after 1800 seconds") from exc
+    finally:
+        ProcessTracker.unregister(proc.pid)
+    out = stdout.decode("utf-8", errors="replace")
+    err = stderr.decode("utf-8", errors="replace")
+    if proc.returncode != 0:
+        detail = err.strip() or out.strip() or f"{label} failed with code {proc.returncode}"
+        raise RuntimeError(detail)
+    return out, err
+
+
+def _tail_log(lines: int = 80) -> str:
+    try:
+        if not ospath.exists(Paths.LOG_PATH):
             return ""
-        data = json.loads(result.stdout)
-    except Exception as exc:
-        logging.warning("Media info probe failed: %s", exc)
+        with open(Paths.LOG_PATH, "r", encoding="utf-8", errors="replace") as fh:
+            chunk = fh.readlines()[-lines:]
+        return "".join(chunk).strip()
+    except Exception:
         return ""
 
-    fmt = data.get("format", {}) or {}
-    streams = data.get("streams", []) or []
-    lines = [
-        "MEDIA INFO",
-        f"FILE  <code>{os.path.basename(path)}</code>",
-        f"SIZE  <code>{sizeUnit(os.path.getsize(path))}</code>",
-    ]
-    duration = float(fmt.get("duration") or 0.0)
-    if duration > 0:
-        lines.append(f"DURATION  <code>{_fmt_hms(duration)}</code>")
 
-    for stream in streams:
-        stype = str(stream.get("codec_type") or "").lower()
-        codec = str(stream.get("codec_name") or "?").upper()
-        tags = stream.get("tags", {}) or {}
-        lang = (tags.get("language") or "").lower()
-        lang_s = f" [{lang}]" if lang else ""
-        if stype == "video":
-            w = stream.get("width", 0)
-            h = stream.get("height", 0)
-            fr = str(stream.get("r_frame_rate") or "0/1")
+async def _seedr_status(kind: str, stage: str, pct: float, detail: str, filename: str = "") -> None:
+    pct = max(0.0, min(float(pct), 100.0))
+    TaskInfo.set(
+        phase="process",
+        engine="Seedr+CloudConvert",
+        filename=filename or TaskInfo.filename or Messages.download_name,
+        percentage=pct,
+        speed=detail,
+        eta="-",
+    )
+    text = (
+        f"☁️ <b>{kind}</b>\n\n"
+        f"<code>{filename or Messages.download_name or 'Seedr job'}</code>\n\n"
+        f"<b>Stage</b>  <code>{stage}</code>\n"
+        f"<b>Progress</b>  <code>{pct:.1f}%</code>\n"
+        f"<b>Mode</b>  <code>{cc_mode_label(BOT.Options.cc_engine_mode)}</code>\n"
+        f"<b>Preset</b>  <code>{quality_label(BOT.Options.cc_quality_profile)}</code>\n"
+        f"<b>Detail</b>  <code>{detail}</code>"
+    )
+    try:
+        await MSG.status_msg.edit_text(
+            text=Messages.task_msg + text + sysINFO(),
+            reply_markup=keyboard(),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
+
+# ═════════════════════════════════════════════════════════════
+# Concurrence FreeConvert Hardsub — jusqu'à 3 jobs en vrai parallèle.
+#
+# Le hardsub FreeConvert se fait sur les serveurs de FreeConvert (pas sur
+# Colab), donc plusieurs jobs peuvent tourner en même temps sans se marcher
+# dessus au niveau CPU — il suffit juste que chaque job ait :
+#   - son propre message de statut Telegram (pas MSG.status_msg, partagé)
+#   - son propre dossier de travail (pas Paths.temp_cc_path, partagé)
+# Le reste du pipeline (leech normal, CloudConvert, zip...) reste séquentiel
+# comme avant, gated par BOT.State.task_going — on ne touche pas à ça.
+# ═════════════════════════════════════════════════════════════
+
+FC_HARDSUB_CONCURRENCY = 5
+_fc_hardsub_semaphore = asyncio.Semaphore(FC_HARDSUB_CONCURRENCY)
+
+# Même principe pour le hardsub CloudConvert sur lien direct — traitement
+# côté serveurs CloudConvert, pas sur Colab, donc parallélisable pareil.
+CC_HARDSUB_CONCURRENCY = 5
+_cc_hardsub_semaphore = asyncio.Semaphore(CC_HARDSUB_CONCURRENCY)
+
+
+async def _fc_job_status(status_msg, kind: str, stage: str, pct: float, detail: str, filename: str = "") -> None:
+    """Comme _seedr_status, mais édite un message dédié à CE job précis
+    plutôt que le MSG.status_msg global — permet à plusieurs jobs FreeConvert
+    de tourner en parallèle sans que leurs messages de statut ne s'écrasent."""
+    pct = max(0.0, min(float(pct), 100.0))
+    text = (
+        f"🆓 <b>{kind}</b>\n\n"
+        f"<code>{filename or 'FreeConvert job'}</code>\n\n"
+        f"<b>Stage</b>  <code>{stage}</code>\n"
+        f"<b>Progress</b>  <code>{pct:.1f}%</code>\n"
+        f"<b>Preset</b>  <code>{fc_quality_label(BOT.Options.cc_quality_profile)}</code>\n"
+        f"<b>Detail</b>  <code>{detail}</code>"
+    )
+    try:
+        await status_msg.edit_text(text, disable_web_page_preview=True)
+    except Exception:
+        pass
+
+
+async def _probe_remote_video(url: str) -> dict:
+    out, _ = await _run_tracked_process(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            url,
+        ],
+        "ffprobe",
+    )
+    return json.loads(out or "{}")
+
+
+def _pick_french_text_subtitle(info: dict) -> dict | None:
+    allowed = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
+    best = None
+    best_score = -1
+    for stream in info.get("streams") or []:
+        if str(stream.get("codec_type") or "").lower() != "subtitle":
+            continue
+        codec = str(stream.get("codec_name") or "").lower()
+        if codec not in allowed:
+            continue
+        tags = {str(k).lower(): str(v).lower() for k, v in (stream.get("tags") or {}).items()}
+        lang = tags.get("language", "")
+        title = " ".join(filter(None, [tags.get("title", ""), tags.get("handler_name", "")]))
+        score = 0
+        if lang in {"fr", "fra", "fre"}:
+            score += 100
+        elif "fr" in lang or "french" in lang:
+            score += 70
+        if "vostfr" in title:
+            score += 40
+        if "french" in title or "francais" in title or "français" in title:
+            score += 30
+        if "full" in title:
+            score += 5
+        if "forced" in title:
+            score += 3
+        if score > best_score:
+            best = stream
+            best_score = score
+    return best if best_score > 0 else None
+
+
+async def _extract_subtitle_from_url(video_url: str, stream: dict, dest_dir: str, stem: str) -> str:
+    os.makedirs(dest_dir, exist_ok=True)
+    codec = str(stream.get("codec_name") or "").lower()
+    ext = ".ass" if codec in {"ass", "ssa"} else ".srt"
+    out_path = ospath.join(dest_dir, f"{stem}.fr{ext}")
+    sub_codec = "ass" if ext == ".ass" else "srt"
+    stream_index = int(stream.get("index"))
+    await _run_tracked_process(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_url,
+            "-map",
+            f"0:{stream_index}",
+            "-c:s",
+            sub_codec,
+            out_path,
+        ],
+        "ffmpeg-subtitle",
+    )
+    if not ospath.exists(out_path) or ospath.getsize(out_path) == 0:
+        raise RuntimeError("Subtitle extraction produced an empty file.")
+    return out_path
+
+
+async def Seedr_CC_Convert_Handler(magnet: str) -> None:
+    if not _seedr_ready():
+        await cancelTask("Seedr credentials are missing in your Colab launcher.")
+        return
+    if not BOT.Options.cc_api_keys:
+        await cancelTask("CloudConvert API key is missing in your Colab launcher.")
+        return
+
+    if ospath.exists(Paths.temp_cc_path):
+        shutil.rmtree(Paths.temp_cc_path)
+    makedirs(Paths.temp_cc_path)
+
+    folder_id = None
+    seedr_user = seedr_pwd = ""
+    try:
+        await _seedr_status("Seedr + CloudConvert Convert", "Seedr", 0.0, "Preparing Seedr job")
+
+        async def _seedr_cb(stage: str, pct: float, detail: str) -> None:
+            await _seedr_status("Seedr + CloudConvert Convert", f"Seedr/{stage}", pct * 0.35, detail)
+
+        files, folder_id, seedr_user, seedr_pwd = await fetch_urls_via_seedr(magnet, progress_cb=_seedr_cb)
+        videos = _seedr_video_files(files)
+        if not videos:
+            raise SeedrError("Seedr completed, but no video file was found in the torrent.")
+
+        total = len(videos)
+        for idx, video in enumerate(videos):
+            name = video["name"]
+            chunk_start = 35.0 + ((idx / total) * 50.0)
+            chunk_end = 35.0 + (((idx + 1) / total) * 50.0)
+
+            async def _process_cb(pct: float, detail: str, filename: str = name) -> None:
+                overall = chunk_start + ((chunk_end - chunk_start) * max(0.0, min(pct, 100.0)) / 100.0)
+                await _seedr_status("Seedr + CloudConvert Convert", "CloudConvert", overall, detail, filename)
+
+            async def _download_cb(pct: float, detail: str, filename: str = name) -> None:
+                overall = 85.0 + ((idx + (max(0.0, min(pct, 100.0)) / 100.0)) / total * 15.0)
+                await _seedr_status("Seedr + CloudConvert Convert", "Download", overall, detail, filename)
+
+            await _seedr_status("Seedr + CloudConvert Convert", "Queue", chunk_start, "Submitting CloudConvert job", name)
+            await convert_remote_url(
+                ",".join(BOT.Options.cc_api_keys),
+                video["url"],
+                name,
+                Paths.temp_cc_path,
+                output_ext=BOT.Options.video_out,
+                scale_height=0,
+                cc_mode=BOT.Options.cc_engine_mode,
+                quality_profile=BOT.Options.cc_quality_profile,
+                process_cb=_process_cb,
+                download_cb=_download_cb,
+            )
+
+        await _seedr_status("Seedr + CloudConvert Convert", "Upload", 100.0, "Uploading to Telegram")
+        await Leech(Paths.temp_cc_path, True, convert_videos=False)
+    except Exception as exc:
+        await cancelTask(f"Seedr+CC convert failed\n\n{exc}")
+    finally:
+        if folder_id and seedr_user and seedr_pwd:
+            await _del_folder(seedr_user, seedr_pwd, folder_id)
+
+
+async def Seedr_CC_Hardsub_Handler(magnet: str, resolution: str | None = None, encode_speed: str | None = None) -> None:
+    if not _seedr_ready():
+        await cancelTask("Seedr credentials are missing in your Colab launcher.")
+        return
+    if not BOT.Options.cc_api_keys:
+        await cancelTask("CloudConvert API key is missing in your Colab launcher.")
+        return
+
+    if ospath.exists(Paths.temp_cc_path):
+        shutil.rmtree(Paths.temp_cc_path)
+    makedirs(Paths.temp_cc_path)
+
+    subtitle_dir = ospath.join(Paths.WORK_PATH, "seedr_subtitles")
+    if ospath.exists(subtitle_dir):
+        shutil.rmtree(subtitle_dir)
+    makedirs(subtitle_dir)
+
+    folder_id = None
+    seedr_user = seedr_pwd = ""
+    try:
+        await _seedr_status("Seedr + CloudConvert Hardsub", "Seedr", 0.0, "Preparing Seedr job")
+
+        async def _seedr_cb(stage: str, pct: float, detail: str) -> None:
+            await _seedr_status("Seedr + CloudConvert Hardsub", f"Seedr/{stage}", pct * 0.30, detail)
+
+        files, folder_id, seedr_user, seedr_pwd = await fetch_urls_via_seedr(magnet, progress_cb=_seedr_cb)
+        videos = _seedr_video_files(files)
+        if not videos:
+            raise SeedrError("Seedr completed, but no video file was found in the torrent.")
+
+        total = len(videos)
+        for idx, video in enumerate(videos):
+            name = video["name"]
+            video_url = video["url"]
+            stem = ospath.splitext(ospath.basename(name))[0]
+            base_start = 30.0 + ((idx / total) * 55.0)
+            base_end = 30.0 + (((idx + 1) / total) * 55.0)
+
+            await _seedr_status("Seedr + CloudConvert Hardsub", "Probe", base_start, "Inspecting subtitle streams", name)
+            probe = await _probe_remote_video(video_url)
+            sub_stream = _pick_french_text_subtitle(probe)
+            if not sub_stream:
+                raise RuntimeError(f"No French text subtitle stream found in {name}")
+
+            await _seedr_status("Seedr + CloudConvert Hardsub", "Extract", base_start + 6.0, "Extracting French subtitles", name)
+            subtitle_path = await _extract_subtitle_from_url(video_url, sub_stream, subtitle_dir, stem)
+
+            async def _process_cb(pct: float, detail: str, filename: str = name) -> None:
+                overall = (base_start + 10.0) + ((base_end - (base_start + 10.0)) * max(0.0, min(pct, 100.0)) / 100.0)
+                await _seedr_status("Seedr + CloudConvert Hardsub", "CloudConvert", overall, detail, filename)
+
+            async def _download_cb(pct: float, detail: str, filename: str = name) -> None:
+                overall = 85.0 + ((idx + (max(0.0, min(pct, 100.0)) / 100.0)) / total * 15.0)
+                await _seedr_status("Seedr + CloudConvert Hardsub", "Download", overall, detail, filename)
+
+            await _seedr_status("Seedr + CloudConvert Hardsub", "Queue", base_start + 10.0, "Submitting CloudConvert hardsub job", name)
+            await hardsub_remote_url(
+                ",".join(BOT.Options.cc_api_keys),
+                video_url,
+                name,
+                subtitle_path,
+                Paths.temp_cc_path,
+                resolution=resolution,
+                cc_mode=BOT.Options.cc_engine_mode,
+                quality_profile=BOT.Options.cc_quality_profile,
+                encode_speed=encode_speed,
+                process_cb=_process_cb,
+                download_cb=_download_cb,
+            )
+
+        await _seedr_status("Seedr + CloudConvert Hardsub", "Upload", 100.0, "Uploading to Telegram")
+        await _burn_prefix_suffix_in_dir(Paths.temp_cc_path, None, "Seedr + CloudConvert Hardsub")
+        await Leech(Paths.temp_cc_path, True, convert_videos=False)
+    except Exception as exc:
+        await cancelTask(f"Seedr+CC hardsub failed\n\n{exc}")
+    finally:
+        if folder_id and seedr_user and seedr_pwd:
+            await _del_folder(seedr_user, seedr_pwd, folder_id)
+
+
+async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, int] | None = None) -> None:
+    """
+    Équivalent de Seedr_CC_Hardsub_Handler mais via FreeConvert au lieu de
+    CloudConvert. Même pipeline : Seedr -> sonde la piste FR -> extrait le
+    sous-titre -> hardsub -> upload Telegram.
+
+    Conçu pour tourner en PARALLÈLE avec d'autres jobs FC hardsub (jusqu'à
+    FC_HARDSUB_CONCURRENCY à la fois) : dossier de travail et message de
+    statut dédiés à ce job, pas de dépendance à MSG.status_msg/BOT.State.
+    """
+    if not _seedr_ready():
+        try:
+            await status_msg.edit_text("❌ Seedr credentials are missing in your Colab launcher.")
+        except Exception:
+            pass
+        return
+    if not BOT.Options.fc_api_keys:
+        try:
+            await status_msg.edit_text("❌ FreeConvert API key is missing in your Colab launcher.")
+        except Exception:
+            pass
+        return
+
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_{job_id}"
+    subtitle_dir = ospath.join(Paths.WORK_PATH, f"seedr_subtitles_{job_id}")
+    makedirs(job_dir, exist_ok=True)
+    makedirs(subtitle_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _fc_hardsub_semaphore:
+        folder_id = None
+        seedr_user = seedr_pwd = ""
+        try:
+            await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Seedr", 0.0, "Preparing Seedr job")
+
+            async def _seedr_cb(stage: str, pct: float, detail: str) -> None:
+                await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", f"Seedr/{stage}", pct * 0.30, detail)
+
+            files, folder_id, seedr_user, seedr_pwd = await fetch_urls_via_seedr(magnet, progress_cb=_seedr_cb)
+            videos = _seedr_video_files(files)
+            if not videos:
+                raise SeedrError("Seedr completed, but no video file was found in the torrent.")
+
+            total = len(videos)
+            for idx, video in enumerate(videos):
+                name = video["name"]
+                video_url = video["url"]
+                stem = ospath.splitext(ospath.basename(name))[0]
+                base_start = 30.0 + ((idx / total) * 55.0)
+                base_end = 30.0 + (((idx + 1) / total) * 55.0)
+
+                await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Probe", base_start, "Inspecting subtitle streams", name)
+                probe = await _probe_remote_video(video_url)
+                sub_stream = _pick_french_text_subtitle(probe)
+                if not sub_stream:
+                    raise RuntimeError(f"No French text subtitle stream found in {name}")
+
+                await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Extract", base_start + 6.0, "Extracting French subtitles", name)
+                subtitle_path = await _extract_subtitle_from_url(video_url, sub_stream, subtitle_dir, stem)
+
+                async def _process_cb(pct: float, detail: str, filename: str = name) -> None:
+                    overall = (base_start + 10.0) + ((base_end - (base_start + 10.0)) * max(0.0, min(pct, 100.0)) / 100.0)
+                    await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "FreeConvert", overall, detail, filename)
+
+                async def _download_cb(pct: float, detail: str, filename: str = name) -> None:
+                    overall = 85.0 + ((idx + (max(0.0, min(pct, 100.0)) / 100.0)) / total * 15.0)
+                    await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Download", overall, detail, filename)
+
+                await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Queue", base_start + 10.0, "Submitting FreeConvert hardsub job", name)
+
+                async def _url_cb(url: str, filename: str = name) -> None:
+                    try:
+                        await colab_bot.send_message(
+                            chat_id=OWNER,
+                            text=(
+                                "🔗 <b>Lien direct disponible</b>\n\n"
+                                f"<code>{filename}</code>\n\n"
+                                f"{url}\n\n"
+                                "<i>Le bot va maintenant le télécharger et l'uploader. "
+                                "Si ça plante, tu as déjà ce lien pour le récupérer toi-même.</i>"
+                            ),
+                            disable_web_page_preview=True,
+                        )
+                    except Exception:
+                        pass
+
+                await fc_hardsub_remote_url(
+                    ",".join(BOT.Options.fc_api_keys),
+                    video_url,
+                    name,
+                    subtitle_path,
+                    job_dir,
+                    quality_profile=BOT.Options.cc_quality_profile,
+                    resize=resize,
+                    process_cb=_process_cb,
+                    download_cb=_download_cb,
+                    url_cb=_url_cb,
+                )
+
+            await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Upload", 100.0, "Uploading to Telegram")
+            await _burn_prefix_suffix_in_dir(job_dir, status_msg, "Seedr + FreeConvert Hardsub")
+            await Leech(job_dir, True, convert_videos=False, status_msg=status_msg)
             try:
-                fn, fd = fr.split("/")
-                fps = float(fn) / max(float(fd), 1.0)
-                fps_s = f"{fps:.3f}fps"
+                await status_msg.delete()
             except Exception:
-                fps_s = "?"
-            lines.append(f"VIDEO  <code>{codec}  {w}x{h}  {fps_s}</code>")
-        elif stype == "audio":
-            ch = int(stream.get("channels") or 0)
-            ch_s = {1: "Mono", 2: "Stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch}ch" if ch else "")
-            lines.append(f"AUDIO  <code>{codec}  {ch_s}{lang_s}</code>")
-        elif stype == "subtitle":
-            lines.append(f"SUB  <code>{codec}{lang_s}</code>")
-    return "\n".join(lines[:12])
-
-
-async def _startup_welcome() -> None:
-    for _ in range(6):
-        try:
-            await sleep(2)
-            owner = await colab_bot.get_users(OWNER)
-            first = owner.first_name or owner.username or str(OWNER)
-            display = first.replace("<", "&lt;").replace(">", "&gt;")
-            text = (
-                f"👋 <b>Welcome back, {display}</b>\n"
-                "⚡ <b>Zilong is online</b>\n\n"
-                "Send a link, magnet, or path to begin.\n"
-                "Use /start for the full menu and /status for the live dashboard."
-            )
-            await colab_bot.send_message(chat_id=OWNER, text=text)
-            return
+                pass
         except Exception as exc:
-            logging.warning("Startup welcome attempt failed: %s", exc)
-
-
-def _owner(m): return m.chat.id == OWNER
-def _can_use(m): return m.chat.id == OWNER or m.chat.id in BOT.Options.allowed_users
-def _ring(p):  return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
-
-REQUIRED_CHANNEL = "@hebdos"
-
-
-async def _is_subscribed(client, user_id: int) -> bool:
-    try:
-        member = await client.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return str(member.status).lower() not in ("left", "banned", "kicked")
-    except Exception as exc:
-        logging.debug(f"Subscription check failed: {exc}")
-        return False
-
-
-def _join_gate_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Rejoindre " + REQUIRED_CHANNEL, url=f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}")],
-        [InlineKeyboardButton("✅ J'ai rejoint", callback_data="check_sub")],
-    ])
-
-
-# Résolutions proposées avant un hardsub FreeConvert — format (largeur, hauteur).
-# None = garde la résolution d'origine du fichier (comportement historique).
-FC_RESOLUTIONS: dict[str, tuple[int, int] | None] = {
-    "orig": None,
-    "360":  (640, 360),
-    "480":  (854, 480),
-    "720":  (1280, 720),
-}
-
-
-def _fc_quality_kb(flow: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 Qualité d'origine", callback_data=f"fc_res|{flow}|orig")],
-        [InlineKeyboardButton("360p", callback_data=f"fc_res|{flow}|360"),
-         InlineKeyboardButton("480p", callback_data=f"fc_res|{flow}|480")],
-        [InlineKeyboardButton("720p", callback_data=f"fc_res|{flow}|720")],
-    ])
-
-
-# Mêmes codes/labels que FreeConvert — juste préfixé cc_res pour ce flow-ci.
-# _cc_direct_sessions : token (8 hex chars, embedded dans callback_data) ->
-# url. Volontairement PAS indexé par message_id (contrairement à
-# _link_sessions) — le token voyage dans le bouton lui-même, donc aucune
-# dépendance à ce que message.id reste stable entre les callbacks.
-_cc_direct_sessions: dict[str, str] = {}
-
-
-def _cc_direct_quality_kb(token: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 Qualité d'origine", callback_data=f"ccdirect_res|{token}|orig")],
-        [InlineKeyboardButton("360p", callback_data=f"ccdirect_res|{token}|360"),
-         InlineKeyboardButton("480p", callback_data=f"ccdirect_res|{token}|480")],
-        [InlineKeyboardButton("720p", callback_data=f"ccdirect_res|{token}|720")],
-    ])
-
-
-# code du menu ("orig"/"360"/"480"/"720") -> chaîne attendue par
-# hardsub_remote_url() de CloudConvert ("original"/"360p"/"480p"/"720p").
-_CC_RES_CODE_TO_LABEL: dict[str, str] = {
-    "orig": "original", "360": "360p", "480": "480p", "720": "720p",
-}
-
-# _pending_cc_subtitle : message_id (du prompt "envoie le sous-titre") ->
-# {"url": str, "name": str, "resolution": str|None}. Namespace séparé de
-# _pending_fc_subtitle pour ne pas mélanger les deux moteurs si les deux
-# flows tournent en même temps.
-_pending_cc_subtitle: dict[int, dict] = {}
-
-
-# ── CC Hardsub : résolution puis vitesse d'encodage, choisies avant de lancer ──
-# _cc_hardsub_session : message_id -> {"magnet": str, "resolution": str|None}
-_cc_hardsub_session: dict[int, dict] = {}
-
-CC_RESOLUTION_LABELS: dict[str, str] = {
-    "original": "🎬 Qualité d'origine",
-    "480p": "480p",
-    "720p": "720p",
-    "1080p": "1080p",
-}
-
-CC_SPEED_LABELS: dict[str, str] = {
-    "superfast": "⚡ Superfast",
-    "veryfast": "🚀 Veryfast",
-    "fast": "🏃 Fast",
-}
-
-
-def _cc_res_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(CC_RESOLUTION_LABELS["original"], callback_data="cc_res|original")],
-        [InlineKeyboardButton("480p", callback_data="cc_res|480p"),
-         InlineKeyboardButton("720p", callback_data="cc_res|720p")],
-        [InlineKeyboardButton("1080p", callback_data="cc_res|1080p")],
-    ])
-
-
-def _cc_speed_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(CC_SPEED_LABELS["superfast"], callback_data="cc_speed|superfast")],
-        [InlineKeyboardButton(CC_SPEED_LABELS["veryfast"], callback_data="cc_speed|veryfast")],
-        [InlineKeyboardButton(CC_SPEED_LABELS["fast"], callback_data="cc_speed|fast")],
-    ])
-
-
-# ══════════════════════════════════════════════
-#  /start
-# ══════════════════════════════════════════════
-
-@colab_bot.on_message(filters.command("start") & filters.private)
-async def start(client, message):
-    await message.delete()
-
-    if _owner(message):
-        await message.reply_text(
-            "⚡ <b>ZILONG BOT</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🟢 Online &amp; Ready\n\n"
-            "Send a <b>link</b>, <b>magnet</b> or <b>path</b>.\n\n"
-            "📥 Direct links · Magnet · GDrive\n"
-            "🎬 YouTube · Mega · Terabox\n"
-            "☁️ CloudConvert convert · resize · compress\n"
-            "🧲 Seedr + CloudConvert convert · hardsub\n"
-            "🧲 Seedr + FreeConvert hardsub\n"
-            "🎞 Stream Extractor (any link)\n"
-            "📊 /status — live dashboard\n"
-            "📡 /nyaa_search — anime search\n\n"
-            "💡 /help for all commands",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📖 Help",     callback_data="cb_help"),
-                InlineKeyboardButton("⚙️ Settings", callback_data="cb_settings"),
-            ], [
-                InlineKeyboardButton("📊 Status",   callback_data="status_refresh"),
-            ]])
-        )
-        return
-
-    if not await _is_subscribed(client, message.from_user.id):
-        await message.reply_text(
-            "🔒 <b>Accès restreint</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Pour utiliser ce bot, abonne-toi d'abord à {REQUIRED_CHANNEL}.\n\n"
-            "Une fois fait, tape sur « J'ai rejoint » ci-dessous.",
-            reply_markup=_join_gate_kb(),
-        )
-        return
-
-    await message.reply_text(
-        "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✅ Abonnement vérifié\n\n"
-        "Tu peux consulter les réglages du bot, mais seul le propriétaire "
-        "peut lancer des téléchargements.",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚙️ Voir les réglages", callback_data="cb_settings"),
-        ]])
-    )
-
-
-# ══════════════════════════════════════════════
-#  /help
-# ══════════════════════════════════════════════
-
-@colab_bot.on_message(filters.command("help") & filters.private)
-async def help_cmd(client, message):
-    text = (
-        "📖 <b>HELP</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🔗 <b>Supported Sources</b>\n"
-        "  · HTTP/HTTPS  · Magnet  · Torrent\n"
-        "  · Google Drive  · Mega.nz  · Terabox\n"
-        "  · YouTube / YTDL  · Telegram links\n"
-        "  · Local paths (/content/...)\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚙️ <b>Commands</b>\n"
-        "  /settings  — bot preferences\n"
-        "  /status    — <b>live task dashboard + cancel</b>\n"
-        "  /stats     — system resources\n"
-        "  /ping      — latency test\n"
-        "  /cancel    — cancel running task\n"
-        "  /stop      — shutdown bot\n"
-        "  /setname   — custom filename\n"
-        "  /rename    — rename after download\n"
-        "  /add       — add a dump channel\n"
-        "  /dumps     — list/remove dump channels\n"
-        "  /addcc     — add a CloudConvert API key\n"
-        "  /addfc     — add a FreeConvert API key\n"
-        "  /apikeys   — list/remove API keys\n"
-        "  /adduser   — give a user access to the bot\n"
-        "  /deluser   — remove a user's access\n"
-        "  /users     — list authorized users\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📡 <b>Nyaa Anime Search</b>\n"
-        "  /nyaa_search <query> — search Nyaa.si\n"
-        "  /nyaa_add <title>    — track anime\n"
-        "  /nyaa_list           — watchlist\n"
-        "  /nyaa_check          — poll now\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎛 <b>Options (after link)</b>\n"
-        "  <code>[name.ext]</code>  — custom filename\n"
-        "  <code>{pass}</code>     — zip password\n"
-        "  <code>(pass)</code>     — unzip password\n\n"
-        "☁️ <b>CloudConvert</b> — use CC Convert / Resize / Compress buttons\n"
-        "🧲 <b>Seedr + CC</b> — on magnet links, use Seedr+CC Convert / Hardsub\n"
-        "🧲 <b>Seedr + FreeConvert</b> — on magnet links, use Seedr+FC Hardsub\n"
-        "🎞 <b>Stream Extractor</b> — tap 🎞 Streams on any link\n"
-        "🖼 Send a <b>photo</b> to set thumbnail"
-    )
-    msg = await message.reply_text(text)
-    await sleep(120)
-    await message_deleter(message, msg)
-
-
-@colab_bot.on_message(filters.command("logs") & filters.private)
-async def logs_cmd(client, message):
-    if not _owner(message):
-        return
-    await message.delete()
-    if not os.path.exists(Paths.LOG_PATH):
-        await message.reply_text("❌ No log file found yet.")
-        return
-    try:
-        with open(Paths.LOG_PATH, "r", encoding="utf-8", errors="replace") as fh:
-            tail = "".join(fh.readlines()[-80:]).strip()
-        if tail:
-            await message.reply_text(f"📜 <b>Recent Logs</b>\n\n<code>{tail[-3500:]}</code>")
-        await client.send_document(chat_id=OWNER, document=Paths.LOG_PATH, caption="Zilong runtime log")
-    except Exception as exc:
-        await message.reply_text(f"❌ Could not send logs: <code>{exc}</code>")
-
-
-# ══════════════════════════════════════════════
-#  /status — LIVE TASK DASHBOARD WITH CANCEL
-# ══════════════════════════════════════════════
-
-def _status_panel() -> str:
-    """Build the /status panel text — shows task state + system + cancel info."""
-    cpu  = psutil.cpu_percent(interval=0)
-    ram  = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
-
-    cpu_bar  = _pct_bar(cpu, 10)
-    ram_bar  = _pct_bar(ram.percent, 10)
-    disk_bar = _pct_bar(disk.percent, 10)
-
-    lines = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-        "⚡  <b>ZILONG BOT — STATUS</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-        "",
-    ]
-
-    # ── Active task section ───────────────────
-    if BOT.State.task_going:
-        phase_icons = {
-            "download": "📥", "upload": "📤", "process": "⚙️",
-            "zip": "🗜", "extract": "📂",
-        }
-        icon   = phase_icons.get(TaskInfo.phase, "⏳")
-        engine = TaskInfo.engine or "—"
-        fname  = TaskInfo.filename or Messages.download_name or "—"
-        fname  = (fname[:35] + "…") if len(fname) > 35 else fname
-        pct    = TaskInfo.percentage
-        speed  = TaskInfo.speed or "—"
-        eta    = TaskInfo.eta or "—"
-        spd_e  = _speed_emoji(speed)
-        bar    = _pct_bar(pct, 14)
-
-        elapsed = getTime((datetime.now() - BotTimes.task_start).seconds)
-
-        lines += [
-            f"{icon}  <b>{TaskInfo.phase.upper()}</b>  ·  <code>{engine}</code>",
-            f"🏷  <code>{fname}</code>",
-            "",
-            f"<code>[{bar}]</code>  <b>{pct:.1f}%</b>",
-            "",
-            f"{spd_e}  <b>Speed</b>   <code>{speed}</code>",
-            f"⏳  <b>ETA</b>     <code>{eta}</code>",
-            f"🕰  <b>Elapsed</b> <code>{elapsed}</code>",
-        ]
-
-        procs = ProcessTracker.active()
-        if procs:
-            lines.append("")
-            lines.append(f"🔧  <b>Processes</b>  <code>{len(procs)}</code>")
-            for pid, label in procs[:5]:
-                lines.append(f"   · PID {pid}  <code>{label[:25]}</code>")
-    else:
-        lines += [
-            "💤  <b>No active task</b>",
-            "",
-            "<i>Send a link to start a download.</i>",
-        ]
-
-    # ── System section ────────────────────────
-    lines += [
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"{_ring(cpu)}  CPU   <code>[{cpu_bar}]</code>  <b>{cpu:.0f}%</b>",
-        f"{_ring(ram.percent)}  RAM   <code>[{ram_bar}]</code>  <b>{ram.percent:.0f}%</b>",
-        f"   Used <code>{sizeUnit(ram.used)}</code>  ·  Free <code>{sizeUnit(ram.available)}</code>",
-        f"{_ring(disk.percent)}  Disk  <code>[{disk_bar}]</code>  <b>{disk.percent:.0f}%</b>",
-        f"   Free <code>{sizeUnit(disk.free)}</code>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-
-    return "\n".join(lines)
-
-
-def _status_kb() -> InlineKeyboardMarkup:
-    rows = []
-    if BOT.State.task_going:
-        rows.append([
-            InlineKeyboardButton("⛔ CANCEL TASK", callback_data="status_cancel"),
-            InlineKeyboardButton("🔄 Refresh",     callback_data="status_refresh"),
-        ])
-        # Kill individual processes
-        procs = ProcessTracker.active()
-        if procs:
-            row = []
-            for pid, label in procs[:4]:
-                short = label[:10] if label else str(pid)
-                row.append(InlineKeyboardButton(
-                    f"💀 {short}", callback_data=f"status_kill|{pid}",
-                ))
-                if len(row) == 2:
-                    rows.append(row)
-                    row = []
-            if row:
-                rows.append(row)
-    else:
-        rows.append([
-            InlineKeyboardButton("🔄 Refresh", callback_data="status_refresh"),
-            InlineKeyboardButton("❌ Close",    callback_data="close"),
-        ])
-    return InlineKeyboardMarkup(rows)
-
-
-@colab_bot.on_message(filters.command("status") & filters.private)
-async def cmd_status(client, message):
-    await message.delete()
-    await message.reply_text(
-        _status_panel(),
-        reply_markup=_status_kb(),
-    )
-
-
-# ══════════════════════════════════════════════
-#  /stats — system info (unchanged)
-# ══════════════════════════════════════════════
-
-@colab_bot.on_message(filters.command("stats") & filters.private)
-async def stats(client, message):
-    if not _owner(message): return
-    await message.delete()
-    cpu  = psutil.cpu_percent(interval=1)
-    ram  = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
-    net  = psutil.net_io_counters()
-    up_s = int((datetime.now() - datetime.fromtimestamp(psutil.boot_time())).total_seconds())
-    text = (
-        "📊 <b>SERVER STATS</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🖥  <b>OS</b>      <code>{platform.system()} {platform.release()}</code>\n"
-        f"🐍  <b>Python</b>  <code>v{platform.python_version()}</code>\n"
-        f"⏱  <b>Uptime</b>  <code>{getTime(up_s)}</code>\n"
-        f"🤖  <b>Task</b>    {'🟠 Running' if BOT.State.task_going else '⚪ Idle'}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{_ring(cpu)}  CPU  <code>[{_pct_bar(cpu,12)}]</code>  <b>{cpu:.1f}%</b>\n\n"
-        f"{_ring(ram.percent)}  RAM  <code>[{_pct_bar(ram.percent,12)}]</code>  <b>{ram.percent:.1f}%</b>\n"
-        f"    Used <code>{sizeUnit(ram.used)}</code>  ·  Free <code>{sizeUnit(ram.available)}</code>\n\n"
-        f"{_ring(disk.percent)}  Disk <code>[{_pct_bar(disk.percent,12)}]</code>  <b>{disk.percent:.1f}%</b>\n"
-        f"    Used <code>{sizeUnit(disk.used)}</code>  ·  Free <code>{sizeUnit(disk.free)}</code>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"    ⬆️  <code>{sizeUnit(net.bytes_sent)}</code>\n"
-        f"    ⬇️  <code>{sizeUnit(net.bytes_recv)}</code>"
-    )
-    await message.reply_text(text, reply_markup=InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Refresh", callback_data="stats_refresh"),
-        InlineKeyboardButton("❌ Close",    callback_data="close"),
-    ]]))
-
-
-# ══════════════════════════════════════════════
-#  /ping
-# ══════════════════════════════════════════════
-
-@colab_bot.on_message(filters.command("ping") & filters.private)
-async def ping(client, message):
-    t0  = datetime.now()
-    msg = await message.reply_text("⏳")
-    ms  = (datetime.now() - t0).microseconds // 1000
-    if ms < 100:   q, fill = "🟢 Excellent", 12
-    elif ms < 300: q, fill = "🟡 Good",       8
-    elif ms < 700: q, fill = "🟠 Average",     4
-    else:          q, fill = "🔴 Poor",         1
-    bar = "█" * fill + "░" * (12 - fill)
-    await msg.edit_text(
-        f"🏓 <b>PONG</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<code>[{bar}]</code>\n\n"
-        f"⚡ <b>Latency</b>  <code>{ms} ms</code>\n"
-        f"📶 <b>Quality</b>  {q}"
-    )
-    await sleep(20)
-    await message_deleter(message, msg)
-
-
-# ══════════════════════════════════════════════
-#  /cancel, /stop, /settings, /setname, /rename
-# ══════════════════════════════════════════════
-
-@colab_bot.on_message(filters.command("cancel") & filters.private)
-async def cancel_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    if BOT.State.task_going:
-        await cancelTask("Cancelled via /cancel")
-    else:
-        msg = await message.reply_text("⚠️ No active task.")
-        await sleep(8); await msg.delete()
-
-
-@colab_bot.on_message(filters.command("stop") & filters.private)
-async def stop_bot(client, message):
-    if not _owner(message): return
-    await message.delete()
-    if BOT.State.task_going:
-        await cancelTask("Bot shutdown")
-    await message.reply_text("🛑 <b>Shutting down...</b> 👋")
-    await sleep(2); await client.stop(); os._exit(0)
-
-
-@colab_bot.on_message(filters.command("settings") & filters.private)
-async def settings_cmd(client, message):
-    await message.delete()
-    if _owner(message):
-        await send_settings(client, message, message.id, True)
-        return
-    if not await _is_subscribed(client, message.from_user.id):
-        await message.reply_text(
-            f"🔒 Abonne-toi à {REQUIRED_CHANNEL} pour voir les réglages.",
-            reply_markup=_join_gate_kb(),
-        )
-        return
-    await send_settings(client, message, message.id, True, readonly=True)
-
-
-@colab_bot.on_message(filters.command("setname") & filters.private)
-async def custom_name(client, message):
-    if len(message.command) != 2:
-        msg = await message.reply_text("Usage: <code>/setname file.ext</code>", quote=True)
-    else:
-        BOT.Options.custom_name = message.command[1]
-        msg = await message.reply_text(f"✅ Name → <code>{BOT.Options.custom_name}</code>", quote=True)
-    await sleep(15); await message_deleter(message, msg)
-
-
-@colab_bot.on_message(filters.command("rename") & filters.private)
-async def rename_cmd(client, message):
-    """Minimal rename — set name for next upload."""
-    if len(message.command) < 2:
-        return await message.reply_text(
-            "✏️ <b>Rename</b>\n\nUsage: <code>/rename New Name.mkv</code>",
-            quote=True,
-        )
-    new_name = " ".join(message.command[1:])
-    BOT.Options.custom_name = new_name
-    await message.reply_text(
-        f"✅ Next file will be named: <code>{new_name}</code>",
-        quote=True,
-    )
-
-
-@colab_bot.on_message(filters.command("zipaswd") & filters.private)
-async def zip_pswd(client, message):
-    if len(message.command) != 2:
-        msg = await message.reply_text("Usage: <code>/zipaswd password</code>", quote=True)
-    else:
-        BOT.Options.zip_pswd = message.command[1]
-        msg = await message.reply_text("✅ Zip password set 🔐", quote=True)
-    await sleep(15); await message_deleter(message, msg)
-
-
-@colab_bot.on_message(filters.command("unzipaswd") & filters.private)
-async def unzip_pswd(client, message):
-    if len(message.command) != 2:
-        msg = await message.reply_text("Usage: <code>/unzipaswd password</code>", quote=True)
-    else:
-        BOT.Options.unzip_pswd = message.command[1]
-        msg = await message.reply_text("✅ Unzip password set 🔓", quote=True)
-    await sleep(15); await message_deleter(message, msg)
-
-
-def _dumps_kb() -> InlineKeyboardMarkup:
-    rows = []
-    for cid in BOT.Options.dump_ids:
-        rows.append([InlineKeyboardButton(f"🗑 {cid}", callback_data=f"dump_remove|{cid}")])
-    rows.append([InlineKeyboardButton("⏎ Back", callback_data="back")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _dumps_text() -> str:
-    if not BOT.Options.dump_ids:
-        return (
-            "📦 <b>CANAUX DUMP</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Aucun canal configuré.\n\n"
-            "Ajoute-en un avec :\n"
-            "<code>/add @mon_channel</code>\n"
-            "<code>/add -1001234567890</code>"
-        )
-    lines = "\n".join(f"· <code>{cid}</code>" for cid in BOT.Options.dump_ids)
-    return (
-        "📦 <b>CANAUX DUMP</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{lines}\n\n"
-        "Ajoute-en un autre avec <code>/add @channel</code>\n"
-        "Tape sur 🗑 pour en retirer un."
-    )
-
-
-@colab_bot.on_message(filters.command("add") & filters.private)
-async def add_dump_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    if len(message.command) != 2:
-        msg = await message.reply_text(
-            "Usage: <code>/add @channel</code> ou <code>/add -1001234567890</code>",
-            quote=True,
-        )
-        await sleep(10); await msg.delete()
-        return
-
-    target = message.command[1].strip()
-    try:
-        chat = await client.get_chat(target)
-        chat_id = chat.id
-        title = chat.title or chat.first_name or str(chat_id)
-    except Exception as exc:
-        msg = await message.reply_text(
-            f"❌ Impossible de trouver <code>{target}</code>\n<code>{exc}</code>",
-            quote=True,
-        )
-        await sleep(10); await msg.delete()
-        return
-
-    if chat_id in BOT.Options.dump_ids:
-        msg = await message.reply_text(f"⚠️ <b>{title}</b> est déjà dans la liste.", quote=True)
-    else:
-        BOT.Options.dump_ids.append(chat_id)
-        BOT.Options.auto_forward = True
-        BOT.Setting.auto_forward = "On"
-        msg = await message.reply_text(
-            f"✅ Canal ajouté : <b>{title}</b>\n<code>{chat_id}</code>",
-            quote=True,
-        )
-    await sleep(10); await msg.delete()
-
-
-@colab_bot.on_message(filters.command("dumps") & filters.private)
-async def dumps_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    await message.reply_text(_dumps_text(), reply_markup=_dumps_kb())
-
-
-def _mask_key(key: str) -> str:
-    if len(key) <= 10:
-        return "•" * len(key)
-    return f"{key[:4]}…{key[-4:]}"
-
-
-def _apikeys_kb() -> InlineKeyboardMarkup:
-    rows = []
-    for i, key in enumerate(BOT.Options.cc_api_keys):
-        rows.append([InlineKeyboardButton(f"🗑 CC · {_mask_key(key)}", callback_data=f"apikey_remove|cc|{i}")])
-    for i, key in enumerate(BOT.Options.fc_api_keys):
-        rows.append([InlineKeyboardButton(f"🗑 FC · {_mask_key(key)}", callback_data=f"apikey_remove|fc|{i}")])
-    rows.append([InlineKeyboardButton("⏎ Back", callback_data="back")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _apikeys_text() -> str:
-    cc_lines = "\n".join(f"· <code>{_mask_key(k)}</code>" for k in BOT.Options.cc_api_keys) or "Aucune"
-    fc_lines = "\n".join(f"· <code>{_mask_key(k)}</code>" for k in BOT.Options.fc_api_keys) or "Aucune"
-    return (
-        "🔑 <b>CLÉS API</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>☁️ CloudConvert</b>\n{cc_lines}\n\n"
-        f"<b>🆓 FreeConvert</b>\n{fc_lines}\n\n"
-        "Ajoute-en une avec :\n"
-        "<code>/addcc TA_CLE</code>\n"
-        "<code>/addfc TA_CLE</code>\n\n"
-        "Tape sur 🗑 pour en retirer une."
-    )
-
-
-@colab_bot.on_message(filters.command("addcc") & filters.private)
-async def add_cc_key_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    if len(message.command) != 2:
-        msg = await message.reply_text("Usage: <code>/addcc TA_CLE_CLOUDCONVERT</code>", quote=True)
-        await sleep(10); await msg.delete()
-        return
-    key = message.command[1].strip()
-    if key in BOT.Options.cc_api_keys:
-        msg = await message.reply_text("⚠️ Cette clé est déjà enregistrée.", quote=True)
-    else:
-        BOT.Options.cc_api_keys.append(key)
-        msg = await message.reply_text(f"✅ Clé CloudConvert ajoutée : <code>{_mask_key(key)}</code>", quote=True)
-    await sleep(10); await msg.delete()
-
-
-@colab_bot.on_message(filters.command("addfc") & filters.private)
-async def add_fc_key_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    if len(message.command) != 2:
-        msg = await message.reply_text("Usage: <code>/addfc TA_CLE_FREECONVERT</code>", quote=True)
-        await sleep(10); await msg.delete()
-        return
-    key = message.command[1].strip()
-    if key in BOT.Options.fc_api_keys:
-        msg = await message.reply_text("⚠️ Cette clé est déjà enregistrée.", quote=True)
-    else:
-        BOT.Options.fc_api_keys.append(key)
-        msg = await message.reply_text(f"✅ Clé FreeConvert ajoutée : <code>{_mask_key(key)}</code>", quote=True)
-    await sleep(10); await msg.delete()
-
-
-@colab_bot.on_message(filters.command("apikeys") & filters.private)
-async def apikeys_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    await message.reply_text(_apikeys_text(), reply_markup=_apikeys_kb())
-
-
-def _users_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"🗑 {uid}", callback_data=f"user_remove|{uid}")]
-            for uid in BOT.Options.allowed_users]
-    rows.append([InlineKeyboardButton("⏎ Back", callback_data="back")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _users_text() -> str:
-    if not BOT.Options.allowed_users:
-        return (
-            "👥 <b>UTILISATEURS AUTORISÉS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Aucun utilisateur ajouté — seul le propriétaire peut utiliser le bot.\n\n"
-            "Ajoute-en un avec :\n<code>/adduser 123456789</code>"
-        )
-    lines = "\n".join(f"· <code>{uid}</code>" for uid in BOT.Options.allowed_users)
-    return (
-        "👥 <b>UTILISATEURS AUTORISÉS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{lines}\n\nAjoute-en un autre avec <code>/adduser id</code>\n"
-        "Tape sur 🗑 pour en retirer un."
-    )
-
-
-@colab_bot.on_message(filters.command("adduser") & filters.private)
-async def adduser_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    if len(message.command) != 2:
-        msg = await message.reply_text(
-            "Usage: <code>/adduser 123456789</code> (user_id Telegram)\n\n"
-            "L'utilisateur peut obtenir son ID via @userinfobot.",
-            quote=True,
-        )
-        await sleep(12); await msg.delete()
-        return
-    try:
-        uid = int(message.command[1].strip())
-    except ValueError:
-        msg = await message.reply_text("❌ user_id invalide — attendu un nombre.", quote=True)
-        await sleep(8); await msg.delete()
-        return
-    if uid in BOT.Options.allowed_users:
-        msg = await message.reply_text("⚠️ Cet utilisateur a déjà accès.", quote=True)
-    else:
-        BOT.Options.allowed_users.append(uid)
-        msg = await message.reply_text(f"✅ Utilisateur ajouté : <code>{uid}</code>", quote=True)
-        try:
-            await colab_bot.send_message(chat_id=uid, text="✅ Tu as maintenant accès à ce bot. Envoie /start.")
-        except Exception:
-            pass
-    await sleep(10); await msg.delete()
-
-
-@colab_bot.on_message(filters.command(["deluser", "removeuser"]) & filters.private)
-async def deluser_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    if len(message.command) != 2:
-        msg = await message.reply_text("Usage: <code>/deluser 123456789</code>", quote=True)
-        await sleep(10); await msg.delete()
-        return
-    try:
-        uid = int(message.command[1].strip())
-    except ValueError:
-        msg = await message.reply_text("❌ user_id invalide — attendu un nombre.", quote=True)
-        await sleep(8); await msg.delete()
-        return
-    if uid in BOT.Options.allowed_users:
-        BOT.Options.allowed_users.remove(uid)
-        msg = await message.reply_text(f"🗑 Accès retiré : <code>{uid}</code>", quote=True)
-    else:
-        msg = await message.reply_text("⚠️ Cet utilisateur n'a pas accès.", quote=True)
-    await sleep(10); await msg.delete()
-
-
-@colab_bot.on_message(filters.command("users") & filters.private)
-async def users_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    await message.reply_text(_users_text(), reply_markup=_users_kb())
-
-
-@colab_bot.on_message(filters.reply & filters.private)
-async def setFix(client, message):
-    if BOT.State.prefix:
-        BOT.Setting.prefix = message.text; BOT.State.prefix = False
-        await send_settings(client, message, message.reply_to_message_id, False)
-        await message.delete()
-    elif BOT.State.suffix:
-        BOT.Setting.suffix = message.text; BOT.State.suffix = False
-        await send_settings(client, message, message.reply_to_message_id, False)
-        await message.delete()
-    elif message.reply_to_message_id in _pending_trim:
-        pending = _pending_trim.pop(message.reply_to_message_id)
-        parts = (message.text or "").split()
-        if len(parts) != 2:
-            msg = await message.reply_text(
-                "❌ Format invalide. Exemple : <code>00:01:30 00:04:10</code>",
-                quote=True,
-            )
-            _pending_trim[message.reply_to_message_id] = pending
-            await sleep(8); await msg.delete()
-            return
-        start, end = parts
-        await message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=OWNER, text="⏳ <i>Starting trim...</i>",
-        )
-        get_event_loop().create_task(
-            Local_Trim_Handler(pending["source_message"], start, end, job_status_msg)
-        )
-    elif message.reply_to_message_id in _pending_manualshot:
-        pending = _pending_manualshot.pop(message.reply_to_message_id)
-        ts = (message.text or "").strip()
-        if not ts:
-            msg = await message.reply_text("❌ Envoie un timestamp, ex: <code>00:02:15</code>", quote=True)
-            _pending_manualshot[message.reply_to_message_id] = pending
-            await sleep(8); await msg.delete()
-            return
-        await message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting manual shot...</i>")
-        get_event_loop().create_task(Local_ManualShot_Handler(pending["source_message"], ts, job_status_msg))
-    elif message.reply_to_message_id in _pending_split:
-        pending = _pending_split.pop(message.reply_to_message_id)
-        try:
-            parts_n = int((message.text or "").strip())
-        except ValueError:
-            parts_n = 0
-        if parts_n < 2:
-            msg = await message.reply_text("❌ Envoie un nombre de parties (min 2), ex: <code>3</code>", quote=True)
-            _pending_split[message.reply_to_message_id] = pending
-            await sleep(8); await msg.delete()
-            return
-        await message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting split...</i>")
-        get_event_loop().create_task(Local_Split_Handler(pending["source_message"], parts_n, job_status_msg))
-    elif message.reply_to_message_id in _pending_sample:
-        pending = _pending_sample.pop(message.reply_to_message_id)
-        try:
-            dur = int((message.text or "").strip())
-        except ValueError:
-            dur = 0
-        if dur < 5:
-            msg = await message.reply_text("❌ Envoie une durée en secondes (min 5), ex: <code>30</code>", quote=True)
-            _pending_sample[message.reply_to_message_id] = pending
-            await sleep(8); await msg.delete()
-            return
-        await message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting sample...</i>")
-        get_event_loop().create_task(Local_Sample_Handler(pending["source_message"], dur, job_status_msg))
-    elif message.reply_to_message_id in _pending_rename:
-        pending = _pending_rename.pop(message.reply_to_message_id)
-        new_name = (message.text or "").strip()
-        if not new_name:
-            msg = await message.reply_text("❌ Envoie un nom de fichier valide.", quote=True)
-            _pending_rename[message.reply_to_message_id] = pending
-            await sleep(8); await msg.delete()
-            return
-        await message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting rename...</i>")
-        get_event_loop().create_task(Local_Rename_Handler(pending["source_message"], new_name, job_status_msg))
-
-
-# ══════════════════════════════════════════════
-#  Link handler — mode selection
-# ══════════════════════════════════════════════
-
-def _mode_keyboard():
-    first = (BOT.SOURCE or [""])[0].strip()
-    is_magnet = first.startswith("magnet:?xt=urn:btih:")
-    is_http = first.startswith("http://") or first.startswith("https://")
-
-    rows = [
-        [InlineKeyboardButton("── 📦 Fichier ──", callback_data="noop")],
-        [InlineKeyboardButton("📄 Normal",      callback_data="normal"),
-         InlineKeyboardButton("🗜 Compresser",  callback_data="zip")],
-        [InlineKeyboardButton("📂 Extraire",    callback_data="unzip"),
-         InlineKeyboardButton("♻️ Ré-archiver", callback_data="undzip")],
-        [InlineKeyboardButton("── ☁️ CloudConvert ──", callback_data="noop")],
-        [InlineKeyboardButton("🔄 Convertir",       callback_data="cc_convert"),
-         InlineKeyboardButton("📐 Redimensionner",  callback_data="cc_resize")],
-        [InlineKeyboardButton("🧱 Compresser", callback_data="cc_compress")],
-    ]
-
-    if is_magnet:
-        rows.append([InlineKeyboardButton("── 🧲 Seedr + Hardsub ──", callback_data="noop")])
-        rows.append([InlineKeyboardButton("☁️ Seedr+CC Convert", callback_data="seedr_cc_convert")])
-        rows.append([
-            InlineKeyboardButton("☁️ CC Hardsub", callback_data="seedr_cc_hardsub"),
-            InlineKeyboardButton("🆓 FC Hardsub", callback_data="seedr_fc_hardsub"),
-        ])
-    elif is_http:
-        rows.append([InlineKeyboardButton("── 🧲 Hardsub ──", callback_data="noop")])
-        rows.append([
-            InlineKeyboardButton("☁️ CC Hardsub", callback_data="cc_hardsub_manual"),
-            InlineKeyboardButton("🆓 FC Hardsub", callback_data="fc_hardsub_manual"),
-        ])
-
-    rows.append([InlineKeyboardButton("── 🎞 Autre ──", callback_data="noop")])
-    rows.append([InlineKeyboardButton("🎞 Extraire pistes (streams)", callback_data="sx_open")])
-
-    return InlineKeyboardMarkup(rows)
-
-
-@colab_bot.on_message(filters.create(isLink) & ~filters.photo & filters.private)
-async def handle_url(client, message):
-    if not _can_use(message):
-        if await _is_subscribed(client, message.from_user.id):
-            msg = await message.reply_text(
-                "⛔ Tu n'as pas accès aux téléchargements sur ce bot.\n"
-                "Demande au propriétaire de t'ajouter avec /adduser.",
-                quote=True,
-            )
-        else:
-            msg = await message.reply_text(
-                f"🔒 Abonne-toi à {REQUIRED_CHANNEL} pour utiliser ce bot.",
-                reply_markup=_join_gate_kb(),
-                quote=True,
-            )
-        await sleep(10); await msg.delete()
-        return
-    BOT.Options.custom_name = ""
-    BOT.Options.zip_pswd    = ""
-    BOT.Options.unzip_pswd  = ""
-
-    if BOT.State.task_going:
-        msg = await message.reply_text("⚠️ Task running — /cancel first.", quote=True)
-        await sleep(8); await msg.delete()
-        return
-
-    src = message.text.splitlines()
-    for _ in range(3):
-        if not src: break
-        last = src[-1].strip()
-        if   last.startswith("[") and last.endswith("]"): BOT.Options.custom_name = last[1:-1]; src.pop()
-        elif last.startswith("{") and last.endswith("}"): BOT.Options.zip_pswd    = last[1:-1]; src.pop()
-        elif last.startswith("(") and last.endswith(")"): BOT.Options.unzip_pswd  = last[1:-1]; src.pop()
-        else: break
-
-    BOT.SOURCE    = src
-    BOT.Mode.ytdl = all(is_ytdl_link(l) for l in src if l.strip())
-    BOT.Mode.mode = "leech"
-    BOT.State.started = True
-
-    n = len([l for l in src if l.strip()])
-    first_src = (src or [""])[0].strip()
-    if BOT.Mode.ytdl:
-        kind_label = "🏮 Lien YTDL"
-    elif first_src.startswith("magnet:?xt=urn:btih:"):
-        kind_label = "🧲 Magnet détecté"
-    else:
-        kind_label = "🔗 Lien détecté"
-
-    sent = await message.reply_text(
-        f"{kind_label}\n<code>{n}</code> source(s) · <b>Choisis un mode :</b>",
-        reply_markup=_mode_keyboard(), quote=True,
-    )
-    _link_sessions[sent.id] = src
-
-
-# ══════════════════════════════════════════════
-#  ALL CALLBACKS
-# ══════════════════════════════════════════════
-
-@colab_bot.on_callback_query()
-async def callbacks(client, cq):
-    data    = cq.data
-    chat_id = cq.message.chat.id
-
-    # ── Labels de section non-cliquables (juste des repères visuels) ──
-    if data == "noop":
-        await cq.answer()
-        return
-
-    # ── Help/Settings from /start ──────────────
-    if data == "cb_help":
-        await cq.answer()
-        text = (
-            "📖 <b>Quick Guide</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Send any link to download.\n"
-            "/status — live dashboard + cancel\n"
-            "/nyaa_search — anime torrents\n"
-            "/settings — preferences\n"
-            "/help — full command list"
-        )
-        await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔙 Back", callback_data="cb_back_start"),
-        ]]))
-        return
-
-    if data == "cb_settings":
-        await cq.answer()
-        is_owner = cq.from_user and cq.from_user.id == OWNER
-        await send_settings(client, cq.message, cq.message.id, False, readonly=not is_owner)
-        return
-
-    if data == "check_sub":
-        if await _is_subscribed(client, cq.from_user.id):
-            await cq.answer("✅ Abonnement confirmé !", show_alert=True)
-            await cq.message.edit_text(
-                "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "✅ Abonnement vérifié\n\n"
-                "Tu peux consulter les réglages du bot, mais seul le propriétaire "
-                "peut lancer des téléchargements.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⚙️ Voir les réglages", callback_data="cb_settings"),
-                ]])
-            )
-        else:
-            await cq.answer(f"❌ Toujours pas abonné à {REQUIRED_CHANNEL}", show_alert=True)
-        return
-
-    if data == "cb_back_start":
-        await cq.answer()
-        await cq.message.edit_text(
-            "⚡ <b>ZILONG BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 Online",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📖 Help",     callback_data="cb_help"),
-                InlineKeyboardButton("⚙️ Settings", callback_data="cb_settings"),
-            ], [
-                InlineKeyboardButton("📊 Status", callback_data="status_refresh"),
-            ]])
-        )
-        return
-
-    # ── Status panel callbacks ─────────────────
-
-    if data == "status_refresh":
-        await cq.answer("🔄 Refreshed")
-        try:
-            await cq.message.edit_text(
-                _status_panel(),
-                reply_markup=_status_kb(),
-            )
-        except Exception:
-            pass
-        return
-
-    if data == "status_cancel":
-        await cq.answer("⛔ Cancelling ALL tasks…")
-        await cancelTask("Cancelled via /status panel")
-        try:
-            await cq.message.edit_text(
-                _status_panel(),
-                reply_markup=_status_kb(),
-            )
-        except Exception:
-            pass
-        return
-
-    if data.startswith("status_kill|"):
-        pid = int(data.split("|")[1])
-        import signal
-        try:
-            os.kill(pid, signal.SIGTERM)
-            ProcessTracker.unregister(pid)
-            await cq.answer(f"💀 Killed PID {pid}")
-        except ProcessLookupError:
-            ProcessTracker.unregister(pid)
-            await cq.answer("Process already dead.")
-        except Exception as e:
-            await cq.answer(f"Kill failed: {e}", show_alert=True)
-        try:
-            await cq.message.edit_text(_status_panel(), reply_markup=_status_kb())
-        except Exception:
-            pass
-        return
-
-    # ── Stats refresh ──────────────────────────
-    if data == "stats_refresh":
-        await cq.answer("🔄")
-        cpu  = psutil.cpu_percent(interval=0)
-        ram  = psutil.virtual_memory()
-        disk = psutil.disk_usage("/")
-        net  = psutil.net_io_counters()
-        text = (
-            "📊 <b>SERVER STATS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{_ring(cpu)}  CPU  <code>[{_pct_bar(cpu,12)}]</code>  <b>{cpu:.1f}%</b>\n\n"
-            f"{_ring(ram.percent)}  RAM  <code>[{_pct_bar(ram.percent,12)}]</code>  <b>{ram.percent:.1f}%</b>\n"
-            f"    Used <code>{sizeUnit(ram.used)}</code>  ·  Free <code>{sizeUnit(ram.available)}</code>\n\n"
-            f"{_ring(disk.percent)}  Disk <code>[{_pct_bar(disk.percent,12)}]</code>  <b>{disk.percent:.1f}%</b>\n"
-            f"    Free <code>{sizeUnit(disk.free)}</code>\n\n"
-            f"    ⬆️ <code>{sizeUnit(net.bytes_sent)}</code>  ⬇️ <code>{sizeUnit(net.bytes_recv)}</code>"
-        )
-        try:
-            await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Refresh", callback_data="stats_refresh"),
-                InlineKeyboardButton("❌ Close",    callback_data="close"),
-            ]]))
-        except Exception:
-            pass
-        return
-
-    # ── Task launch ────────────────────────────
-    if data in ["normal", "zip", "unzip", "undzip", "cc_convert", "cc_resize", "cc_compress"]:
-        if data.startswith("cc_") and not BOT.Options.cc_api_keys:
-            await cq.answer("CloudConvert API key missing — use /addcc YOUR_KEY.", show_alert=True)
-            return
-        BOT.Mode.type = data
-        await cq.message.delete()
-        MSG.status_msg = await colab_bot.send_message(
-            chat_id=OWNER, text="⏳ <i>Starting...</i>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⛔ Cancel", callback_data="cancel"),
-                InlineKeyboardButton("📊 Status", callback_data="status_refresh"),
-            ]]),
-        )
-        BOT.State.task_going = True
-        BOT.State.started    = False
-        BotTimes.start_time  = datetime.now()
-        TaskInfo.reset()
-        TaskInfo.set(phase="download", started_at=datetime.now().timestamp())
-        BOT.TASK = get_event_loop().create_task(taskScheduler())
-        await BOT.TASK
-        BOT.State.task_going = False
-        TaskInfo.reset()
-        return
-
-    if data == "seedr_cc_convert":
-        if not BOT.Options.cc_api_keys:
-            await cq.answer("CloudConvert API key missing — use /addcc YOUR_KEY.", show_alert=True)
-            return
-        if not str(SEEDR_USERNAME or "").strip() or not str(SEEDR_PASSWORD or "").strip():
-            await cq.answer("Seedr credentials are missing in your Colab launcher.", show_alert=True)
-            return
-        magnet = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
-        if not magnet.startswith("magnet:?xt=urn:btih:"):
-            await cq.answer("Seedr mode currently needs a magnet link.", show_alert=True)
-            return
-        if BOT.State.task_going:
-            await cq.answer("A task is already running — /cancel first.", show_alert=True)
-            return
-
-        await cq.message.delete()
-        MSG.status_msg = await colab_bot.send_message(
-            chat_id=OWNER,
-            text="⏳ <i>Starting Seedr job...</i>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⛔ Cancel", callback_data="cancel"),
-                InlineKeyboardButton("📊 Status", callback_data="status_refresh"),
-            ]]),
-        )
-        BOT.State.task_going = True
-        BOT.State.started = False
-        BotTimes.start_time = datetime.now()
-        TaskInfo.reset()
-        TaskInfo.set(phase="process", engine="Seedr+CloudConvert", started_at=datetime.now().timestamp())
-        BOT.Mode.type = data
-        BOT.TASK = get_event_loop().create_task(Seedr_CC_Convert_Handler(magnet))
-        await BOT.TASK
-        BOT.State.task_going = False
-        TaskInfo.reset()
-        return
-
-    if data == "seedr_cc_hardsub":
-        if not BOT.Options.cc_api_keys:
-            await cq.answer("CloudConvert API key missing — use /addcc YOUR_KEY.", show_alert=True)
-            return
-        if not str(SEEDR_USERNAME or "").strip() or not str(SEEDR_PASSWORD or "").strip():
-            await cq.answer("Seedr credentials are missing in your Colab launcher.", show_alert=True)
-            return
-        magnet = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
-        if not magnet.startswith("magnet:?xt=urn:btih:"):
-            await cq.answer("Seedr mode currently needs a magnet link.", show_alert=True)
-            return
-        if BOT.State.task_going:
-            await cq.answer("A task is already running — /cancel first.", show_alert=True)
-            return
-
-        await cq.message.edit_text(
-            "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Choisis la résolution de sortie :",
-            reply_markup=_cc_res_kb(),
-        )
-        _cc_hardsub_session[cq.message.id] = {"magnet": magnet}
-        return
-
-    if data.startswith("cc_res|"):
-        resolution = data.split("|", 1)[1]
-        session = _cc_hardsub_session.get(cq.message.id)
-        if not session:
-            await cq.answer("Session expirée, renvoie le lien.", show_alert=True)
-            return
-        session["resolution"] = resolution
-        await cq.message.edit_text(
-            "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Résolution : <code>{CC_RESOLUTION_LABELS.get(resolution, resolution)}</code>\n\n"
-            "Choisis la vitesse d'encodage :\n"
-            "<i>Plus rapide = moins de compression, fichier un peu plus lourd.</i>",
-            reply_markup=_cc_speed_kb(),
-        )
-        return
-
-    if data.startswith("cc_speed|"):
-        speed = data.split("|", 1)[1]
-        session = _cc_hardsub_session.pop(cq.message.id, None)
-        if not session:
-            await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
-            return
-        if BOT.State.task_going:
-            await cq.answer("A task is already running — /cancel first.", show_alert=True)
-            return
-
-        magnet = session["magnet"]
-        resolution = session.get("resolution")
-
-        await cq.message.delete()
-        MSG.status_msg = await colab_bot.send_message(
-            chat_id=OWNER,
-            text="⏳ <i>Starting Seedr + CloudConvert hardsub job...</i>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⛔ Cancel", callback_data="cancel"),
-                InlineKeyboardButton("📊 Status", callback_data="status_refresh"),
-            ]]),
-        )
-        BOT.State.task_going = True
-        BOT.State.started = False
-        BotTimes.start_time = datetime.now()
-        TaskInfo.reset()
-        TaskInfo.set(phase="process", engine="Seedr+CloudConvert", started_at=datetime.now().timestamp())
-        BOT.Mode.type = "seedr_cc_hardsub"
-        BOT.TASK = get_event_loop().create_task(
-            Seedr_CC_Hardsub_Handler(magnet, resolution=resolution, encode_speed=speed)
-        )
-        await BOT.TASK
-        BOT.State.task_going = False
-        TaskInfo.reset()
-        return
-        return
-
-    # ── FreeConvert Hardsub (magnet) — CONCURRENT, jusqu'à 3 en parallèle ──
-    # Ne bloque pas sur BOT.State.task_going : peut tourner en même temps
-    # qu'un autre hardsub FC, ou même pendant un leech normal en cours.
-    if data == "seedr_fc_hardsub":
-        if not BOT.Options.fc_api_keys:
-            await cq.answer("FreeConvert API key missing — use /addfc YOUR_KEY.", show_alert=True)
-            return
-        if not str(SEEDR_USERNAME or "").strip() or not str(SEEDR_PASSWORD or "").strip():
-            await cq.answer("Seedr credentials are missing in your Colab launcher.", show_alert=True)
-            return
-        magnet = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
-        if not magnet.startswith("magnet:?xt=urn:btih:"):
-            await cq.answer("Seedr mode currently needs a magnet link.", show_alert=True)
-            return
-
-        await cq.message.edit_text(
-            "🆓 <b>FREECONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Choisis la qualité de sortie :\n"
-            "<i>Une résolution plus basse = traitement plus rapide.</i>",
-            reply_markup=_fc_quality_kb("magnet"),
-        )
-        _link_sessions[cq.message.id] = [magnet]
-        return
-
-    if data.startswith("fc_res|magnet|"):
-        code = data.split("|", 2)[2]
-        resize = FC_RESOLUTIONS.get(code)
-        session = _link_sessions.pop(cq.message.id, None)
-        magnet = (session or (BOT.SOURCE or [""]))[0].strip()
-        if not magnet.startswith("magnet:?xt=urn:btih:"):
-            await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
-            return
-
-        await cq.answer("🆓 Hardsub FreeConvert démarré (en parallèle)")
-        await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=OWNER,
-            text="⏳ <i>Starting Seedr + FreeConvert hardsub job...</i>",
-        )
-        get_event_loop().create_task(Seedr_FC_Hardsub_Handler(magnet, job_status_msg, resize=resize))
-        return
-
-    # ── FreeConvert Hardsub sur lien direct (sous-titre fourni manuellement) ──
-    # Concurrent lui aussi. Le sous-titre est associé via reply-to-message,
-    # pour supporter plusieurs demandes en attente simultanément.
-    if data == "fc_hardsub_manual":
-        if not BOT.Options.fc_api_keys:
-            await cq.answer("FreeConvert API key missing — use /addfc YOUR_KEY.", show_alert=True)
-            return
-        url = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
-        if not (url.startswith("http://") or url.startswith("https://")):
-            await cq.answer("This option needs a direct HTTP(S) link.", show_alert=True)
-            return
-
-        await cq.message.edit_text(
-            "🆓 <b>FREECONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Choisis la qualité de sortie :\n"
-            "<i>Une résolution plus basse = traitement plus rapide.</i>",
-            reply_markup=_fc_quality_kb("direct"),
-        )
-        _link_sessions[cq.message.id] = [url]
-        return
-
-    if data.startswith("fc_res|direct|"):
-        code = data.split("|", 2)[2]
-        resize = FC_RESOLUTIONS.get(code)
-        session = _link_sessions.pop(cq.message.id, None)
-        url = (session or (BOT.SOURCE or [""]))[0].strip()
-        if not (url.startswith("http://") or url.startswith("https://")):
-            await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
-            return
-
-        name = os.path.basename(urlparse(url).path) or "video.mp4"
-
-        prompt = await cq.message.edit_text(
-            "🆓 <b>FREECONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<code>{name}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec le fichier de sous-titres "
-            "(<code>.ass</code> ou <code>.srt</code>) à utiliser.\n\n"
-            "<i>Le style (police, gras, contour...) sera appliqué automatiquement. "
-            "Tu peux lancer un autre lien pendant que celui-ci tourne.</i>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="fc_hardsub_cancel"),
-            ]]),
-        )
-        _pending_fc_subtitle[prompt.id] = {"url": url, "name": name, "resize": resize}
-        return
-
-    # ── CloudConvert Hardsub sur lien direct (sous-titre fourni manuellement) ──
-    # Même UX que le flow FreeConvert ci-dessus, juste le moteur qui change.
-    if data == "cc_hardsub_manual":
-        if not BOT.Options.cc_api_keys:
-            await cq.answer("CloudConvert API key missing — use /addcc YOUR_KEY.", show_alert=True)
-            return
-        url = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])[0].strip()
-        if not (url.startswith("http://") or url.startswith("https://")):
-            await cq.answer("This option needs a direct HTTP(S) link.", show_alert=True)
-            return
-
-        token = uuid4().hex[:8]
-        _cc_direct_sessions[token] = url
-        await cq.message.edit_text(
-            "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Choisis la qualité de sortie :\n"
-            "<i>Une résolution plus basse = traitement plus rapide.</i>",
-            reply_markup=_cc_direct_quality_kb(token),
-        )
-        return
-
-    if data.startswith("ccdirect_res|"):
-        _, token, code = data.split("|", 2)
-        resolution = _CC_RES_CODE_TO_LABEL.get(code)
-        url = _cc_direct_sessions.pop(token, "")
-        if not (url.startswith("http://") or url.startswith("https://")):
-            await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
-            return
-
-        name = os.path.basename(urlparse(url).path) or "video.mp4"
-
-        prompt = await cq.message.edit_text(
-            "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<code>{name}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec le fichier de sous-titres "
-            "(<code>.ass</code> ou <code>.srt</code>) à utiliser.\n\n"
-            "<i>Le style (police, gras, contour...) sera appliqué automatiquement. "
-            "Tu peux lancer un autre lien pendant que celui-ci tourne.</i>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="cc_hardsub_cancel"),
-            ]]),
-        )
-        _pending_cc_subtitle[prompt.id] = {"url": url, "name": name, "resolution": resolution}
-        return
-
-    if data == "cc_hardsub_cancel":
-        _pending_cc_subtitle.pop(cq.message.id, None)
-        await cq.message.edit_text("❌ Hardsub annulé.")
-        return
-
-    if data == "fc_hardsub_cancel":
-        _pending_fc_subtitle.pop(cq.message.id, None)
-        await cq.message.edit_text("❌ Hardsub annulé.")
-        return
-
-    # ── Video Converter local (ffmpeg) ─────────────────────────
-    if data == "vidtool_convert":
-        pending = _pending_video.get(cq.message.id)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        await cq.message.edit_text(
-            f"📹 <code>{pending['name']}</code>\n\n<b>Choisis la résolution de sortie :</b>",
-            reply_markup=_video_res_kb(),
-        )
-        return
-
-    if data.startswith("vidres|"):
-        code = data.split("|", 1)[1]
-        height = LOCAL_RESOLUTIONS.get(code)
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending or not height:
-            await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
-            return
-
-        await cq.answer(f"🎞 Conversion {height}p démarrée")
-        await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=OWNER,
-            text=f"⏳ <i>Starting local video conversion ({height}p)...</i>",
-        )
-        get_event_loop().create_task(
-            Local_Video_Convert_Handler(pending["source_message"], height, job_status_msg)
-        )
-        return
-
-    if data in ("style_yes", "style_no"):
-        pending = _pending_style_sub.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée.", show_alert=True)
-            return
-        path, name = pending["path"], pending["name"]
-        try:
-            if data == "style_yes":
-                await cq.answer("🎨 Application du style...")
-                styled = await apply_house_style(path, Paths.WORK_PATH)
-                out_name = os.path.splitext(name)[0] + ".styled.ass"
-                await colab_bot.send_document(
-                    chat_id=OWNER, document=styled,
-                    caption=f"✅ Style maison appliqué (Trebuchet MS 22)\n<code>{out_name}</code>",
-                    file_name=out_name,
-                )
-                await cq.message.edit_text(f"✅ Style appliqué et renvoyé : <code>{out_name}</code>")
-                if os.path.exists(styled) and styled != path:
-                    os.remove(styled)
-            else:
-                await cq.answer()
-                await colab_bot.send_document(
-                    chat_id=OWNER, document=path,
-                    caption=f"↩️ Style inchangé\n<code>{name}</code>",
-                    file_name=name,
-                )
-                await cq.message.edit_text(f"↩️ Style inchangé, fichier renvoyé tel quel : <code>{name}</code>")
-        except Exception as exc:
-            await cq.message.edit_text(f"❌ <b>Style sub failed</b>\n\n<code>{exc}</code>")
+            try:
+                await status_msg.edit_text(f"❌ <b>Seedr+FC hardsub failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
         finally:
-            if os.path.exists(path):
+            if folder_id and seedr_user and seedr_pwd:
+                await _del_folder(seedr_user, seedr_pwd, folder_id)
+            for d in (job_dir, subtitle_dir):
+                if ospath.exists(d):
+                    shutil.rmtree(d, ignore_errors=True)
+
+
+async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: str, status_msg, resolution: str | None = None) -> None:
+    """
+    Équivalent CloudConvert de Direct_FC_Hardsub_Handler : hardsub sur un
+    lien direct (Seedr, HTTP classique...) avec sous-titre fourni
+    manuellement. Mêmes paramètres/UX que le flow FreeConvert (choix de
+    résolution avant d'envoyer le sous-titre) — juste le moteur qui change.
+
+    Conçu pour tourner en PARALLÈLE avec d'autres jobs CC hardsub (jusqu'à
+    CC_HARDSUB_CONCURRENCY à la fois) : dossier de travail et message de
+    statut dédiés à ce job.
+    """
+    if not BOT.Options.cc_api_keys:
+        try:
+            await status_msg.edit_text("❌ CloudConvert API key is missing in your Colab launcher.")
+        except Exception:
+            pass
+        return
+
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "CloudConvert Hardsub", "Queue", 0.0, "En attente d'un slot disponible...", name)
+
+    async with _cc_hardsub_semaphore:
+        try:
+            async def _process_cb(pct: float, detail: str) -> None:
+                overall = 10.0 + (max(0.0, min(pct, 100.0)) * 0.75)
+                await _fc_job_status(status_msg, "CloudConvert Hardsub", "CloudConvert", overall, detail, name)
+
+            async def _download_cb(pct: float, detail: str) -> None:
+                overall = 85.0 + (max(0.0, min(pct, 100.0)) * 0.15)
+                await _fc_job_status(status_msg, "CloudConvert Hardsub", "Download", overall, detail, name)
+
+            await _fc_job_status(status_msg, "CloudConvert Hardsub", "Queue", 5.0, "Submitting CloudConvert hardsub job", name)
+
+            async def _url_cb(url: str) -> None:
                 try:
-                    os.remove(path)
+                    await colab_bot.send_message(
+                        chat_id=OWNER,
+                        text=(
+                            "🔗 <b>Lien direct disponible</b>\n\n"
+                            f"<code>{name}</code>\n\n"
+                            f"{url}\n\n"
+                            "<i>Le bot va maintenant le télécharger et l'uploader. "
+                            "Si ça plante, tu as déjà ce lien pour le récupérer toi-même.</i>"
+                        ),
+                        disable_web_page_preview=True,
+                    )
                 except Exception:
                     pass
-        return
 
-
-        _pending_video.pop(cq.message.id, None)
-        _pending_merge.pop(cq.message.id, None)
-        _pending_trim.pop(cq.message.id, None)
-        _pending_subs.pop(cq.message.id, None)
-        _pending_manualshot.pop(cq.message.id, None)
-        _pending_split.pop(cq.message.id, None)
-        _pending_sample.pop(cq.message.id, None)
-        _pending_rename.pop(cq.message.id, None)
-        await cq.message.edit_text("❌ Annulé.")
-        return
-
-    if data == "vidtool_merge":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        prompt = await cq.message.edit_text(
-            f"🔊 <code>{pending['name']}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec le fichier audio "
-            "à fusionner avec cette vidéo.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
-            ]]),
-        )
-        _pending_merge[prompt.id] = {"source_message": pending["source_message"]}
-        return
-
-    if data == "vidtool_thumb":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        await cq.answer("🖼 Extraction du thumb...")
-        await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=OWNER, text="⏳ <i>Starting thumbnail extraction...</i>",
-        )
-        get_event_loop().create_task(
-            Local_Thumb_Handler(pending["source_message"], job_status_msg)
-        )
-        return
-
-    if data == "vidtool_shots":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        await cq.answer("📸 Extraction des screenshots...")
-        await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=OWNER, text="⏳ <i>Starting screenshots extraction...</i>",
-        )
-        get_event_loop().create_task(
-            Local_Screenshots_Handler(pending["source_message"], job_status_msg)
-        )
-        return
-
-    if data == "vidtool_trim":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        prompt = await cq.message.edit_text(
-            f"✂️ <code>{pending['name']}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec :\n"
-            "<code>début fin</code>\n\n"
-            "Exemple : <code>00:01:30 00:04:10</code>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
-            ]]),
-        )
-        _pending_trim[prompt.id] = {"source_message": pending["source_message"]}
-        return
-
-    if data == "vidtool_compress":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        await cq.answer("🗜 Compression démarrée")
-        await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=OWNER, text="⏳ <i>Starting local compression...</i>",
-        )
-        get_event_loop().create_task(
-            Local_Compress_Handler(pending["source_message"], job_status_msg)
-        )
-        return
-
-    if data == "vidtool_manualshot":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        prompt = await cq.message.edit_text(
-            f"🎯 <code>{pending['name']}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec le timestamp exact.\n\n"
-            "Exemple : <code>00:02:15</code>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
-            ]]),
-        )
-        _pending_manualshot[prompt.id] = {"source_message": pending["source_message"]}
-        return
-
-    if data == "vidtool_sample":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        prompt = await cq.message.edit_text(
-            f"🎬 <code>{pending['name']}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec la durée en secondes.\n\n"
-            "Exemple : <code>30</code>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
-            ]]),
-        )
-        _pending_sample[prompt.id] = {"source_message": pending["source_message"]}
-        return
-
-    if data == "vidtool_split":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        prompt = await cq.message.edit_text(
-            f"🔪 <code>{pending['name']}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec le nombre de parties.\n\n"
-            "Exemple : <code>3</code>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
-            ]]),
-        )
-        _pending_split[prompt.id] = {"source_message": pending["source_message"]}
-        return
-
-    if data == "vidtool_rename":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        prompt = await cq.message.edit_text(
-            f"✏️ <code>{pending['name']}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec le nouveau nom (avec extension).\n\n"
-            "Exemple : <code>Episode 05.mkv</code>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
-            ]]),
-        )
-        _pending_rename[prompt.id] = {"source_message": pending["source_message"]}
-        return
-
-    if data == "vidtool_toaudio":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        await cq.answer("🎵 Extraction audio démarrée")
-        await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting audio extraction...</i>")
-        get_event_loop().create_task(Local_ToAudio_Handler(pending["source_message"], job_status_msg))
-        return
-
-    if data == "vidtool_mute":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        await cq.answer("🔇 Retrait audio démarré")
-        await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=OWNER, text="⏳ <i>Starting mute...</i>")
-        get_event_loop().create_task(Local_Mute_Handler(pending["source_message"], job_status_msg))
-        return
-
-    if data == "vidtool_metadata":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        await cq.answer()
-        status_msg = await cq.message.edit_text("⏳ <i>Lecture des métadonnées...</i>")
-        get_event_loop().create_task(Local_Metadata_Handler(pending["source_message"], status_msg))
-        return
-
-    if data == "vidtool_streams":
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        await cq.answer()
-        await cq.message.edit_text("🎞 <b>STREAM EXTRACTOR</b>\n\nTéléchargement depuis Telegram...")
-        os.makedirs(Paths.WORK_PATH, exist_ok=True)
-        local_path = os.path.join(Paths.WORK_PATH, f"sx_{uuid4().hex[:8]}_{pending['name']}")
-        await pending["source_message"].download(file_name=local_path)
-
-        session = await analyse(local_path, chat_id)
-        if not session or (not session["video"] and not session["audio"] and not session["subs"]):
-            await cq.message.edit_text(
-                "🎞 <b>STREAM EXTRACTOR</b>\n\nAucune piste détectée sur ce fichier.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Fermer", callback_data="close")]]),
+            await hardsub_remote_url(
+                ",".join(BOT.Options.cc_api_keys),
+                video_url,
+                name,
+                subtitle_path,
+                job_dir,
+                cc_mode=BOT.Options.cc_engine_mode,
+                quality_profile=BOT.Options.cc_quality_profile,
+                resolution=resolution,
+                process_cb=_process_cb,
+                download_cb=_download_cb,
+                url_cb=_url_cb,
             )
-            return
-        await _show_type_menu(cq.message, session)
-        return
 
-
-        pending = _pending_video.pop(cq.message.id, None)
-        if not pending:
-            await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
-            return
-        burn = data == "vidtool_burnsubs"
-        label = "🔥 Burn subs (incrusté)" if burn else "💬 Mux subs (piste)"
-        prompt = await cq.message.edit_text(
-            f"{label}\n<code>{pending['name']}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec le fichier de "
-            "sous-titres (<code>.ass</code> ou <code>.srt</code>).",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="vidtool_cancel"),
-            ]]),
-        )
-        _pending_subs[prompt.id] = {"source_message": pending["source_message"], "burn": burn}
-        return
-
-    # ════════════════════════════════════════════
-    #  STREAM EXTRACTOR
-    # ════════════════════════════════════════════
-
-    if data == "sx_open":
-        url = (BOT.SOURCE or [None])[0]
-        if not url:
-            await cq.answer("No URL found.", show_alert=True); return
-
-        source_url = url
-        if url.startswith("magnet:?xt=urn:btih:"):
-            await cq.message.edit_text(
-                "STREAM EXTRACTOR\n\nDownloading magnet first...\nThe stream menu will open once the main video is local."
-            )
-            MSG.status_msg = cq.message
-            BOT.State.task_going = True
+            await _fc_job_status(status_msg, "CloudConvert Hardsub", "Upload", 100.0, "Uploading to Telegram", name)
+            await Leech(job_dir, True, convert_videos=False, status_msg=status_msg)
             try:
-                source_url = await _prepare_stream_source(url)
-            except Exception as exc:
-                BOT.State.task_going = False
-                await cq.message.edit_text(
-                    f"STREAM EXTRACTOR\n\nFailed to prepare source:\n<code>{exc}</code>",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="sx_back")]])
-                )
-                return
-            BOT.State.task_going = False
-        else:
-            await cq.message.edit_text(
-                "STREAM EXTRACTOR\n\n"
-                f"Analyzing streams...\n"
-                f"<code>{url[:70]}{'...' if len(url)>70 else ''}</code>"
-            )
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>CloudConvert hardsub failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(subtitle_path):
+                try:
+                    os.remove(subtitle_path)
+                except Exception:
+                    pass
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
 
-        session = await analyse(source_url, chat_id)
 
-        if not session or (not session["video"] and not session["audio"] and not session["subs"]):
-            await cq.message.edit_text(
-                "STREAM EXTRACTOR\n\n"
-                "Could not extract streams.\n"
-                "<i>Only yt-dlp compatible sources are supported.</i>",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Back", callback_data="sx_back")
-                ]])
-            )
-            return
+async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: str, status_msg, resize: tuple[int, int] | None = None) -> None:
+    """
+    Hardsub FreeConvert sur un lien direct (ex: lien Seedr, lien HTTP classique),
+    avec un fichier de sous-titres fourni manuellement par l'utilisateur —
+    pas de Seedr, pas d'extraction automatique de piste sub, pas de sonde
+    ffprobe. On envoie juste video_url + le sous-titre reçu à FreeConvert.
 
-        await _show_type_menu(cq.message, session)
-        return
-
-    if data == "sx_type":
-        session = get_session(chat_id)
-        if not session:
-            await cq.answer("Session expired.", show_alert=True); return
-        await _show_type_menu(cq.message, session)
-        return
-
-    if data == "sx_video":
-        session = get_session(chat_id)
-        if not session: await cq.answer("Session expired.", show_alert=True); return
-        if not session["video"]: await cq.answer("No video tracks.", show_alert=True); return
-        await cq.message.edit_text(
-            "🎬 <b>VIDEO TRACKS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>flag  resolution  [codec]  size</i>\n\nTap to download:",
-            reply_markup=kb_video(session)
-        )
-        return
-
-    if data == "sx_audio":
-        session = get_session(chat_id)
-        if not session: await cq.answer("Session expired.", show_alert=True); return
-        if not session["audio"]: await cq.answer("No audio tracks.", show_alert=True); return
-        await cq.message.edit_text(
-            "🎵 <b>AUDIO TRACKS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>flag  language  [codec]  bitrate  size</i>\n\nTap to download:",
-            reply_markup=kb_audio(session)
-        )
-        return
-
-    if data == "sx_subs":
-        session = get_session(chat_id)
-        if not session: await cq.answer("Session expired.", show_alert=True); return
-        if not session["subs"]: await cq.answer("No subtitles.", show_alert=True); return
-        await cq.message.edit_text(
-            "💬 <b>SUBTITLES</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>flag  language  [format]</i>\n\nTap to download:",
-            reply_markup=kb_subs(session)
-        )
-        return
-
-    if data == "sx_back":
-        clear_session(chat_id)
-        n     = len([l for l in (BOT.SOURCE or []) if l.strip()])
-        label = "🏮 Lien YTDL" if BOT.Mode.ytdl else "🔗 Lien détecté"
-        await cq.message.edit_text(
-            f"{label}\n<code>{n}</code> source(s) · <b>Choisis un mode :</b>",
-            reply_markup=_mode_keyboard()
-        )
-        return
-
-    # ── Stream download ────────────────────────
-    if data.startswith("sx_dl_"):
-        session = get_session(chat_id)
-        if not session: await cq.answer("Session expired.", show_alert=True); return
-
-        parts = data.split("_")
-        kind  = parts[2]
-        idx   = int(parts[3])
-
-        stream = (session["video"] if kind == "video"
-                  else session["audio"] if kind == "audio"
-                  else session["subs"])[idx]
-
-        await cq.message.edit_text(
-            f"🎞 <b>STREAM EXTRACTOR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"⬇️ <i>Downloading {kind}...</i>\n\n"
-            f"<code>{stream['label']}</code>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⛔ Cancel", callback_data="cancel")
-            ]])
-        )
-        MSG.status_msg = cq.message
-
-        os.makedirs(Paths.down_path, exist_ok=True)
+    Conçu pour tourner en PARALLÈLE avec d'autres jobs FC hardsub (jusqu'à
+    FC_HARDSUB_CONCURRENCY à la fois) : dossier de travail et message de
+    statut dédiés à ce job.
+    """
+    if not BOT.Options.fc_api_keys:
         try:
-            if kind == "video":
-                fp = await dl_video(session, idx, Paths.down_path)
-            elif kind == "audio":
-                fp = await dl_audio(session, idx, Paths.down_path)
+            await status_msg.edit_text("❌ FreeConvert API key is missing in your Colab launcher.")
+        except Exception:
+            pass
+        return
+
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "FreeConvert Hardsub", "Queue", 0.0, "En attente d'un slot disponible...", name)
+
+    async with _fc_hardsub_semaphore:
+        try:
+            async def _process_cb(pct: float, detail: str) -> None:
+                overall = 10.0 + (max(0.0, min(pct, 100.0)) * 0.75)
+                await _fc_job_status(status_msg, "FreeConvert Hardsub", "FreeConvert", overall, detail, name)
+
+            async def _download_cb(pct: float, detail: str) -> None:
+                overall = 85.0 + (max(0.0, min(pct, 100.0)) * 0.15)
+                await _fc_job_status(status_msg, "FreeConvert Hardsub", "Download", overall, detail, name)
+
+            await _fc_job_status(status_msg, "FreeConvert Hardsub", "Queue", 5.0, "Submitting FreeConvert hardsub job", name)
+
+            async def _url_cb(url: str) -> None:
+                try:
+                    await colab_bot.send_message(
+                        chat_id=OWNER,
+                        text=(
+                            "🔗 <b>Lien direct disponible</b>\n\n"
+                            f"<code>{name}</code>\n\n"
+                            f"{url}\n\n"
+                            "<i>Le bot va maintenant le télécharger et l'uploader. "
+                            "Si ça plante, tu as déjà ce lien pour le récupérer toi-même.</i>"
+                        ),
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+
+            await fc_hardsub_remote_url(
+                ",".join(BOT.Options.fc_api_keys),
+                video_url,
+                name,
+                subtitle_path,
+                job_dir,
+                quality_profile=BOT.Options.cc_quality_profile,
+                resize=resize,
+                process_cb=_process_cb,
+                download_cb=_download_cb,
+                url_cb=_url_cb,
+            )
+
+            await _fc_job_status(status_msg, "FreeConvert Hardsub", "Upload", 100.0, "Uploading to Telegram", name)
+            await _burn_prefix_suffix_in_dir(job_dir, status_msg, "FreeConvert Hardsub")
+            await Leech(job_dir, True, convert_videos=False, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>FreeConvert hardsub failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(subtitle_path):
+                try:
+                    os.remove(subtitle_path)
+                except Exception:
+                    pass
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+# ═════════════════════════════════════════════════════════════
+# Video Converter local (ffmpeg sur le CPU de Colab)
+#
+# Contrairement à FreeConvert (qui tourne sur leurs serveurs), l'encodage ici
+# consomme le CPU partagé de Colab — on limite donc la concurrence à 2 jobs
+# max (au lieu de 3 pour FreeConvert), sinon les encodages se marchent
+# dessus et ralentissent tout le monde au lieu d'aider.
+# ═════════════════════════════════════════════════════════════
+
+LOCAL_CONVERT_CONCURRENCY = 5
+_local_convert_semaphore = asyncio.Semaphore(LOCAL_CONVERT_CONCURRENCY)
+
+
+async def Local_Video_Convert_Handler(source_message, height: int, status_msg) -> None:
+    """
+    Télécharge une vidéo envoyée directement au bot (message Telegram), la
+    convertit en local à la résolution demandée via ffmpeg, puis l'upload.
+    Job isolé (dossier + message de statut dédiés), comme les jobs FreeConvert.
+    """
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_local_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Video Converter", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Video Converter", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(
+                file_name=os.path.join(job_dir, "source_input")
+            )
+
+            async def _progress_cb(pct: float, detail: str) -> None:
+                overall = 10.0 + (max(0.0, min(pct, 100.0)) * 0.80)
+                await _fc_job_status(status_msg, "Video Converter", "Encodage", overall, detail)
+
+            base = os.path.splitext(os.path.basename(input_path))[0]
+            output_path = os.path.join(job_dir, f"{base}.{height}p.mp4")
+
+            await _fc_job_status(status_msg, "Video Converter", "Encodage", 10.0, f"ffmpeg -> {height}p")
+            await convert_resolution(input_path, output_path, height, progress_cb=_progress_cb)
+
+            await _fc_job_status(status_msg, "Video Converter", "Upload", 95.0, "Uploading to Telegram")
+            await upload_file(output_path, os.path.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Video Converter failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Merge_Handler(video_message, audio_path: str, status_msg) -> None:
+    """
+    Fusionne une vidéo envoyée au bot avec un fichier audio séparé (envoyé
+    ensuite en reply). Traitement local ffmpeg, même sémaphore CPU que le
+    Video Converter (pas de course entre les deux pour le CPU Colab).
+    """
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_merge_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Merge Audio+Vidéo", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Merge Audio+Vidéo", "Download", 0.0, "Téléchargement de la vidéo...")
+            video_path = await video_message.download(file_name=os.path.join(job_dir, "source_video"))
+
+            async def _progress_cb(pct: float, detail: str) -> None:
+                overall = 20.0 + (max(0.0, min(pct, 100.0)) * 0.70)
+                await _fc_job_status(status_msg, "Merge Audio+Vidéo", "Fusion", overall, detail)
+
+            base = os.path.splitext(os.path.basename(video_path))[0]
+            output_path = os.path.join(job_dir, f"{base}.merged.mp4")
+
+            await _fc_job_status(status_msg, "Merge Audio+Vidéo", "Fusion", 15.0, "ffmpeg -> fusion audio/vidéo")
+            await merge_audio_video(video_path, audio_path, output_path, progress_cb=_progress_cb)
+
+            await _fc_job_status(status_msg, "Merge Audio+Vidéo", "Upload", 95.0, "Uploading to Telegram")
+            await upload_file(output_path, os.path.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Merge failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except Exception:
+                    pass
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Thumb_Handler(source_message, status_msg) -> None:
+    """Extrait un thumbnail à un timestamp aléatoire (10%-90% de la durée)."""
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_thumb_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Thumb", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Thumb", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            await _fc_job_status(status_msg, "Thumb", "Extraction", 60.0, "ffmpeg -> frame aléatoire")
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            thumb_path = ospath.join(job_dir, f"{base}.thumb.jpg")
+            await extract_random_thumbnail(input_path, thumb_path)
+
+            await _fc_job_status(status_msg, "Thumb", "Upload", 95.0, "Uploading to Telegram")
+            await colab_bot.send_photo(chat_id=OWNER, photo=thumb_path, caption=f"🖼 {ospath.basename(input_path)}")
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Thumb failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Screenshots_Handler(source_message, status_msg, count: int = 5) -> None:
+    """Prend N screenshots répartis sur la durée (avec jitter aléatoire)."""
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_shots_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Screenshots", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Screenshots", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            await _fc_job_status(status_msg, "Screenshots", "Extraction", 50.0, f"ffmpeg -> {count} frames")
+            shots = await take_screenshots(input_path, job_dir, count=count)
+
+            await _fc_job_status(status_msg, "Screenshots", "Upload", 90.0, "Uploading to Telegram")
+            from pyrogram.types import InputMediaPhoto
+            media = [InputMediaPhoto(p) for p in shots]
+            await colab_bot.send_media_group(chat_id=OWNER, media=media)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Screenshots failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Trim_Handler(source_message, start: str, end: str, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_trim_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Trim", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Trim", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            async def _progress_cb(pct: float, detail: str) -> None:
+                overall = 10.0 + (max(0.0, min(pct, 100.0)) * 0.80)
+                await _fc_job_status(status_msg, "Trim", "Découpe", overall, detail)
+
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            ext = ospath.splitext(ospath.basename(input_path))[1] or ".mp4"
+            output_path = ospath.join(job_dir, f"{base}.trim{ext}")
+
+            await _fc_job_status(status_msg, "Trim", "Découpe", 10.0, f"ffmpeg -> {start} → {end}")
+            await trim_video(input_path, output_path, start, end, progress_cb=_progress_cb)
+
+            await _fc_job_status(status_msg, "Trim", "Upload", 95.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Trim failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Compress_Handler(source_message, status_msg, crf: int = 28) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_compress_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Compress", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Compress", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            async def _progress_cb(pct: float, detail: str) -> None:
+                overall = 10.0 + (max(0.0, min(pct, 100.0)) * 0.80)
+                await _fc_job_status(status_msg, "Compress", "Compression", overall, detail)
+
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            output_path = ospath.join(job_dir, f"{base}.compressed.mp4")
+
+            await _fc_job_status(status_msg, "Compress", "Compression", 10.0, f"ffmpeg -> crf {crf}")
+            await compress_video(input_path, output_path, crf=crf, progress_cb=_progress_cb)
+
+            await _fc_job_status(status_msg, "Compress", "Upload", 95.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Compress failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: bool) -> None:
+    """burn=True -> hardsub (incrusté, ré-encodé) ; burn=False -> mux (piste, copy)."""
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_subs_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+    kind = "Burn Subs" if burn else "Mux Subs"
+
+    await _fc_job_status(status_msg, kind, "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, kind, "Download", 0.0, "Téléchargement de la vidéo...")
+            video_path = await video_message.download(file_name=ospath.join(job_dir, "source_video"))
+
+            base = ospath.splitext(ospath.basename(video_path))[0]
+
+            if burn:
+                async def _progress_cb(pct: float, detail: str) -> None:
+                    overall = 15.0 + (max(0.0, min(pct, 100.0)) * 0.75)
+                    await _fc_job_status(status_msg, kind, "Hardsub", overall, detail)
+
+                await _fc_job_status(status_msg, kind, "Style", 8.0, "Application du house style")
+                sub_path = await apply_house_style(sub_path, job_dir)
+
+                output_path = ospath.join(job_dir, f"{base}.hardsub.mp4")
+                await _fc_job_status(status_msg, kind, "Hardsub", 10.0, "ffmpeg -> incrustation")
+                await burn_subtitles(video_path, sub_path, output_path, progress_cb=_progress_cb)
             else:
-                fp = await dl_sub(session, idx, Paths.down_path)
+                output_path = ospath.join(job_dir, f"{base}.muxed.mkv")
+                await _fc_job_status(status_msg, kind, "Mux", 40.0, "ffmpeg -> ajout de la piste")
+                await mux_subtitles(video_path, sub_path, output_path)
 
-            from colab_leecher.uploader.telegram import upload_file
-            await upload_file(fp, os.path.basename(fp), is_last=True)
-            media_info = _probe_media_info(fp)
-            if media_info:
-                await colab_bot.send_message(chat_id=OWNER, text=media_info)
-            clear_session(chat_id)
-
-        except Exception as e:
-            logging.error(f"[StreamDL] {e}")
+            if BOT.Options.custom_name:
+                out_ext = ospath.splitext(output_path)[1]
+                has_ext = bool(ospath.splitext(BOT.Options.custom_name)[1])
+                upload_name = BOT.Options.custom_name if has_ext else f"{BOT.Options.custom_name}{out_ext}"
+            else:
+                upload_name = ospath.basename(output_path)
+            await _fc_job_status(status_msg, kind, "Upload", 95.0, "Uploading to Telegram")
+            await upload_file(output_path, upload_name, is_last=True, status_msg=status_msg)
             try:
-                await cq.message.edit_text(
-                    f"🎞 <b>STREAM EXTRACTOR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"❌ <b>Error:</b> <code>{e}</code>"
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>{kind} failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(sub_path):
+                try:
+                    os.remove(sub_path)
+                except Exception:
+                    pass
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_ManualShot_Handler(source_message, timestamp: str, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_shot_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Manual Shot", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Manual Shot", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            await _fc_job_status(status_msg, "Manual Shot", "Extraction", 60.0, f"ffmpeg -> {timestamp}")
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            shot_path = ospath.join(job_dir, f"{base}.shot.jpg")
+            await screenshot_at(input_path, shot_path, timestamp)
+
+            await _fc_job_status(status_msg, "Manual Shot", "Upload", 95.0, "Uploading to Telegram")
+            await colab_bot.send_photo(chat_id=OWNER, photo=shot_path, caption=f"🖼 {timestamp} — {ospath.basename(input_path)}")
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Manual Shot failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Split_Handler(source_message, parts: int, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_split_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Split", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Split", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            await _fc_job_status(status_msg, "Split", "Découpe", 40.0, f"ffmpeg -> {parts} parties")
+            files = await split_video(input_path, ospath.join(job_dir, "parts"), parts=parts)
+
+            for i, fp in enumerate(files, start=1):
+                await _fc_job_status(status_msg, "Split", "Upload", 60.0 + (i / len(files)) * 35.0, f"Partie {i}/{len(files)}")
+                await upload_file(fp, ospath.basename(fp), is_last=(i == len(files)), status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Split failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Sample_Handler(source_message, duration: int, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_sample_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Sample", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Sample", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            ext = ospath.splitext(ospath.basename(input_path))[1] or ".mp4"
+            output_path = ospath.join(job_dir, f"{base}.sample{ext}")
+
+            await _fc_job_status(status_msg, "Sample", "Extraction", 50.0, f"ffmpeg -> {duration}s")
+            await sample_clip(input_path, output_path, duration=duration)
+
+            await _fc_job_status(status_msg, "Sample", "Upload", 90.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Sample failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Rename_Handler(source_message, new_name: str, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_rename_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Rename", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Rename", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            await _fc_job_status(status_msg, "Rename", "Upload", 60.0, f"-> {new_name}")
+            await upload_file(input_path, new_name, is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Rename failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_ToAudio_Handler(source_message, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_toaudio_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "To Audio", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "To Audio", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            output_path = ospath.join(job_dir, f"{base}.mp3")
+
+            await _fc_job_status(status_msg, "To Audio", "Extraction", 50.0, "ffmpeg -> mp3")
+            await extract_audio(input_path, output_path)
+
+            await _fc_job_status(status_msg, "To Audio", "Upload", 90.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>To Audio failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Mute_Handler(source_message, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_mute_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+
+    await _fc_job_status(status_msg, "Mute", "Queue", 0.0, "En attente d'un slot disponible...")
+
+    async with _local_convert_semaphore:
+        try:
+            await _fc_job_status(status_msg, "Mute", "Download", 0.0, "Téléchargement depuis Telegram...")
+            input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+
+            base = ospath.splitext(ospath.basename(input_path))[0]
+            ext = ospath.splitext(ospath.basename(input_path))[1] or ".mp4"
+            output_path = ospath.join(job_dir, f"{base}.mute{ext}")
+
+            await _fc_job_status(status_msg, "Mute", "Traitement", 50.0, "ffmpeg -> retrait audio")
+            await mute_video(input_path, output_path)
+
+            await _fc_job_status(status_msg, "Mute", "Upload", 90.0, "Uploading to Telegram")
+            await upload_file(output_path, ospath.basename(output_path), is_last=True, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await status_msg.edit_text(f"❌ <b>Mute failed</b>\n\n<code>{exc}</code>")
+            except Exception:
+                pass
+        finally:
+            if ospath.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def Local_Metadata_Handler(source_message, status_msg) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = f"{Paths.temp_cc_path}_meta_{job_id}"
+    makedirs(job_dir, exist_ok=True)
+    try:
+        await status_msg.edit_text("⏳ <i>Téléchargement depuis Telegram...</i>")
+        input_path = await source_message.download(file_name=ospath.join(job_dir, "source_input"))
+        text = await probe_media_info_text(input_path)
+        await status_msg.edit_text(text)
+    except Exception as exc:
+        try:
+            await status_msg.edit_text(f"❌ <b>Metadata failed</b>\n\n<code>{exc}</code>")
+        except Exception:
+            pass
+    finally:
+        if ospath.exists(job_dir):
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+
+async def _burn_prefix_suffix_in_dir(job_dir: str, status_msg, label: str) -> None:
+    """Grave BOT.Setting.prefix/suffix directement dans l'image de chaque
+    vidéo trouvée dans job_dir, EN PLACE (remplace le fichier d'origine).
+    No-op silencieux si prefix et suffix sont vides — c'est le comportement
+    historique (juste dans le nom de fichier/caption) qui continue à
+    s'appliquer dans ce cas. status_msg peut être None (pipeline Seedr+CC
+    historique, pas de message dédié) : dans ce cas on grave sans notifier
+    de progression détaillée, juste un log."""
+    prefix = (BOT.Setting.prefix or "").strip()
+    suffix = (BOT.Setting.suffix or "").strip()
+    if not prefix and not suffix:
+        return
+
+    video_files = [
+        f for f in pathlib.Path(job_dir).glob("**/*")
+        if f.is_file() and fileType(str(f)) == "video"
+    ]
+    for i, vf in enumerate(video_files, start=1):
+        try:
+            if status_msg is not None:
+                await _fc_job_status(
+                    status_msg, label, "Overlay", 90.0 + (i / max(1, len(video_files))) * 5.0,
+                    f"Gravure prefix/suffix {i}/{len(video_files)}",
                 )
-            except Exception: pass
-        return
+            else:
+                log.info("Burning prefix/suffix into %s (%d/%d)", vf.name, i, len(video_files))
+            tmp_out = str(vf) + ".burned.mp4"
+            await burn_text_overlay(str(vf), tmp_out, prefix=prefix, suffix=suffix)
+            os.remove(str(vf))
+            os.rename(tmp_out, str(vf))
+        except Exception as exc:
+            log.warning("Prefix/suffix burn-in failed for %s: %s", vf, exc)
 
-    # ── Settings callbacks ─────────────────────
-    if data == "video":
-        await cq.message.edit_text(
-            "🎥 <b>VIDEO SETTINGS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Convert  <code>{BOT.Setting.convert_video}</code>\n"
-            f"Split    <code>{BOT.Setting.split_video}</code>\n"
-            f"Format   <code>{BOT.Options.video_out.upper()}</code>\n"
-            f"Quality  <code>{BOT.Setting.convert_quality}</code>",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✂️ Split",   callback_data="split-true"),
-                 InlineKeyboardButton("🗜 Zip",     callback_data="split-false")],
-                [InlineKeyboardButton("🔄 Convert", callback_data="convert-true"),
-                 InlineKeyboardButton("🚫 No",      callback_data="convert-false")],
-                [InlineKeyboardButton("🎬 MP4",     callback_data="mp4"),
-                 InlineKeyboardButton("📦 MKV",     callback_data="mkv")],
-                [InlineKeyboardButton("🔝 High",    callback_data="q-High"),
-                 InlineKeyboardButton("📉 Low",     callback_data="q-Low")],
-                [InlineKeyboardButton("⏎ Back",     callback_data="back")],
-            ]))
-    elif data == "cc":
-        cc_ready = "Ready" if BOT.Options.cc_api_keys else "Missing"
-        await cq.message.edit_text(
-            "☁️ <b>CLOUDCONVERT SETTINGS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"API Key  <code>{cc_ready}</code>\n"
-            f"Mode     <code>{cc_mode_label(BOT.Options.cc_engine_mode)}</code>\n"
-            f"Preset   <code>{quality_label(BOT.Options.cc_quality_profile)}</code>\n"
-            f"Resize   <code>{resize_label(BOT.Options.cc_resize)}</code>\n"
-            f"Target   <code>{BOT.Setting.cc_target_size}</code>\n\n"
-            "These settings are used by CC Convert, CC Resize, and CC Compress.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚖️ CC Mode", callback_data="cc-mode"),
-                 InlineKeyboardButton("🎚 Preset", callback_data="cc-quality")],
-                [InlineKeyboardButton("📐 Resize", callback_data="cc-resize"),
-                 InlineKeyboardButton("🗜 Target", callback_data="cc-target")],
-                [InlineKeyboardButton("⏮ Back", callback_data="back")],
-            ]))
-    elif data == "caption":
-        await cq.message.edit_text(
-            f"✏️ <b>CAPTION STYLE</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Current: <code>{BOT.Setting.caption}</code>",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Monospace", callback_data="code-Monospace"),
-                 InlineKeyboardButton("Bold",      callback_data="b-Bold")],
-                [InlineKeyboardButton("Italic",    callback_data="i-Italic"),
-                 InlineKeyboardButton("Underline", callback_data="u-Underlined")],
-                [InlineKeyboardButton("Plain",     callback_data="p-Regular")],
-                [InlineKeyboardButton("⏎ Back",    callback_data="back")],
-            ]))
-    elif data == "thumb":
-        await cq.message.edit_text(
-            f"🖼 <b>THUMBNAIL</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Status: {'✅ Set' if BOT.Setting.thumbnail else '❌ None'}\n\n"
-            "Send a photo to update.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑 Delete", callback_data="del-thumb")],
-                [InlineKeyboardButton("⏎ Back",   callback_data="back")],
-            ]))
-    elif data == "del-thumb":
-        if BOT.Setting.thumbnail:
-            try: os.remove(Paths.THMB_PATH)
-            except Exception: pass
-        BOT.Setting.thumbnail = False
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data == "set-prefix":
-        await cq.message.edit_text("Reply with your <b>prefix</b> text:")
-        BOT.State.prefix = True
-    elif data == "set-suffix":
-        await cq.message.edit_text("Reply with your <b>suffix</b> text:")
-        BOT.State.suffix = True
-    elif data in ["code-Monospace","p-Regular","b-Bold","i-Italic","u-Underlined"]:
-        r = data.split("-"); BOT.Options.caption = r[0]; BOT.Setting.caption = r[1]
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data in ["split-true","split-false"]:
-        BOT.Options.is_split    = data == "split-true"
-        BOT.Setting.split_video = "Split" if data == "split-true" else "Zip"
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data in ["convert-true","convert-false","mp4","mkv","q-High","q-Low"]:
-        if   data == "convert-true":  BOT.Options.convert_video = True;  BOT.Setting.convert_video = "Yes"
-        elif data == "convert-false": BOT.Options.convert_video = False; BOT.Setting.convert_video = "No"
-        elif data == "q-High": BOT.Setting.convert_quality = "High"; BOT.Options.convert_quality = True
-        elif data == "q-Low":  BOT.Setting.convert_quality = "Low";  BOT.Options.convert_quality = False
-        else: BOT.Options.video_out = data
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data == "cc-mode":
-        cycle = ["balanced", "economy"]
-        cur = str(BOT.Options.cc_engine_mode or "balanced").lower()
-        nxt = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else "balanced"
-        BOT.Options.cc_engine_mode = nxt
-        BOT.Setting.cc_engine_mode = cc_mode_label(nxt)
-        await cq.answer(BOT.Setting.cc_engine_mode, show_alert=True)
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data == "cc-quality":
-        cycle = ["fast", "balanced", "small", "best"]
-        cur = str(BOT.Options.cc_quality_profile or "balanced").lower()
-        nxt = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else "balanced"
-        BOT.Options.cc_quality_profile = nxt
-        BOT.Setting.cc_quality_profile = quality_label(nxt)
-        await cq.answer(BOT.Setting.cc_quality_profile, show_alert=True)
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data == "cc-resize":
-        cycle = [0, 480, 720, 1080]
-        cur = int(BOT.Options.cc_resize or 0)
-        nxt = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else 720
-        BOT.Options.cc_resize = nxt
-        BOT.Setting.cc_resize = resize_label(nxt)
-        await cq.answer(BOT.Setting.cc_resize, show_alert=True)
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data == "cc-target":
-        cycle = [50, 100, 200, 500]
-        cur = int(BOT.Options.cc_target_size_mb or 100)
-        nxt = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else 100
-        BOT.Options.cc_target_size_mb = nxt
-        BOT.Setting.cc_target_size = f"{nxt} MB"
-        await cq.answer(BOT.Setting.cc_target_size, show_alert=True)
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data == "autofwd":
-        if not BOT.Options.dump_ids:
-            await cq.answer("Ajoute d'abord un canal avec /add @channel", show_alert=True)
-        else:
-            BOT.Options.auto_forward = not BOT.Options.auto_forward
-            BOT.Setting.auto_forward = "On" if BOT.Options.auto_forward else "Off"
-            await cq.answer(f"AutoFwd {BOT.Setting.auto_forward}", show_alert=True)
-            await send_settings(client, cq.message, cq.message.id, False)
-    elif data == "dumps":
-        await cq.message.edit_text(_dumps_text(), reply_markup=_dumps_kb())
-    elif data.startswith("dump_remove|"):
-        raw_id = data.split("|", 1)[1]
+
+async def Zip_Handler(down_path: str, is_split: bool, remove: bool):
+    Messages.status_head = f"🗜 <b>COMPRESSING</b>\n\n<code>{Messages.download_name}</code>\n"
+    TaskInfo.set(phase="process", engine="zip", filename=Messages.download_name)
+    try:
+        MSG.status_msg = await MSG.status_msg.edit_text(
+            text=Messages.task_msg + Messages.status_head + sysINFO(),
+            reply_markup=keyboard(),
+        )
+    except Exception: pass
+    if not ospath.exists(Paths.temp_zpath): makedirs(Paths.temp_zpath)
+    await archive(down_path, is_split, remove)
+    await sleep(2)
+    Transfer.total_down_size = getSize(Paths.temp_zpath)
+    if remove and ospath.exists(down_path): shutil.rmtree(down_path)
+
+
+async def Unzip_Handler(down_path: str, remove: bool):
+    Messages.status_head = f"📂 <b>EXTRACTING</b>\n\n<code>{Messages.download_name}</code>\n"
+    TaskInfo.set(phase="process", engine="unzip", filename=Messages.download_name)
+    try:
+        MSG.status_msg = await MSG.status_msg.edit_text(
+            text=Messages.task_msg + Messages.status_head
+            + "\n⏳ <i>Starting...</i>" + sysINFO(),
+            reply_markup=keyboard(),
+        )
+    except Exception: pass
+    filenames = natsorted([str(p) for p in pathlib.Path(down_path).glob("**/*") if p.is_file()])
+    for f in filenames:
+        short_path = ospath.join(down_path, f)
+        if not ospath.exists(Paths.temp_unzip_path): makedirs(Paths.temp_unzip_path)
+        _, ext = ospath.splitext(ospath.basename(f).lower())
         try:
-            target = int(raw_id)
-        except ValueError:
-            target = raw_id
-        if target in BOT.Options.dump_ids:
-            BOT.Options.dump_ids.remove(target)
-            if not BOT.Options.dump_ids:
-                BOT.Options.auto_forward = False
-                BOT.Setting.auto_forward = "Off"
-            await cq.answer("🗑 Retiré")
-        else:
-            await cq.answer("Déjà retiré.")
-        await cq.message.edit_text(_dumps_text(), reply_markup=_dumps_kb())
-    elif data == "apikeys":
-        await cq.message.edit_text(_apikeys_text(), reply_markup=_apikeys_kb())
-    elif data.startswith("apikey_remove|"):
-        _, kind, idx_str = data.split("|")
-        idx = int(idx_str)
-        target_list = BOT.Options.cc_api_keys if kind == "cc" else BOT.Options.fc_api_keys
-        if 0 <= idx < len(target_list):
-            target_list.pop(idx)
-            await cq.answer("🗑 Retirée")
-        else:
-            await cq.answer("Déjà retirée.")
-        await cq.message.edit_text(_apikeys_text(), reply_markup=_apikeys_kb())
-    elif data.startswith("user_remove|"):
-        raw_uid = data.split("|", 1)[1]
+            if ospath.exists(short_path):
+                if ext in [".7z", ".gz", ".zip", ".rar", ".001", ".tar", ".z01"]:
+                    await extract(short_path, remove)
+                else:
+                    shutil.copy(short_path, Paths.temp_unzip_path)
+        except Exception as e:
+            logging.warning(f"Unzip error: {e}")
+    if remove: shutil.rmtree(down_path)
+
+
+def _kill_stray_processes():
+    """Kill any aria2c/ffmpeg/yt-dlp that might have been missed."""
+    import subprocess
+    for name in ("aria2c", "ffmpeg", "ffprobe"):
         try:
-            uid = int(raw_uid)
-        except ValueError:
-            uid = None
-        if uid in BOT.Options.allowed_users:
-            BOT.Options.allowed_users.remove(uid)
-            await cq.answer("🗑 Retiré")
-        else:
-            await cq.answer("Déjà retiré.")
-        await cq.message.edit_text(_users_text(), reply_markup=_users_kb())
-    elif data in ["media","document"]:
-        BOT.Options.stream_upload = data == "media"
-        BOT.Setting.stream_upload = "Media" if data == "media" else "Document"
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data == "close":
-        await cq.message.delete()
-    elif data == "back":
-        await send_settings(client, cq.message, cq.message.id, False)
-    elif data == "cancel":
-        await cancelTask("Cancelled by user")
+            subprocess.run(
+                ["pkill", "-f", name],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
 
 
-async def _show_type_menu(msg, session):
-    v = len(session["video"])
-    a = len(session["audio"])
-    s = len(session["subs"])
-    title = session["title"]
-    await msg.edit_text(
-        "🎞 <b>STREAM EXTRACTOR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📌  <b>{title}</b>\n\n"
-        f"🎬  Video tracks     <code>{v}</code>\n"
-        f"🎵  Audio tracks     <code>{a}</code>\n"
-        f"💬  Subtitles        <code>{s}</code>\n\n"
-        "Choose track type:",
-        reply_markup=kb_type(v, a, s)
+async def cancelTask(reason: str):
+    spent = getTime((datetime.now() - BotTimes.start_time).seconds)
+    killed = ProcessTracker.kill_all()
+
+    if BOT.State.task_going:
+        try:
+            if BOT.TASK and not BOT.TASK.done():
+                BOT.TASK.cancel()
+        except Exception as exc:
+            logging.warning("Task cancel: %s", exc)
+
+    _kill_stray_processes()
+
+    try:
+        if ospath.exists(Paths.WORK_PATH):
+            shutil.rmtree(Paths.WORK_PATH)
+    except Exception as exc:
+        logging.warning("Cancel cleanup: %s", exc)
+
+    BOT.State.task_going = False
+    TaskInfo.reset()
+
+    text = (
+        "⛔ <b>TASK CANCELLED</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"❓  <b>Reason</b>   <i>{reason}</i>\n"
+        f"⏱  <b>Spent</b>    <code>{spent}</code>\n"
+        f"💀  <b>Killed</b>   <code>{killed} process(es)</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>All downloads, uploads and processing stopped.</i>"
     )
+    log_tail = _tail_log(60)
 
+    try:
+        await MSG.status_msg.edit_text(text)
+    except Exception:
+        try:
+            await colab_bot.send_message(chat_id=OWNER, text=text)
+        except Exception:
+            pass
 
-# ══════════════════════════════════════════════
-#  Photo → thumbnail
-# ══════════════════════════════════════════════
-
-@colab_bot.on_message(filters.photo & filters.private)
-async def handle_photo(client, message):
-    msg = await message.reply_text("⏳ <i>Saving thumbnail...</i>")
-    if await setThumbnail(message):
-        await msg.edit_text("✅ Thumbnail updated.")
-        await message.delete()
-    else:
-        await msg.edit_text("❌ Could not set thumbnail.")
-    await sleep(10)
-    await message_deleter(message, msg)
-
-
-# ══════════════════════════════════════════════
-#  Vidéo envoyée directement → menu d'outils locaux
-# ══════════════════════════════════════════════
-
-_VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m2ts", ".flv", ".wmv")
-
-
-@colab_bot.on_message(
-    (filters.video | filters.audio | filters.voice | filters.document) & filters.private,
-    group=-1,
-)
-async def handle_incoming_video(client, message):
-    if not _can_use(message):
-        message.continue_propagation()
-        return
-
-    # ── Cas 1 : c'est l'audio attendu pour un merge en cours ──────────────
-    reply_id = message.reply_to_message_id
-    pending_merge = _pending_merge.get(reply_id) if reply_id else None
-    if pending_merge is None and len(_pending_merge) == 1:
-        # Pas de reply explicite, mais une seule fusion en attente -> pas
-        # d'ambiguïté, on l'accepte quand même.
-        reply_id, pending_merge = next(iter(_pending_merge.items()))
-    if pending_merge:
-        is_audio = False
-        audio_name = "audio"
-        if message.audio:
-            is_audio = True
-            audio_name = message.audio.file_name or "audio.mp3"
-        elif message.voice:
-            is_audio = True
-            audio_name = "voice.ogg"
-        elif message.document:
-            mime = (message.document.mime_type or "")
-            name = (message.document.file_name or "")
-            if mime.startswith("audio/") or name.lower().endswith(_AUDIO_EXTS):
-                is_audio = True
-                audio_name = name or "audio"
-
-        if is_audio:
-            _pending_merge.pop(reply_id, None)
-            status_msg = await message.reply_text("⏳ <i>Audio reçu, démarrage de la fusion...</i>")
-            await message.delete()
-
-            os.makedirs(Paths.WORK_PATH, exist_ok=True)
-            ext = os.path.splitext(audio_name)[1] or ".mp3"
-            audio_path = os.path.join(Paths.WORK_PATH, f"merge_audio_{uuid4().hex[:8]}{ext}")
-            await message.download(file_name=audio_path)
-
-            get_event_loop().create_task(
-                Local_Merge_Handler(pending_merge["source_message"], audio_path, status_msg)
+    if log_tail and "Cancelled by user" not in reason and "Cancelled via" not in reason:
+        try:
+            await colab_bot.send_message(
+                chat_id=OWNER,
+                text="📜 <b>Recent Log Tail</b>\n\n<code>" + log_tail[-3500:] + "</code>",
             )
-            return
-        # Reply présent mais c'est pas un fichier audio -> on laisse tomber
-        # ce cas précis et on continue l'analyse normale ci-dessous.
+        except Exception:
+            pass
 
-    # ── Cas 2 : c'est une vidéo -> affiche le menu d'outils ────────────────
-    is_video = False
-    display_name = "video.mp4"
-    if message.video:
-        is_video = True
-        display_name = message.video.file_name or "video.mp4"
-    elif message.document:
-        mime = (message.document.mime_type or "")
-        name = (message.document.file_name or "")
-        if mime.startswith("video/") or name.lower().endswith(_VIDEO_EXTS):
-            is_video = True
-            display_name = name or "video.mp4"
+    logging.info("[Cancel] Task cancelled: %s - killed %s procs", reason, killed)
 
-    if not is_video:
-        message.continue_propagation()
-        return
 
-    prompt = await message.reply_text(
-        f"📹 <code>{display_name}</code>\n\n<b>Choisis une action :</b>",
-        reply_markup=_video_tools_kb(),
-        quote=True,
+async def SendLogs(is_leech: bool):
+    spent = getTime((datetime.now() - BotTimes.start_time).seconds)
+    summary = (
+        "✅ <b>TASK COMPLETED</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"⏱  <b>Spent</b>  <code>{spent}</code>\n"
+        f"📤  <b>Files</b>  <code>{len(Transfer.sent_file_names)}</code>\n"
+        f"💾  <b>Total</b>  <code>{sizeUnit(Transfer.total_down_size)}</code>\n"
     )
-    _pending_video[prompt.id] = {"source_message": message, "name": display_name}
+    if Transfer.sent_file_names:
+        recent = "\n".join(f"· <code>{name}</code>" for name in Transfer.sent_file_names[-5:])
+        summary += f"\n<b>Recent files</b>\n{recent}"
+    if _tail_log(10):
+        summary += "\n\n📜 <b>Need details?</b> Use <code>/logs</code>"
 
+    try:
+        await colab_bot.send_message(chat_id=OWNER, text=summary)
+    except Exception:
+        pass
 
-# ══════════════════════════════════════════════
-#  Document → sous-titre pour FC Hardsub manuel
-# ══════════════════════════════════════════════
-
-@colab_bot.on_message(filters.document & filters.private)
-async def handle_subtitle_document(client, message):
-    if not _owner(message):
-        return
-
-    # ── Sous-titre pour CloudConvert Hardsub sur lien direct ──────────────
-    reply_id_cc = message.reply_to_message_id
-    pending_cc = _pending_cc_subtitle.get(reply_id_cc) if reply_id_cc else None
-    if pending_cc is None and len(_pending_cc_subtitle) == 1:
-        reply_id_cc, pending_cc = next(iter(_pending_cc_subtitle.items()))
-    if pending_cc:
-        file_name = message.document.file_name or ""
-        ext = os.path.splitext(file_name)[1].lower()
-        if ext not in (".ass", ".srt", ".ssa"):
-            await message.reply_text(
-                "❌ Envoie un fichier <code>.ass</code> ou <code>.srt</code> valide.",
-                quote=True,
-            )
-            return
-        _pending_cc_subtitle.pop(reply_id_cc, None)
-        status_msg = await message.reply_text("⏳ <i>Sous-titre reçu, démarrage CloudConvert...</i>")
-        await message.delete()
-        os.makedirs(Paths.WORK_PATH, exist_ok=True)
-        subtitle_path = os.path.join(Paths.WORK_PATH, f"cc_sub_{uuid4().hex[:8]}{ext}")
-        await message.download(file_name=subtitle_path)
-        get_event_loop().create_task(
-            Direct_CC_Hardsub_Handler(
-                pending_cc["url"], pending_cc["name"], subtitle_path, status_msg,
-                resolution=pending_cc.get("resolution"),
-            )
-        )
-        return
-
-    # ── Sous-titre pour Mux/Burn subs (ffmpeg local sur vidéo déjà envoyée) ──
-    reply_id_subs = message.reply_to_message_id
-    pending_subs = _pending_subs.get(reply_id_subs) if reply_id_subs else None
-    if pending_subs is None and len(_pending_subs) == 1:
-        reply_id_subs, pending_subs = next(iter(_pending_subs.items()))
-    if pending_subs:
-        file_name = message.document.file_name or ""
-        ext = os.path.splitext(file_name)[1].lower()
-        if ext not in (".ass", ".srt", ".ssa"):
-            await message.reply_text(
-                "❌ Envoie un fichier <code>.ass</code> ou <code>.srt</code> valide.",
-                quote=True,
-            )
-            return
-        _pending_subs.pop(reply_id_subs, None)
-        burn = pending_subs["burn"]
-        status_msg = await message.reply_text("⏳ <i>Sous-titre reçu, démarrage...</i>")
-        await message.delete()
-        os.makedirs(Paths.WORK_PATH, exist_ok=True)
-        subtitle_path = os.path.join(Paths.WORK_PATH, f"vidtool_sub_{uuid4().hex[:8]}{ext}")
-        await message.download(file_name=subtitle_path)
-        get_event_loop().create_task(
-            Local_Subs_Handler(pending_subs["source_message"], subtitle_path, status_msg, burn)
-        )
-        return
-
-    if not _pending_fc_subtitle:
-        # Aucun hardsub/mux/burn en attente : on propose le flow autonome
-        # "Add Style Sub" — appliquer (ou pas) le house style et renvoyer
-        # le fichier, sans lancer aucun job vidéo.
-        file_name = message.document.file_name or ""
-        ext = os.path.splitext(file_name)[1].lower()
-        if ext not in (".ass", ".srt", ".ssa"):
-            return  # fichier non reconnu, on ignore silencieusement
-        os.makedirs(Paths.WORK_PATH, exist_ok=True)
-        subtitle_path = os.path.join(Paths.WORK_PATH, f"style_sub_{uuid4().hex[:8]}{ext}")
-        await message.download(file_name=subtitle_path)
-        await message.delete()
-        prompt = await colab_bot.send_message(
-            chat_id=OWNER,
-            text=(
-                f"🎨 <code>{file_name}</code>\n\n"
-                "Appliquer le <b>house style</b> (Trebuchet MS 22) sur ce sous-titre ?"
-            ),
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Oui", callback_data="style_yes"),
-                InlineKeyboardButton("❌ Non", callback_data="style_no"),
-            ]]),
-        )
-        _pending_style_sub[prompt.id] = {"path": subtitle_path, "name": file_name}
-        return
-
-    # 1. Priorité au reply explicite (lève l'ambiguïté si plusieurs en attente)
-    reply_id = message.reply_to_message_id
-    pending = _pending_fc_subtitle.get(reply_id) if reply_id else None
-
-    # 2. Fallback : s'il n'y a qu'UNE seule demande en attente, pas besoin de reply
-    if pending is None:
-        if len(_pending_fc_subtitle) == 1:
-            reply_id, pending = next(iter(_pending_fc_subtitle.items()))
-        else:
-            await message.reply_text(
-                "⚠️ Plusieurs hardsub sont en attente d'un sous-titre — "
-                "réponds (reply) directement au message concerné avec ce fichier.",
-                quote=True,
-            )
-            return
-
-    file_name = message.document.file_name or ""
-    ext = os.path.splitext(file_name)[1].lower()
-    if ext not in (".ass", ".srt", ".ssa"):
-        await message.reply_text(
-            "❌ Envoie un fichier <code>.ass</code> ou <code>.srt</code> valide.",
-            quote=True,
-        )
-        return
-
-    _pending_fc_subtitle.pop(reply_id, None)
-
-    status_msg = await message.reply_text("⏳ <i>Sous-titre reçu, démarrage du hardsub...</i>")
-    await message.delete()
-
-    os.makedirs(Paths.WORK_PATH, exist_ok=True)
-    subtitle_path = os.path.join(Paths.WORK_PATH, f"manual_sub_{uuid4().hex[:8]}{ext}")
-    await message.download(file_name=subtitle_path)
-
-    # Fire-and-forget : ne bloque pas ce handler, donc le bot reste réactif
-    # pour recevoir d'autres liens/sous-titres pendant que celui-ci tourne.
-    get_event_loop().create_task(
-        Direct_FC_Hardsub_Handler(pending["url"], pending["name"], subtitle_path, status_msg, resize=pending.get("resize"))
-    )
-
-
-# ══════════════════════════════════════════════
-#  Import nyaa_tracker (registers its handlers)
-# ══════════════════════════════════════════════
-
-try:
-    import colab_leecher.nyaa_tracker
-    logging.info("📡 Nyaa tracker loaded")
-except Exception as e:
-    logging.warning(f"Nyaa tracker not loaded: {e}")
-
-
-logging.info("⚡ Zilong started.")
-get_event_loop().create_task(_startup_welcome())
-colab_bot.run()
+    BOT.State.started = False
+    BOT.State.task_going = False
+    TaskInfo.reset()
