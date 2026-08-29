@@ -14,7 +14,7 @@ from typing import Awaitable, Callable, Optional
 
 import aiohttp
 
-from colab_leecher.house_style import DEFAULT_HARDSUB_STYLE, AssStyle, apply_hardsub_style
+from colab_leecher.house_style import apply_hardsub_style
 
 log = logging.getLogger(__name__)
 
@@ -539,17 +539,19 @@ async def _create_hardsub_job(
     crf: int,
     preset: str,
     scale_height: int = 0,
-    style: AssStyle = DEFAULT_HARDSUB_STYLE,
 ) -> dict:
     v_safe = _arg_safe(video_filename)
     s_safe = _arg_safe(subtitle_filename)
     o_safe = _arg_safe(output_filename)
 
-    # Force notre style (police/gras/contour/ombre) avant l'envoi, comme
-    # pour FreeConvert — sinon ffmpeg utiliserait le style brut du fichier
-    # source, qui varie selon d'où vient le sous-titre.
+    # Force notre house style (police/gras/contour/ombre, alignment par
+    # position) avant l'envoi, comme pour FreeConvert — sinon ffmpeg
+    # utiliserait le style brut du fichier source, qui varie selon d'où
+    # vient le sous-titre. apply_hardsub_style() choisit le profil tout
+    # seul par nom de style (BottomCenter/TopCenter/...), plus de
+    # paramètre `style` à lui passer.
     styled_sub_path = subtitle_path + ".styled.ass"
-    apply_hardsub_style(subtitle_path, styled_sub_path, style=style)
+    apply_hardsub_style(subtitle_path, styled_sub_path)
     with open(styled_sub_path, "rb") as fh:
         subtitle_b64 = base64.b64encode(fh.read()).decode("ascii")
     try:
