@@ -711,7 +711,7 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
                 async def _url_cb(url: str, filename: str = name) -> None:
                     try:
                         await colab_bot.send_message(
-                            chat_id=OWNER,
+                            chat_id=status_msg.chat.id,
                             text=(
                                 "🔗 <b>Lien direct disponible</b>\n\n"
                                 f"<code>{filename}</code>\n\n"
@@ -796,7 +796,7 @@ async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
             async def _url_cb(url: str) -> None:
                 try:
                     await colab_bot.send_message(
-                        chat_id=OWNER,
+                        chat_id=status_msg.chat.id,
                         text=(
                             "🔗 <b>Lien direct disponible</b>\n\n"
                             f"<code>{name}</code>\n\n"
@@ -884,7 +884,7 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
             async def _url_cb(url: str) -> None:
                 try:
                     await colab_bot.send_message(
-                        chat_id=OWNER,
+                        chat_id=status_msg.chat.id,
                         text=(
                             "🔗 <b>Lien direct disponible</b>\n\n"
                             f"<code>{name}</code>\n\n"
@@ -1063,7 +1063,7 @@ async def Local_Thumb_Handler(source_message, status_msg) -> None:
             await extract_random_thumbnail(input_path, thumb_path)
 
             await _fc_job_status(status_msg, "Thumb", "Upload", 95.0, "Uploading to Telegram")
-            await colab_bot.send_photo(chat_id=OWNER, photo=thumb_path, caption=f"🖼 {ospath.basename(input_path)}")
+            await colab_bot.send_photo(chat_id=status_msg.chat.id, photo=thumb_path, caption=f"🖼 {ospath.basename(input_path)}")
             try:
                 await status_msg.delete()
             except Exception:
@@ -1097,7 +1097,7 @@ async def Local_Screenshots_Handler(source_message, status_msg, count: int = 5) 
             await _fc_job_status(status_msg, "Screenshots", "Upload", 90.0, "Uploading to Telegram")
             from pyrogram.types import InputMediaPhoto
             media = [InputMediaPhoto(p) for p in shots]
-            await colab_bot.send_media_group(chat_id=OWNER, media=media)
+            await colab_bot.send_media_group(chat_id=status_msg.chat.id, media=media)
             try:
                 await status_msg.delete()
             except Exception:
@@ -1273,7 +1273,7 @@ async def Local_ManualShot_Handler(source_message, timestamp: str, status_msg) -
             await screenshot_at(input_path, shot_path, timestamp)
 
             await _fc_job_status(status_msg, "Manual Shot", "Upload", 95.0, "Uploading to Telegram")
-            await colab_bot.send_photo(chat_id=OWNER, photo=shot_path, caption=f"🖼 {timestamp} — {ospath.basename(input_path)}")
+            await colab_bot.send_photo(chat_id=status_msg.chat.id, photo=shot_path, caption=f"🖼 {timestamp} — {ospath.basename(input_path)}")
             try:
                 await status_msg.delete()
             except Exception:
@@ -1598,14 +1598,14 @@ async def cancelTask(reason: str):
         await MSG.status_msg.edit_text(text)
     except Exception:
         try:
-            await colab_bot.send_message(chat_id=OWNER, text=text)
+            await colab_bot.send_message(chat_id=BOT.TargetChat, text=text)
         except Exception:
             pass
 
     if log_tail and "Cancelled by user" not in reason and "Cancelled via" not in reason:
         try:
             await colab_bot.send_message(
-                chat_id=OWNER,
+                chat_id=BOT.TargetChat,
                 text="📜 <b>Recent Log Tail</b>\n\n<code>" + log_tail[-3500:] + "</code>",
             )
         except Exception:
@@ -1675,7 +1675,7 @@ async def SendLogs(is_leech: bool):
         summary += "\n\n📜 <b>Need details?</b> Use <code>/logs</code>"
 
     try:
-        await colab_bot.send_message(chat_id=OWNER, text=summary)
+        await colab_bot.send_message(chat_id=BOT.TargetChat, text=summary)
     except Exception:
         pass
 
