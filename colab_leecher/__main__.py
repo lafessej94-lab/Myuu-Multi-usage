@@ -38,7 +38,7 @@ from colab_leecher.utility.handler import (
     cancelTask,
 )
 from colab_leecher.utility.variables import (
-    BOT, MSG, BotTimes, Paths, Messages, ProcessTracker, TaskInfo, Aria2c,
+    BOT, MSG, ActiveJobs, BotTimes, Paths, Messages, ProcessTracker, TaskInfo, Aria2c,
 )
 from colab_leecher.utility.task_manager import taskScheduler
 from colab_leecher.utility.helper import (
@@ -2207,6 +2207,14 @@ async def callbacks(client, cq):
         await send_settings(client, cq.message, cq.message.id, False)
     elif data == "cancel":
         await cancelTask("Cancelled by user")
+
+    elif data.startswith("canceljob_"):
+        job_id = data.split("_", 1)[1]
+        ok = ActiveJobs.cancel(job_id)
+        await cq.answer(
+            "⛔ Annulation en cours..." if ok else "Ce job est déjà terminé.",
+            show_alert=not ok,
+        )
 
 
 async def _show_type_menu(msg, session):
