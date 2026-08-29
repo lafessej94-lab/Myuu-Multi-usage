@@ -14,6 +14,7 @@ from pyrogram import filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot, OWNER
+from colab_leecher.access import is_allowed as access_is_allowed, is_banned as access_is_banned
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.utility.handler import (
     Direct_CC_Hardsub_Handler,
@@ -269,7 +270,7 @@ async def _startup_welcome() -> None:
 
 
 def _owner(m): return m.chat.id == OWNER
-def _can_use(m): return m.chat.id == OWNER or m.chat.id in BOT.Options.allowed_users
+def _can_use(m): return m.chat.id == OWNER or (access_is_allowed(m.chat.id) and not access_is_banned(m.chat.id))
 def _ring(p):  return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
 
 REQUIRED_CHANNEL = "@hebdos"
@@ -456,9 +457,12 @@ async def help_cmd(client, message):
         "  /addcc     — add a CloudConvert API key\n"
         "  /addfc     — add a FreeConvert API key\n"
         "  /apikeys   — list/remove API keys\n"
-        "  /adduser   — give a user access to the bot\n"
-        "  /deluser   — remove a user's access\n"
-        "  /users     — list authorized users\n\n"
+        "  /adduser   — give a user access to the bot (alias /allow)\n"
+        "  /deluser   — remove a user's access (alias /deny)\n"
+        "  /users     — list authorized users (alias /allowed)\n"
+        "  /ban /unban — block/unblock a user entirely\n"
+        "  /banned    — list banned users\n"
+        "  /broadcast — reply to a message to send it to all authorized users\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📡 <b>Nyaa Anime Search</b>\n"
         "  /nyaa_search <query> — search Nyaa.si\n"
@@ -494,7 +498,7 @@ async def logs_cmd(client, message):
             tail = "".join(fh.readlines()[-80:]).strip()
         if tail:
             await message.reply_text(f"📜 <b>Recent Logs</b>\n\n<code>{tail[-3500:]}</code>")
-        await client.send_document(chat_id=OWNER, document=Paths.LOG_PATH, caption="Zilong runtime log")
+        await client.send_document(chat_id=OWNER, document=Paths.LOG_PATH, caption="Myuu runtime log")
     except Exception as exc:
         await message.reply_text(f"❌ Could not send logs: <code>{exc}</code>")
 
@@ -920,85 +924,10 @@ async def apikeys_cmd(client, message):
     await message.reply_text(_apikeys_text(), reply_markup=_apikeys_kb())
 
 
-def _users_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"🗑 {uid}", callback_data=f"user_remove|{uid}")]
-            for uid in BOT.Options.allowed_users]
-    rows.append([InlineKeyboardButton("⏎ Back", callback_data="back")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _users_text() -> str:
-    if not BOT.Options.allowed_users:
-        return (
-            "👥 <b>UTILISATEURS AUTORISÉS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Aucun utilisateur ajouté — seul le propriétaire peut utiliser le bot.\n\n"
-            "Ajoute-en un avec :\n<code>/adduser 123456789</code>"
-        )
-    lines = "\n".join(f"· <code>{uid}</code>" for uid in BOT.Options.allowed_users)
-    return (
-        "👥 <b>UTILISATEURS AUTORISÉS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{lines}\n\nAjoute-en un autre avec <code>/adduser id</code>\n"
-        "Tape sur 🗑 pour en retirer un."
-    )
-
-
-@colab_bot.on_message(filters.command("adduser") & filters.private)
-async def adduser_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    if len(message.command) != 2:
-        msg = await message.reply_text(
-            "Usage: <code>/adduser 123456789</code> (user_id Telegram)\n\n"
-            "L'utilisateur peut obtenir son ID via @userinfobot.",
-            quote=True,
-        )
-        await sleep(12); await msg.delete()
-        return
-    try:
-        uid = int(message.command[1].strip())
-    except ValueError:
-        msg = await message.reply_text("❌ user_id invalide — attendu un nombre.", quote=True)
-        await sleep(8); await msg.delete()
-        return
-    if uid in BOT.Options.allowed_users:
-        msg = await message.reply_text("⚠️ Cet utilisateur a déjà accès.", quote=True)
-    else:
-        BOT.Options.allowed_users.append(uid)
-        msg = await message.reply_text(f"✅ Utilisateur ajouté : <code>{uid}</code>", quote=True)
-        try:
-            await colab_bot.send_message(chat_id=uid, text="✅ Tu as maintenant accès à ce bot. Envoie /start.")
-        except Exception:
-            pass
-    await sleep(10); await msg.delete()
-
-
-@colab_bot.on_message(filters.command(["deluser", "removeuser"]) & filters.private)
-async def deluser_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    if len(message.command) != 2:
-        msg = await message.reply_text("Usage: <code>/deluser 123456789</code>", quote=True)
-        await sleep(10); await msg.delete()
-        return
-    try:
-        uid = int(message.command[1].strip())
-    except ValueError:
-        msg = await message.reply_text("❌ user_id invalide — attendu un nombre.", quote=True)
-        await sleep(8); await msg.delete()
-        return
-    if uid in BOT.Options.allowed_users:
-        BOT.Options.allowed_users.remove(uid)
-        msg = await message.reply_text(f"🗑 Accès retiré : <code>{uid}</code>", quote=True)
-    else:
-        msg = await message.reply_text("⚠️ Cet utilisateur n'a pas accès.", quote=True)
-    await sleep(10); await msg.delete()
-
-
-@colab_bot.on_message(filters.command("users") & filters.private)
-async def users_cmd(client, message):
-    if not _owner(message): return
-    await message.delete()
-    await message.reply_text(_users_text(), reply_markup=_users_kb())
+# NOTE : /adduser, /deluser, /removeuser, /users vivent désormais dans
+# colab_leecher/access.py (alias /allow, /deny, /allowed) — whitelist +
+# ban persistants sur disque au lieu d'une liste en mémoire perdue à
+# chaque redémarrage Colab. Voir aussi /ban, /unban, /banned, /broadcast.
 
 
 @colab_bot.on_message(filters.reply & filters.private)
@@ -2187,18 +2116,6 @@ async def callbacks(client, cq):
         else:
             await cq.answer("Déjà retirée.")
         await cq.message.edit_text(_apikeys_text(), reply_markup=_apikeys_kb())
-    elif data.startswith("user_remove|"):
-        raw_uid = data.split("|", 1)[1]
-        try:
-            uid = int(raw_uid)
-        except ValueError:
-            uid = None
-        if uid in BOT.Options.allowed_users:
-            BOT.Options.allowed_users.remove(uid)
-            await cq.answer("🗑 Retiré")
-        else:
-            await cq.answer("Déjà retiré.")
-        await cq.message.edit_text(_users_text(), reply_markup=_users_kb())
     elif data in ["media","document"]:
         BOT.Options.stream_upload = data == "media"
         BOT.Setting.stream_upload = "Media" if data == "media" else "Document"
