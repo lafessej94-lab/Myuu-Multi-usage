@@ -231,3 +231,28 @@ class TaskInfo:
         for k, v in kw.items():
             if hasattr(cls, k):
                 setattr(cls, k, v)
+
+
+class ActiveJobs:
+    """Registre des jobs FC hardsub / FFmpeg local en cours, tenus dans un
+    dict {job_id: asyncio.Task} pour permettre une annulation individuelle
+    (plusieurs jobs peuvent tourner en parallèle via le Semaphore(3) FC,
+    donc pas question d'utiliser BOT.TASK/cancelTask() qui ne gère qu'une
+    seule tâche à la fois)."""
+    tasks: dict = {}
+
+    @classmethod
+    def register(cls, job_id: str, task) -> None:
+        cls.tasks[job_id] = task
+
+    @classmethod
+    def unregister(cls, job_id: str) -> None:
+        cls.tasks.pop(job_id, None)
+
+    @classmethod
+    def cancel(cls, job_id: str) -> bool:
+        task = cls.tasks.get(job_id)
+        if task and not task.done():
+            task.cancel()
+            return True
+        return False
