@@ -52,6 +52,11 @@ async def upload_file(file_path, real_name, is_last: bool = False, status_msg=No
 
     type_  = fileType(file_path)
     f_type = type_ if BOT.Options.stream_upload else "document"
+    # Priorité au chat du message de statut DE CE JOB (déjà correctement
+    # scopé à sa création, robuste même si BOT.TargetChat a été réécrit
+    # entre-temps par un autre job lancé en parallèle) ; sinon repli sur
+    # BOT.TargetChat (pipeline leech classique, un seul job à la fois).
+    target_chat = target_msg.chat.id if target_msg else BOT.TargetChat
 
     async def _progress(current, total):
         await progress_bar(current, total, target_msg)
@@ -64,7 +69,7 @@ async def upload_file(file_path, real_name, is_last: bool = False, status_msg=No
             with Image.open(thmb_path) as img:
                 width, height = img.size
             sent = await colab_bot.send_video(
-                chat_id=OWNER,
+                chat_id=target_chat,
                 video=file_path,
                 supports_streaming=True,
                 width=width, height=height,
@@ -78,7 +83,7 @@ async def upload_file(file_path, real_name, is_last: bool = False, status_msg=No
         elif f_type == "audio":
             thmb_path = Paths.THMB_PATH if ospath.exists(Paths.THMB_PATH) else None
             sent = await colab_bot.send_audio(
-                chat_id=OWNER,
+                chat_id=target_chat,
                 audio=file_path,
                 caption=caption,
                 thumb=thmb_path,
@@ -87,7 +92,7 @@ async def upload_file(file_path, real_name, is_last: bool = False, status_msg=No
 
         elif f_type == "photo":
             sent = await colab_bot.send_photo(
-                chat_id=OWNER,
+                chat_id=target_chat,
                 photo=file_path,
                 caption=caption,
                 progress=_progress,
@@ -101,7 +106,7 @@ async def upload_file(file_path, real_name, is_last: bool = False, status_msg=No
             else:
                 thmb_path = None
             sent = await colab_bot.send_document(
-                chat_id=OWNER,
+                chat_id=target_chat,
                 document=file_path,
                 caption=caption,
                 thumb=thmb_path,
@@ -141,7 +146,7 @@ async def _forward_to(message, dump_target, retries: int = 0) -> None:
     try:
         await colab_bot.copy_message(
             chat_id=dump_target,
-            from_chat_id=OWNER,
+            from_chat_id=BOT.TargetChat,
             message_id=message.id,
         )
     except FloodWait as e:
