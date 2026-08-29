@@ -49,7 +49,7 @@ from colab_leecher.seedr import SeedrError, _del_folder, fetch_urls_via_seedr
 from colab_leecher.uploader.telegram import upload_file
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from colab_leecher.utility.variables import (
-    BOT, MSG, BotTimes, Messages, Paths, Transfer, ProcessTracker, TaskInfo,
+    BOT, MSG, ActiveJobs, BotTimes, Messages, Paths, Transfer, ProcessTracker, TaskInfo,
 )
 from colab_leecher.utility.converters import archive, extract, videoConverter, sizeChecker
 from colab_leecher.utility.helper import (
@@ -385,10 +385,15 @@ _KIND_EMOJI = {
 }
 
 
-async def _fc_job_status(status_msg, kind: str, stage: str, pct: float, detail: str, filename: str = "") -> None:
+async def _fc_job_status(status_msg, kind: str, stage: str, pct: float, detail: str, filename: str = "", job_id: str = "") -> None:
     """Comme _seedr_status, mais édite un message dédié à CE job précis
     plutôt que le MSG.status_msg global — permet à plusieurs jobs FreeConvert
-    de tourner en parallèle sans que leurs messages de statut ne s'écrasent."""
+    de tourner en parallèle sans que leurs messages de statut ne s'écrasent.
+
+    `job_id`, quand fourni, ajoute un bouton ❌ Cancel branché sur
+    ActiveJobs.cancel(job_id) — pour les jobs lancés en asyncio.create_task
+    (FC hardsub direct-link, FFmpeg local burn/mux) qui ne passent pas par
+    BOT.TASK/cancelTask() du pipeline leech classique."""
     pct = max(0.0, min(float(pct), 100.0))
     emoji = _KIND_EMOJI.get(kind, "⚙️")
     text = render_task_status(
@@ -402,9 +407,14 @@ async def _fc_job_status(status_msg, kind: str, stage: str, pct: float, detail: 
             ("Preset", fc_quality_label(BOT.Options.cc_quality_profile)),
             ("Engine", kind),
         ],
+        stop_hint=f"/canceljob_{job_id}" if job_id else "Tap ❌ Cancel below",
+    )
+    kb = (
+        InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"canceljob_{job_id}")]])
+        if job_id else None
     )
     try:
-        await status_msg.edit_text(text, disable_web_page_preview=True)
+        await status_msg.edit_text(text, disable_web_page_preview=True, reply_markup=kb)
     except Exception:
         pass
 
@@ -855,20 +865,21 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
     job_id = uuid.uuid4().hex[:8]
     job_dir = f"{Paths.temp_cc_path}_{job_id}"
     makedirs(job_dir, exist_ok=True)
+    ActiveJobs.register(job_id, asyncio.current_task())
 
-    await _fc_job_status(status_msg, "FreeConvert Hardsub", "Queue", 0.0, "En attente d'un slot disponible...", name)
+    await _fc_job_status(status_msg, "FreeConvert Hardsub", "Queue", 0.0, "En attente d'un slot disponible...", name, job_id=job_id)
 
     async with _fc_hardsub_semaphore:
         try:
             async def _process_cb(pct: float, detail: str) -> None:
                 overall = 10.0 + (max(0.0, min(pct, 100.0)) * 0.75)
-                await _fc_job_status(status_msg, "FreeConvert Hardsub", "FreeConvert", overall, detail, name)
+                await _fc_job_status(status_msg, "FreeConvert Hardsub", "FreeConvert", overall, detail, name, job_id=job_id)
 
             async def _download_cb(pct: float, detail: str) -> None:
                 overall = 85.0 + (max(0.0, min(pct, 100.0)) * 0.15)
-                await _fc_job_status(status_msg, "FreeConvert Hardsub", "Download", overall, detail, name)
+                await _fc_job_status(status_msg, "FreeConvert Hardsub", "Download", overall, detail, name, job_id=job_id)
 
-            await _fc_job_status(status_msg, "FreeConvert Hardsub", "Queue", 5.0, "Submitting FreeConvert hardsub job", name)
+            await _fc_job_status(status_msg, "FreeConvert Hardsub", "Queue", 5.0, "Submitting FreeConvert hardsub job", name, job_id=job_id)
 
             async def _url_cb(url: str) -> None:
                 try:
@@ -899,11 +910,16 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
                 url_cb=_url_cb,
             )
 
-            await _fc_job_status(status_msg, "FreeConvert Hardsub", "Upload", 100.0, "Uploading to Telegram", name)
+            await _fc_job_status(status_msg, "FreeConvert Hardsub", "Upload", 100.0, "Uploading to Telegram", name, job_id=job_id)
             await _burn_prefix_suffix_in_dir(job_dir, status_msg, "FreeConvert Hardsub")
             await Leech(job_dir, True, convert_videos=False, status_msg=status_msg)
             try:
                 await status_msg.delete()
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            try:
+                await status_msg.edit_text("⛔ <b>FreeConvert hardsub cancelled</b>", reply_markup=None)
             except Exception:
                 pass
         except Exception as exc:
@@ -912,6 +928,7 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
             except Exception:
                 pass
         finally:
+            ActiveJobs.unregister(job_id)
             if ospath.exists(subtitle_path):
                 try:
                     os.remove(subtitle_path)
@@ -1178,12 +1195,13 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
     job_dir = f"{Paths.temp_cc_path}_subs_{job_id}"
     makedirs(job_dir, exist_ok=True)
     kind = "Burn Subs" if burn else "Mux Subs"
+    ActiveJobs.register(job_id, asyncio.current_task())
 
-    await _fc_job_status(status_msg, kind, "Queue", 0.0, "En attente d'un slot disponible...")
+    await _fc_job_status(status_msg, kind, "Queue", 0.0, "En attente d'un slot disponible...", job_id=job_id)
 
     async with _local_convert_semaphore:
         try:
-            await _fc_job_status(status_msg, kind, "Download", 0.0, "Téléchargement de la vidéo...")
+            await _fc_job_status(status_msg, kind, "Download", 0.0, "Téléchargement de la vidéo...", job_id=job_id)
             video_path = await video_message.download(file_name=ospath.join(job_dir, "source_video"))
 
             base = ospath.splitext(ospath.basename(video_path))[0]
@@ -1191,17 +1209,17 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
             if burn:
                 async def _progress_cb(pct: float, detail: str) -> None:
                     overall = 15.0 + (max(0.0, min(pct, 100.0)) * 0.75)
-                    await _fc_job_status(status_msg, kind, "Hardsub", overall, detail)
+                    await _fc_job_status(status_msg, kind, "Hardsub", overall, detail, job_id=job_id)
 
-                await _fc_job_status(status_msg, kind, "Style", 8.0, "Application du house style")
+                await _fc_job_status(status_msg, kind, "Style", 8.0, "Application du house style", job_id=job_id)
                 sub_path = await apply_house_style(sub_path, job_dir)
 
                 output_path = ospath.join(job_dir, f"{base}.hardsub.mp4")
-                await _fc_job_status(status_msg, kind, "Hardsub", 10.0, "ffmpeg -> incrustation")
+                await _fc_job_status(status_msg, kind, "Hardsub", 10.0, "ffmpeg -> incrustation", job_id=job_id)
                 await burn_subtitles(video_path, sub_path, output_path, progress_cb=_progress_cb)
             else:
                 output_path = ospath.join(job_dir, f"{base}.muxed.mkv")
-                await _fc_job_status(status_msg, kind, "Mux", 40.0, "ffmpeg -> ajout de la piste")
+                await _fc_job_status(status_msg, kind, "Mux", 40.0, "ffmpeg -> ajout de la piste", job_id=job_id)
                 await mux_subtitles(video_path, sub_path, output_path)
 
             if BOT.Options.custom_name:
@@ -1210,10 +1228,15 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
                 upload_name = BOT.Options.custom_name if has_ext else f"{BOT.Options.custom_name}{out_ext}"
             else:
                 upload_name = ospath.basename(output_path)
-            await _fc_job_status(status_msg, kind, "Upload", 95.0, "Uploading to Telegram")
+            await _fc_job_status(status_msg, kind, "Upload", 95.0, "Uploading to Telegram", job_id=job_id)
             await upload_file(output_path, upload_name, is_last=True, status_msg=status_msg)
             try:
                 await status_msg.delete()
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            try:
+                await status_msg.edit_text(f"⛔ <b>{kind} cancelled</b>", reply_markup=None)
             except Exception:
                 pass
         except Exception as exc:
@@ -1222,6 +1245,7 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
             except Exception:
                 pass
         finally:
+            ActiveJobs.unregister(job_id)
             if ospath.exists(sub_path):
                 try:
                     os.remove(sub_path)
