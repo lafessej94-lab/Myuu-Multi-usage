@@ -1,11 +1,19 @@
 from time import time
 from datetime import datetime
 from pyrogram.types import Message
+from colab_leecher import OWNER
 
 
 class BOT:
     SOURCE = []
     TASK = None
+    # Chat vers lequel les messages de statut/uploads de la tâche EN COURS
+    # doivent partir. Par défaut OWNER (comportement historique). Doit être
+    # positionné à chat_id de la personne qui déclenche la tâche (via
+    # /adduser) AU DÉBUT de chaque handler de lancement de tâche, avant de
+    # créer le premier message de statut — sinon tout repart chez OWNER
+    # même pour un utilisateur autorisé.
+    TargetChat = OWNER
     class Setting:
         stream_upload = "Media"
         auto_forward = "Off"
