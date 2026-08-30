@@ -15,6 +15,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot, OWNER
 from colab_leecher.access import is_allowed as access_is_allowed, is_banned as access_is_banned
+from colab_leecher.status_slideshow import StatusSlideshow
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.utility.handler import (
     Direct_CC_Hardsub_Handler,
@@ -954,8 +955,8 @@ async def setFix(client, message):
             return
         start, end = parts
         await message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=BOT.TargetChat, text="⏳ <i>Starting trim...</i>",
+        job_status_msg = await StatusSlideshow().start(
+            BOT.TargetChat, text="⏳ <i>Starting trim...</i>",
         )
         get_event_loop().create_task(
             Local_Trim_Handler(pending["source_message"], start, end, job_status_msg)
@@ -969,7 +970,7 @@ async def setFix(client, message):
             await sleep(8); await msg.delete()
             return
         await message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=BOT.TargetChat, text="⏳ <i>Starting manual shot...</i>")
+        job_status_msg = await StatusSlideshow().start(BOT.TargetChat, text="⏳ <i>Starting manual shot...</i>")
         get_event_loop().create_task(Local_ManualShot_Handler(pending["source_message"], ts, job_status_msg))
     elif message.reply_to_message_id in _pending_split:
         pending = _pending_split.pop(message.reply_to_message_id)
@@ -983,7 +984,7 @@ async def setFix(client, message):
             await sleep(8); await msg.delete()
             return
         await message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=BOT.TargetChat, text="⏳ <i>Starting split...</i>")
+        job_status_msg = await StatusSlideshow().start(BOT.TargetChat, text="⏳ <i>Starting split...</i>")
         get_event_loop().create_task(Local_Split_Handler(pending["source_message"], parts_n, job_status_msg))
     elif message.reply_to_message_id in _pending_sample:
         pending = _pending_sample.pop(message.reply_to_message_id)
@@ -997,7 +998,7 @@ async def setFix(client, message):
             await sleep(8); await msg.delete()
             return
         await message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=BOT.TargetChat, text="⏳ <i>Starting sample...</i>")
+        job_status_msg = await StatusSlideshow().start(BOT.TargetChat, text="⏳ <i>Starting sample...</i>")
         get_event_loop().create_task(Local_Sample_Handler(pending["source_message"], dur, job_status_msg))
     elif message.reply_to_message_id in _pending_rename:
         pending = _pending_rename.pop(message.reply_to_message_id)
@@ -1008,7 +1009,7 @@ async def setFix(client, message):
             await sleep(8); await msg.delete()
             return
         await message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=BOT.TargetChat, text="⏳ <i>Starting rename...</i>")
+        job_status_msg = await StatusSlideshow().start(BOT.TargetChat, text="⏳ <i>Starting rename...</i>")
         get_event_loop().create_task(Local_Rename_Handler(pending["source_message"], new_name, job_status_msg))
 
 
@@ -1250,8 +1251,8 @@ async def callbacks(client, cq):
             return
         BOT.Mode.type = data
         await cq.message.delete()
-        MSG.status_msg = await colab_bot.send_message(
-            chat_id=BOT.TargetChat, text="⏳ <i>Starting...</i>",
+        MSG.status_msg = await StatusSlideshow().start(
+            BOT.TargetChat, text="⏳ <i>Starting...</i>",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("⛔ Cancel", callback_data="cancel"),
                 InlineKeyboardButton("📊 Status", callback_data="status_refresh"),
@@ -1284,8 +1285,8 @@ async def callbacks(client, cq):
             return
 
         await cq.message.delete()
-        MSG.status_msg = await colab_bot.send_message(
-            chat_id=BOT.TargetChat,
+        MSG.status_msg = await StatusSlideshow().start(
+            BOT.TargetChat,
             text="⏳ <i>Starting Seedr job...</i>",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("⛔ Cancel", callback_data="cancel"),
@@ -1357,8 +1358,8 @@ async def callbacks(client, cq):
         resolution = session.get("resolution")
 
         await cq.message.delete()
-        MSG.status_msg = await colab_bot.send_message(
-            chat_id=BOT.TargetChat,
+        MSG.status_msg = await StatusSlideshow().start(
+            BOT.TargetChat,
             text="⏳ <i>Starting Seedr + CloudConvert hardsub job...</i>",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("⛔ Cancel", callback_data="cancel"),
@@ -1415,8 +1416,8 @@ async def callbacks(client, cq):
 
         await cq.answer("🆓 Hardsub FreeConvert démarré (en parallèle)")
         await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=BOT.TargetChat,
+        job_status_msg = await StatusSlideshow().start(
+            BOT.TargetChat,
             text="⏳ <i>Starting Seedr + FreeConvert hardsub job...</i>",
         )
         get_event_loop().create_task(Seedr_FC_Hardsub_Handler(magnet, job_status_msg, resize=resize))
@@ -1545,8 +1546,8 @@ async def callbacks(client, cq):
 
         await cq.answer(f"🎞 Conversion {height}p démarrée")
         await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=BOT.TargetChat,
+        job_status_msg = await StatusSlideshow().start(
+            BOT.TargetChat,
             text=f"⏳ <i>Starting local video conversion ({height}p)...</i>",
         )
         get_event_loop().create_task(
@@ -1626,8 +1627,8 @@ async def callbacks(client, cq):
             return
         await cq.answer("🖼 Extraction du thumb...")
         await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=BOT.TargetChat, text="⏳ <i>Starting thumbnail extraction...</i>",
+        job_status_msg = await StatusSlideshow().start(
+            BOT.TargetChat, text="⏳ <i>Starting thumbnail extraction...</i>",
         )
         get_event_loop().create_task(
             Local_Thumb_Handler(pending["source_message"], job_status_msg)
@@ -1641,8 +1642,8 @@ async def callbacks(client, cq):
             return
         await cq.answer("📸 Extraction des screenshots...")
         await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=BOT.TargetChat, text="⏳ <i>Starting screenshots extraction...</i>",
+        job_status_msg = await StatusSlideshow().start(
+            BOT.TargetChat, text="⏳ <i>Starting screenshots extraction...</i>",
         )
         get_event_loop().create_task(
             Local_Screenshots_Handler(pending["source_message"], job_status_msg)
@@ -1673,8 +1674,8 @@ async def callbacks(client, cq):
             return
         await cq.answer("🗜 Compression démarrée")
         await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(
-            chat_id=BOT.TargetChat, text="⏳ <i>Starting local compression...</i>",
+        job_status_msg = await StatusSlideshow().start(
+            BOT.TargetChat, text="⏳ <i>Starting local compression...</i>",
         )
         get_event_loop().create_task(
             Local_Compress_Handler(pending["source_message"], job_status_msg)
@@ -1752,7 +1753,7 @@ async def callbacks(client, cq):
             return
         await cq.answer("🎵 Extraction audio démarrée")
         await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=BOT.TargetChat, text="⏳ <i>Starting audio extraction...</i>")
+        job_status_msg = await StatusSlideshow().start(BOT.TargetChat, text="⏳ <i>Starting audio extraction...</i>")
         get_event_loop().create_task(Local_ToAudio_Handler(pending["source_message"], job_status_msg))
         return
 
@@ -1763,7 +1764,7 @@ async def callbacks(client, cq):
             return
         await cq.answer("🔇 Retrait audio démarré")
         await cq.message.delete()
-        job_status_msg = await colab_bot.send_message(chat_id=BOT.TargetChat, text="⏳ <i>Starting mute...</i>")
+        job_status_msg = await StatusSlideshow().start(BOT.TargetChat, text="⏳ <i>Starting mute...</i>")
         get_event_loop().create_task(Local_Mute_Handler(pending["source_message"], job_status_msg))
         return
 
@@ -2209,7 +2210,7 @@ async def handle_incoming_video(client, message):
 
         if is_audio:
             _pending_merge.pop(reply_id, None)
-            status_msg = await message.reply_text("⏳ <i>Audio reçu, démarrage de la fusion...</i>")
+            status_msg = await StatusSlideshow().start(message.chat.id, text="⏳ <i>Audio reçu, démarrage de la fusion...</i>")
             await message.delete()
 
             os.makedirs(Paths.WORK_PATH, exist_ok=True)
@@ -2273,7 +2274,7 @@ async def handle_subtitle_document(client, message):
             )
             return
         _pending_cc_subtitle.pop(reply_id_cc, None)
-        status_msg = await message.reply_text("⏳ <i>Sous-titre reçu, démarrage CloudConvert...</i>")
+        status_msg = await StatusSlideshow().start(message.chat.id, text="⏳ <i>Sous-titre reçu, démarrage CloudConvert...</i>")
         await message.delete()
         os.makedirs(Paths.WORK_PATH, exist_ok=True)
         subtitle_path = os.path.join(Paths.WORK_PATH, f"cc_sub_{uuid4().hex[:8]}{ext}")
@@ -2302,7 +2303,7 @@ async def handle_subtitle_document(client, message):
             return
         _pending_subs.pop(reply_id_subs, None)
         burn = pending_subs["burn"]
-        status_msg = await message.reply_text("⏳ <i>Sous-titre reçu, démarrage...</i>")
+        status_msg = await StatusSlideshow().start(message.chat.id, text="⏳ <i>Sous-titre reçu, démarrage...</i>")
         await message.delete()
         os.makedirs(Paths.WORK_PATH, exist_ok=True)
         subtitle_path = os.path.join(Paths.WORK_PATH, f"vidtool_sub_{uuid4().hex[:8]}{ext}")
@@ -2365,7 +2366,7 @@ async def handle_subtitle_document(client, message):
 
     _pending_fc_subtitle.pop(reply_id, None)
 
-    status_msg = await message.reply_text("⏳ <i>Sous-titre reçu, démarrage du hardsub...</i>")
+    status_msg = await StatusSlideshow().start(message.chat.id, text="⏳ <i>Sous-titre reçu, démarrage du hardsub...</i>")
     await message.delete()
 
     os.makedirs(Paths.WORK_PATH, exist_ok=True)
