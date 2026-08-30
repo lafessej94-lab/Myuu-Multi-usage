@@ -17,7 +17,7 @@ from IPython.display import clear_output
 from threading import Thread
 
 Working = True
-print("⚡️ Zilong Bot — Launcher")
+print("💖 Myuu࣪ ☾ Bot — Launcher")
 print("─" * 40)
 
 
