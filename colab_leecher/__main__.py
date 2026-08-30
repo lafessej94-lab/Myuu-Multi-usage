@@ -1591,7 +1591,7 @@ async def callbacks(client, cq):
                     pass
         return
 
-
+    if data == "vidtool_cancel":
         _pending_video.pop(cq.message.id, None)
         _pending_merge.pop(cq.message.id, None)
         _pending_trim.pop(cq.message.id, None)
@@ -1798,7 +1798,7 @@ async def callbacks(client, cq):
         await _show_type_menu(cq.message, session)
         return
 
-
+    if data in ("vidtool_burnsubs", "vidtool_muxsubs"):
         pending = _pending_video.pop(cq.message.id, None)
         if not pending:
             await cq.answer("Session expirée, renvoie la vidéo.", show_alert=True)
