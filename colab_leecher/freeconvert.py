@@ -13,6 +13,7 @@ from urllib.parse import unquote
 import aiohttp
 
 from colab_leecher.house_style import apply_hardsub_style
+from colab_leecher.smart_rename import build_final_name, resolution_label
 
 log = logging.getLogger(__name__)
 
@@ -373,7 +374,14 @@ async def hardsub_remote_url(
 
     base = os.path.splitext(os.path.basename(clean_source_name))[0]
     input_format = os.path.splitext(clean_source_name)[1].lstrip(".").lower() or "mkv"
-    output_name = f"{base}.VOSTFR.mp4"
+
+    # Nom final : reprend le vrai nom (titre/saison-épisode/qualité/plateforme)
+    # du fichier source, langue normalisée en VOSTFR et tag de fin remplacé
+    # par Myuus-Raws (voir smart_rename.py). La qualité annoncée suit le
+    # resize choisi (ex: 480p) plutôt que la qualité d'origine du fichier,
+    # pour ne pas induire en erreur sur ce qui est réellement livré.
+    quality_override = resolution_label(resize[1]) if resize else None
+    output_name = build_final_name(clean_source_name, override_quality=quality_override, output_ext="mp4")
     output_path = os.path.join(dest_dir, output_name)
 
     # Pré-stylage : force le rendu, indépendamment de ce que contenait le fichier source.
