@@ -721,7 +721,13 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
 
                 await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Queue", base_start + 10.0, "Submitting FreeConvert hardsub job", name)
 
-                async def _url_cb(url: str, filename: str = name) -> None:
+                # Nom qui sera réellement utilisé à l'upload (voir smart_rename.py) —
+                # affiché ici au lieu du vrai nom d'origine, pour cohérence avec
+                # le fichier qu'on recevra à la fin.
+                _quality_override = resolution_label(resize[1]) if resize else None
+                _renamed_name = build_final_name(name, override_quality=_quality_override, output_ext="mp4")
+
+                async def _url_cb(url: str, filename: str = _renamed_name) -> None:
                     try:
                         await colab_bot.send_message(
                             chat_id=status_msg.chat.id,
@@ -1220,6 +1226,33 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
         or "video.mp4"
     )
 
+    # Nom final calculé AVANT la conversion ffmpeg (au lieu d'après), pour
+    # pouvoir passer directement le bon titre à burn_subtitles/mux_subtitles :
+    # celles-ci écrivent ce titre dans les métadonnées du conteneur de sortie
+    # et effacent celles copiées par défaut depuis la source (qui pouvaient
+    # contenir le vrai nom d'origine dans leur tag "title").
+    renamed_output_ext = "mp4" if burn else "mkv"
+    if BOT.Options.custom_name:
+        has_ext = bool(ospath.splitext(BOT.Options.custom_name)[1])
+        upload_name = (
+            BOT.Options.custom_name if has_ext
+            else f"{BOT.Options.custom_name}.{renamed_output_ext}"
+        )
+    else:
+        # Rename automatique : reprend le vrai nom (titre/saison-épisode/
+        # qualité/plateforme), langue normalisée en VOSTFR, tag de fin
+        # remplacé par Myuus-Raws (voir smart_rename.py). Pas de resize sur
+        # ce moteur local -> pas d'override de qualité (contrairement à
+        # FreeConvert/CloudConvert).
+        built_name = build_final_name(real_name, output_ext=renamed_output_ext)
+        # Si le nom réel ne matche pas le format attendu, build_final_name
+        # renvoie real_name inchangé : dans ce cas on garde quand même le
+        # vrai nom d'origine (juste avec la bonne extension), plutôt qu'un
+        # nom de fichier temporaire généré localement sans signification.
+        real_base = ospath.splitext(real_name)[0]
+        upload_name = built_name if built_name != real_name else f"{real_base}.{renamed_output_ext}"
+    metadata_title = ospath.splitext(upload_name)[0]
+
     await _fc_job_status(status_msg, kind, "Queue", 0.0, "En attente d'un slot disponible...", job_id=job_id)
 
     async with _local_convert_semaphore:
@@ -1239,30 +1272,12 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
 
                 output_path = ospath.join(job_dir, f"{base}.hardsub.mp4")
                 await _fc_job_status(status_msg, kind, "Hardsub", 10.0, "ffmpeg -> incrustation", job_id=job_id)
-                await burn_subtitles(video_path, sub_path, output_path, progress_cb=_progress_cb)
-                renamed_output_ext = "mp4"
+                await burn_subtitles(video_path, sub_path, output_path, progress_cb=_progress_cb, title=metadata_title)
             else:
                 output_path = ospath.join(job_dir, f"{base}.muxed.mkv")
                 await _fc_job_status(status_msg, kind, "Mux", 40.0, "ffmpeg -> ajout de la piste", job_id=job_id)
-                await mux_subtitles(video_path, sub_path, output_path)
-                renamed_output_ext = "mkv"
+                await mux_subtitles(video_path, sub_path, output_path, title=metadata_title)
 
-            if BOT.Options.custom_name:
-                out_ext = ospath.splitext(output_path)[1]
-                has_ext = bool(ospath.splitext(BOT.Options.custom_name)[1])
-                upload_name = BOT.Options.custom_name if has_ext else f"{BOT.Options.custom_name}{out_ext}"
-            else:
-                # Rename automatique : reprend le vrai nom (titre/saison-
-                # épisode/qualité/plateforme), langue normalisée en VOSTFR,
-                # tag de fin remplacé par Myuus-Raws (voir smart_rename.py).
-                # Pas de resize sur ce moteur local -> pas d'override de
-                # qualité (contrairement à FreeConvert/CloudConvert).
-                built_name = build_final_name(real_name, output_ext=renamed_output_ext)
-                # Si le nom réel ne matche pas le format attendu,
-                # build_final_name renvoie real_name inchangé : dans ce cas
-                # on retombe sur le nom de fichier généré localement, pour
-                # garder une extension cohérente avec output_path.
-                upload_name = built_name if built_name != real_name else ospath.basename(output_path)
             await _fc_job_status(status_msg, kind, "Upload", 95.0, "Uploading to Telegram", job_id=job_id)
             await upload_file(output_path, upload_name, is_last=True, status_msg=status_msg)
             try:
