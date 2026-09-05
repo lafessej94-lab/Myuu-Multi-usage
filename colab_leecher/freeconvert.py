@@ -379,12 +379,23 @@ async def hardsub_remote_url(
     # Pré-stylage : force le rendu, indépendamment de ce que contenait le fichier source.
     # apply_hardsub_style() n'accepte plus de paramètre `style` : elle applique
     # elle-même le bon profil par position (voir house_style.py).
-    # Le sous-titre stylé reprend le MÊME nom de base que la vidéo finale
-    # (juste l'extension .ass à la place de .mp4), pour que les deux fichiers
-    # envoyés à l'utilisateur soient facilement associables l'un à l'autre.
+    #
+    # Ce fichier stylé n'est utilisé QUE pour construire le payload envoyé à
+    # FreeConvert (encodage base64 ci-dessous) -- il n'est plus destiné à
+    # être uploadé sur Telegram. On le supprime juste après l'avoir encodé :
+    # le laisser dans dest_dir (job_dir) le ferait ramasser par Leech() comme
+    # un fichier à envoyer en plus de la vidéo, ce qui double le nombre
+    # d'appels d'envoi Telegram par job et augmente le risque de FloodWait.
     styled_sub_path = os.path.join(dest_dir, f"{base}.VOSTFR.ass")
     apply_hardsub_style(subtitle_path, styled_sub_path)
-    subtitle_b64 = _encode_subtitle_b64(styled_sub_path)
+    try:
+        subtitle_b64 = _encode_subtitle_b64(styled_sub_path)
+    finally:
+        if os.path.exists(styled_sub_path):
+            try:
+                os.remove(styled_sub_path)
+            except Exception as exc:
+                log.warning("Impossible de supprimer le sous-titre stylé temporaire: %s", exc)
 
     payload = _create_hardsub_payload(
         video_url=video_url,
