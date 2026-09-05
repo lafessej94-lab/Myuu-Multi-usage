@@ -15,6 +15,7 @@ from typing import Awaitable, Callable, Optional
 import aiohttp
 
 from colab_leecher.house_style import apply_hardsub_style
+from colab_leecher.smart_rename import build_final_name, resolution_label
 
 log = logging.getLogger(__name__)
 
@@ -795,10 +796,16 @@ async def hardsub_remote_url(
     crf, base_preset = profile_options(quality_profile, cc_mode)
     preset = _encode_speed_to_preset(encode_speed, base_preset)
     scale_height = _resolution_to_height(resolution)
-    base = os.path.splitext(os.path.basename(source_name))[0]
-    tag = f".{scale_height}p" if scale_height > 0 else ""
-    output_name = f"{base}{tag}.VOSTFR.mp4"
+
+    # Nom final : reprend le vrai nom (titre/saison-épisode/qualité/plateforme)
+    # du fichier source, langue normalisée en VOSTFR et tag de fin remplacé
+    # par Myuus-Raws (voir smart_rename.py). La qualité annoncée suit la
+    # résolution choisie plutôt que celle d'origine, pour ne pas induire en
+    # erreur sur ce qui est réellement livré.
+    quality_override = resolution_label(scale_height) if scale_height > 0 else None
+    output_name = build_final_name(source_name, override_quality=quality_override, output_ext="mp4")
     output_path = os.path.join(dest_dir, output_name)
+
     job = await _create_hardsub_job(
         api_key,
         video_url=video_url,
