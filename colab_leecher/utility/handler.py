@@ -29,6 +29,7 @@ from colab_leecher.freeconvert import (
 )
 from colab_leecher.local_convert import convert_resolution, merge_audio_video
 from colab_leecher.house_style import apply_house_style
+from colab_leecher.smart_rename import build_final_name, resolution_label
 from colab_leecher.local_video_tools import (
     burn_subtitles,
     burn_text_overlay,
@@ -1197,6 +1198,16 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
     kind = "Burn Subs" if burn else "Mux Subs"
     ActiveJobs.register(job_id, asyncio.current_task())
 
+    # Vrai nom du fichier source, pour le rename automatique — pris sur le
+    # message Telegram lui-même : video_message.download() sauvegarde sous
+    # un nom fixe "source_video", donc le chemin local ne porte pas le vrai
+    # nom (titre/saison-épisode/qualité/plateforme).
+    real_name = (
+        getattr(video_message.video, "file_name", None)
+        or getattr(video_message.document, "file_name", None)
+        or "video.mp4"
+    )
+
     await _fc_job_status(status_msg, kind, "Queue", 0.0, "En attente d'un slot disponible...", job_id=job_id)
 
     async with _local_convert_semaphore:
@@ -1217,17 +1228,29 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
                 output_path = ospath.join(job_dir, f"{base}.hardsub.mp4")
                 await _fc_job_status(status_msg, kind, "Hardsub", 10.0, "ffmpeg -> incrustation", job_id=job_id)
                 await burn_subtitles(video_path, sub_path, output_path, progress_cb=_progress_cb)
+                renamed_output_ext = "mp4"
             else:
                 output_path = ospath.join(job_dir, f"{base}.muxed.mkv")
                 await _fc_job_status(status_msg, kind, "Mux", 40.0, "ffmpeg -> ajout de la piste", job_id=job_id)
                 await mux_subtitles(video_path, sub_path, output_path)
+                renamed_output_ext = "mkv"
 
             if BOT.Options.custom_name:
                 out_ext = ospath.splitext(output_path)[1]
                 has_ext = bool(ospath.splitext(BOT.Options.custom_name)[1])
                 upload_name = BOT.Options.custom_name if has_ext else f"{BOT.Options.custom_name}{out_ext}"
             else:
-                upload_name = ospath.basename(output_path)
+                # Rename automatique : reprend le vrai nom (titre/saison-
+                # épisode/qualité/plateforme), langue normalisée en VOSTFR,
+                # tag de fin remplacé par Myuus-Raws (voir smart_rename.py).
+                # Pas de resize sur ce moteur local -> pas d'override de
+                # qualité (contrairement à FreeConvert/CloudConvert).
+                built_name = build_final_name(real_name, output_ext=renamed_output_ext)
+                # Si le nom réel ne matche pas le format attendu,
+                # build_final_name renvoie real_name inchangé : dans ce cas
+                # on retombe sur le nom de fichier généré localement, pour
+                # garder une extension cohérente avec output_path.
+                upload_name = built_name if built_name != real_name else ospath.basename(output_path)
             await _fc_job_status(status_msg, kind, "Upload", 95.0, "Uploading to Telegram", job_id=job_id)
             await upload_file(output_path, upload_name, is_last=True, status_msg=status_msg)
             try:
