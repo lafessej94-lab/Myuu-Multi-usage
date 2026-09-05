@@ -138,8 +138,20 @@ async def Leech(folder_path: str, remove: bool, convert_videos: bool = True, sta
             file_name = ospath.basename(file_path)
             new_path  = shortFileName(file_path)
             os.rename(file_path, new_path)
+
+            # Rename automatique (smart_rename) sur le pipeline leech normal
+            # aussi, pas seulement hardsub/FreeConvert/CloudConvert.
+            if BOT.Options.custom_name:
+                out_ext = ospath.splitext(new_path)[1]
+                has_ext = bool(ospath.splitext(BOT.Options.custom_name)[1])
+                upload_name = BOT.Options.custom_name if has_ext else f"{BOT.Options.custom_name}{out_ext}"
+            elif fileType(new_path) == "video":
+                upload_name = build_final_name(file_name)
+            else:
+                upload_name = file_name
+
             BotTimes.current_time = time()
-            Messages.status_head  = f"📤 <b>UPLOADING</b>\n\n<code>{file_name}</code>\n"
+            Messages.status_head  = f"📤 <b>UPLOADING</b>\n\n<code>{upload_name}</code>\n"
             try:
                 edited = await target_msg.edit_text(
                     text=Messages.task_msg + Messages.status_head
@@ -151,7 +163,7 @@ async def Leech(folder_path: str, remove: bool, convert_videos: bool = True, sta
                     MSG.status_msg = edited
             except Exception: pass
             file_size = os.stat(new_path).st_size
-            await upload_file(new_path, file_name, is_last=is_last, status_msg=target_msg)
+            await upload_file(new_path, upload_name, is_last=is_last, status_msg=target_msg)
             Transfer.up_bytes.append(file_size)
             if remove and ospath.exists(new_path): os.remove(new_path)
             elif not remove:
