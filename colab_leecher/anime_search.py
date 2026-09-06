@@ -27,8 +27,7 @@ from pyrogram.types import (
 from colab_leecher import colab_bot
 from colab_leecher.access import is_allowed as access_is_allowed, is_banned as access_is_banned
 
-import nautilijan
-import my_anime_liste
+from colab_leecher import nautilijan, my_anime_liste
 
 # ⚠️ Le "callbacks()" de __main__.py est un @colab_bot.on_callback_query()
 # SANS filtre, enregistré dans le groupe par défaut (0) : il intercepte tous
