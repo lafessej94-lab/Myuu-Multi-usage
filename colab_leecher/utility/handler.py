@@ -812,13 +812,20 @@ async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
 
             await _fc_job_status(status_msg, "CloudConvert Hardsub", "Queue", 5.0, "Submitting CloudConvert hardsub job", name)
 
-            async def _url_cb(url: str) -> None:
+            # Nom qui sera réellement utilisé à l'upload (voir smart_rename.py) —
+            # affiché ici au lieu du vrai nom d'origine, pour cohérence avec
+            # le fichier qu'on recevra à la fin.
+            _res = (resolution or "").strip().lower()
+            _quality_override = resolution if _res and _res != "original" else None
+            _renamed_name = build_final_name(name, override_quality=_quality_override, output_ext="mp4")
+
+            async def _url_cb(url: str, filename: str = _renamed_name) -> None:
                 try:
                     await colab_bot.send_message(
                         chat_id=status_msg.chat.id,
                         text=(
                             "🔗 <b>Lien direct disponible</b>\n\n"
-                            f"<code>{name}</code>\n\n"
+                            f"<code>{filename}</code>\n\n"
                             f"{url}\n\n"
                             "<i>Le bot va maintenant le télécharger et l'uploader. "
                             "Si ça plante, tu as déjà ce lien pour le récupérer toi-même.</i>"
@@ -900,13 +907,19 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
 
             await _fc_job_status(status_msg, "FreeConvert Hardsub", "Queue", 5.0, "Submitting FreeConvert hardsub job", name, job_id=job_id)
 
-            async def _url_cb(url: str) -> None:
+            # Nom qui sera réellement utilisé à l'upload (voir smart_rename.py) —
+            # affiché ici au lieu du vrai nom d'origine, pour cohérence avec
+            # le fichier qu'on recevra à la fin.
+            _quality_override = resolution_label(resize[1]) if resize else None
+            _renamed_name = build_final_name(name, override_quality=_quality_override, output_ext="mp4")
+
+            async def _url_cb(url: str, filename: str = _renamed_name) -> None:
                 try:
                     await colab_bot.send_message(
                         chat_id=status_msg.chat.id,
                         text=(
                             "🔗 <b>Lien direct disponible</b>\n\n"
-                            f"<code>{name}</code>\n\n"
+                            f"<code>{filename}</code>\n\n"
                             f"{url}\n\n"
                             "<i>Le bot va maintenant le télécharger et l'uploader. "
                             "Si ça plante, tu as déjà ce lien pour le récupérer toi-même.</i>"
