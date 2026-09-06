@@ -53,9 +53,18 @@ _PLATFORM_ALT = (
 # --- Format 1 : scene/release style, séparateurs espace OU point ----------
 # Découpe : <titre> <SxxExx> [<lang>] <quality> <platform> <source>
 #           [DUAL] <audio> <video> [Subs] -<group>
+# --- Format 1 : scene/release style, séparateurs espace OU point ----------
+# Découpe : <titre> <SxxExx> [<titre d'épisode>] [<lang>] <quality> <platform>
+#           <source> [DUAL] <audio> <video> [Subs] -<group>
+#
+# Le bloc optionnel entre SxxExx et la qualité peut être :
+#   - absent                          (RILAKKUMA S01E23 1080p ...)
+#   - un simple tag de langue         (... S02E05 MULTI 1080p ...)
+#   - le titre de l'épisode           (... S01E09.I.Will.Make.Sure.to.Save.You.1080p...)
+# On le capture tel quel puis on décide après coup lequel des deux c'est.
 _SCENE_RE = re.compile(
-    r"^(?P<title>.+?)[\s.]+(?P<se>S\d{2}E\d{2,4})[\s.]+"
-    r"(?:(?P<lang>" + _LANG_ALT + r")[\s.]+)?"
+    r"^(?P<title>.+?)[\s.]+(?P<se>S\d{2}E\d{2,4})"
+    r"(?:[\s.]+(?P<middle>.+?))?[\s.]+"
     r"(?P<quality>\d{3,4}p)[\s.]+"
     r"(?P<platform>" + _PLATFORM_ALT + r")[\s.]+"
     r"(?P<source>" + _SOURCE_ALT + r")[\s.]+"
@@ -66,6 +75,10 @@ _SCENE_RE = re.compile(
     r"-(?P<group>.+)$",
     re.IGNORECASE,
 )
+
+# Un "middle" n'est un tag de langue que s'il correspond EXACTEMENT à un des
+# alternatifs de langue connus (sinon c'est un titre d'épisode -> ignoré).
+_LANG_TOKEN_FULL_RE = re.compile(r"^(?:" + _LANG_ALT + r")$", re.IGNORECASE)
 
 # --- Format 2 : fansub bracket style, pas de saison explicite -------------
 # Découpe : [Groupe] Titre - Épisode <reste des tags entre crochets/parenthèses>
@@ -120,7 +133,14 @@ def _try_scene_format(base: str) -> str | None:
         return None
     parts = match.groupdict()
     title = _clean_title(parts["title"])
-    lang = _final_lang(parts.get("lang"), bool(parts.get("dual")), False)
+
+    middle = (parts.get("middle") or "").strip(" .")
+    lang_tag = middle if middle and _LANG_TOKEN_FULL_RE.match(middle) else None
+    # Si "middle" n'est pas un tag de langue reconnu, c'est un titre
+    # d'épisode (ex: "I Will Make Sure to Save You") -> on l'ignore
+    # simplement, il ne fait pas partie du nom final reconstruit.
+
+    lang = _final_lang(lang_tag, bool(parts.get("dual")), False)
     platform = parts["platform"].upper()
 
     new_base = _join_parts(
@@ -227,6 +247,7 @@ if __name__ == "__main__":
         "[SubsPlease] Rilakkuma - 23 (480p) [E2E141F1].mkv",
         "RILAKKUMA.S01E23.1080p.CR.WEB-DL.DUAL.AAC2.0.H.264.MSubs-ToonsHub.mkv",
         "RILAKKUMA S01E23 1080p CR WEB-DL DUAL AAC2.0 H.264-VARYG.mkv",
+        "Though.I.Am.an.Inept.Villainess.S01E09.I.Will.Make.Sure.to.Save.You.1080p.DSNP.WEB-DL.AAC2.0.H.264-VARYG.mkv",
     ]
     for name in tests:
         print(f"{name}\n  -> {build_final_name(name)}\n")
