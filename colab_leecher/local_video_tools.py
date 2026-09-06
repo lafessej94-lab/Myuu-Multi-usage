@@ -176,7 +176,13 @@ async def compress_video(
 
 
 # ── Mux subs (soft — piste ajoutée, pas de ré-encodage vidéo) ─────────
-async def mux_subtitles(video_path: str, sub_path: str, output_path: str) -> str:
+async def mux_subtitles(video_path: str, sub_path: str, output_path: str, title: str | None = None) -> str:
+    """
+    title : si fourni, écrase TOUTES les métadonnées globales du fichier
+    source (donc le vrai nom éventuellement embarqué dans le tag "title"
+    d'origine) et les remplace par ce titre propre — sinon ffmpeg copie par
+    défaut les métadonnées du premier input telles quelles.
+    """
     is_mkv = output_path.lower().endswith(".mkv")
     sub_codec = "copy" if is_mkv else "mov_text"
 
@@ -187,8 +193,10 @@ async def mux_subtitles(video_path: str, sub_path: str, output_path: str) -> str
         "-map", "0", "-map", "1",
         "-c", "copy",
         "-c:s", sub_codec,
-        output_path,
     ]
+    if title:
+        cmd += ["-map_metadata", "-1", "-metadata", f"title={title}"]
+    cmd.append(output_path)
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
@@ -204,7 +212,14 @@ async def burn_subtitles(
     sub_path: str,
     output_path: str,
     progress_cb: ProgressCB = None,
+    title: str | None = None,
 ) -> str:
+    """
+    title : si fourni, écrase TOUTES les métadonnées globales du fichier
+    source (donc le vrai nom éventuellement embarqué dans le tag "title"
+    d'origine) et les remplace par ce titre propre — sinon ffmpeg copie par
+    défaut les métadonnées du premier input telles quelles.
+    """
     duration = await _probe_duration(video_path)
 
     # ffmpeg veut un chemin échappé pour le filtre subtitles= (les ':' et
@@ -218,8 +233,10 @@ async def burn_subtitles(
         "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
         "-c:a", "copy",
         "-movflags", "+faststart",
-        output_path,
     ]
+    if title:
+        cmd += ["-map_metadata", "-1", "-metadata", f"title={title}"]
+    cmd.append(output_path)
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
