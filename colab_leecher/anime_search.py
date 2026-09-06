@@ -5,12 +5,18 @@ formatée (photo + caption) à partir des moteurs nautilijan.py et
 my_anime_liste.py.
 
 Indépendant du pipeline hardsub — nouvelle feature du repo myuu.
+
+Suit le même pattern que colab_leecher/nyaa_tracker.py : ce module importe
+l'instance partagée `colab_bot` et s'auto-enregistre via ses décorateurs.
+Il suffit d'importer ce module une fois dans __main__.py (voir tout en bas
+de ce fichier pour la ligne à ajouter) pour que /Naut_Anime, /Mal_Anime et
+leur callback fonctionnent.
 """
 
 import json
 import os
 
-from pyrogram import Client
+from pyrogram import filters
 from pyrogram.types import (
     Message,
     CallbackQuery,
@@ -18,12 +24,18 @@ from pyrogram.types import (
     InlineKeyboardButton,
 )
 
+from colab_leecher import colab_bot
+from colab_leecher.access import is_allowed as access_is_allowed, is_banned as access_is_banned
+
 import nautilijan
 import my_anime_liste
 
-# Ce module n'utilise plus les décorateurs @Client.on_message / @Client.on_callback_query
-# car myuu enregistre tous ses handlers manuellement dans __main__.py.
-# Voir en bas de fichier / message d'accompagnement pour les lignes à ajouter.
+# ⚠️ Le "callbacks()" de __main__.py est un @colab_bot.on_callback_query()
+# SANS filtre, enregistré dans le groupe par défaut (0) : il intercepte tous
+# les clics de ce groupe. Notre callback tourne donc dans un groupe séparé
+# (voir CALLBACK_GROUP plus bas) pour être bien évalué malgré ça — Pyrogram
+# traite tous les groupes pour chaque update, pas juste le premier qui matche.
+CALLBACK_GROUP = 15
 
 # Cache persistant sur disque (même logique que data/access.json) :
 # {cache_key: [{"id": ..., "title": ..., "thumb": ...}, ...]}
@@ -52,6 +64,15 @@ def _save_cache(cache: dict[str, list[dict]]) -> None:
 
 
 _SEARCH_CACHE: dict[str, list[dict]] = _load_cache()
+
+
+def _can_use(message: Message) -> bool:
+    """Même règle d'accès que le reste du bot (voir _can_use dans __main__.py) :
+    OWNER, ou autorisé ET pas banni."""
+    from colab_leecher import OWNER
+    if message.chat.id == OWNER:
+        return True
+    return access_is_allowed(message.chat.id) and not access_is_banned(message.chat.id)
 
 
 def _format_caption(data: dict, source_label: str) -> str:
@@ -107,7 +128,10 @@ async def _send_menu(message: Message, results: list[dict], prefix: str, query: 
     )
 
 
-async def naut_anime_command(client: Client, message: Message):
+@colab_bot.on_message(filters.command("Naut_Anime") & filters.private)
+async def naut_anime_command(client, message: Message):
+    if not _can_use(message):
+        return
     if len(message.command) < 2:
         await message.reply_text("Utilisation : `/Naut_Anime <nom de l'anime>`")
         return
@@ -123,7 +147,10 @@ async def naut_anime_command(client: Client, message: Message):
     await _send_menu(message, results, "naut_sel", query)
 
 
-async def mal_anime_command(client: Client, message: Message):
+@colab_bot.on_message(filters.command("Mal_Anime") & filters.private)
+async def mal_anime_command(client, message: Message):
+    if not _can_use(message):
+        return
     if len(message.command) < 2:
         await message.reply_text("Utilisation : `/Mal_Anime <nom de l'anime>`")
         return
@@ -139,7 +166,8 @@ async def mal_anime_command(client: Client, message: Message):
     await _send_menu(message, results, "mal_sel", query)
 
 
-async def anime_selection_callback(client: Client, callback: CallbackQuery):
+@colab_bot.on_callback_query(filters.regex(r"^(naut_sel|mal_sel):"), group=CALLBACK_GROUP)
+async def anime_selection_callback(client, callback: CallbackQuery):
     try:
         prefix, cache_key, idx_str = callback.data.split(":", 2)
         idx = int(idx_str)
@@ -182,22 +210,3 @@ async def anime_selection_callback(client: Client, callback: CallbackQuery):
     # Nettoyage du cache une fois la fiche envoyée
     _SEARCH_CACHE.pop(cache_key, None)
     _save_cache(_SEARCH_CACHE)
-
-
-def register_anime_search_handlers(app: Client) -> None:
-    """À appeler une fois dans __main__.py, après la création du Client,
-    pour brancher les commandes /Naut_Anime, /Mal_Anime et leur callback.
-
-    Exemple d'utilisation dans __main__.py :
-
-        from colab_leecher.anime_search import register_anime_search_handlers
-        register_anime_search_handlers(app)
-    """
-    from pyrogram import filters
-    from pyrogram.handlers import MessageHandler, CallbackQueryHandler
-
-    app.add_handler(MessageHandler(naut_anime_command, filters.command("Naut_Anime")))
-    app.add_handler(MessageHandler(mal_anime_command, filters.command("Mal_Anime")))
-    app.add_handler(
-        CallbackQueryHandler(anime_selection_callback, filters.regex(r"^(naut_sel|mal_sel):"))
-    )
