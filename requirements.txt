@@ -4,6 +4,7 @@ google-auth-httplib2
 google-auth-oauthlib
 GPUtil
 aiohttp
+beautifulsoup4
 moviepy
 natsort
 opencv-python
