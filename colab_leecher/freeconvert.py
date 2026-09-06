@@ -285,6 +285,7 @@ def _create_hardsub_payload(
     video_url: str,
     input_format: str,
     output_format: str,
+    output_filename: str,
     subtitle_b64: str,
     crf: int,
     speed: str,
@@ -317,6 +318,12 @@ def _create_hardsub_payload(
                 "input": "import-video",
                 "input_format": input_format,
                 "output_format": output_format,
+                # Sans ça, FreeConvert nomme le fichier exporté d'après le
+                # nom d'origine de la vidéo source (repris de video_url) au
+                # lieu du nom déjà reconstruit par smart_rename.py -- résultat :
+                # le lien de secours (safety-net) affiché à l'utilisateur en
+                # cas de plantage pointait vers l'ancien nom, pas le nouveau.
+                "filename": os.path.basename(output_filename),
                 "options": options,
             },
             "export": {
@@ -409,6 +416,7 @@ async def hardsub_remote_url(
         video_url=video_url,
         input_format=input_format,
         output_format="mp4",
+        output_filename=output_name,
         subtitle_b64=subtitle_b64,
         crf=cfg.crf,
         speed=cfg.speed,
