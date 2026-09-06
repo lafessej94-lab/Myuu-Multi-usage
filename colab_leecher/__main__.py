@@ -2384,19 +2384,19 @@ async def handle_subtitle_document(client, message):
 #  Import nyaa_tracker (registers its handlers)
 # ══════════════════════════════════════════════
 
-    try:
-        import colab_leecher.nyaa_tracker
-        logging.info("📡 Nyaa tracker loaded")
-    except Exception as e:
-        logging.warning(f"Nyaa tracker not loaded: {e}")
- 
-    try:
-        import colab_leecher.anime_search
-        logging.info("🔎 Anime search (Nautiljon/MAL) loaded")
-    except Exception as e:
-        logging.warning(f"Anime search not loaded: {e}")
- 
- 
-    logging.info("💖 Myuu࣪ ☾ started.")
-    get_event_loop().create_task(_startup_welcome())
-    colab_bot.run()
+try:
+    import colab_leecher.nyaa_tracker
+    logging.info("📡 Nyaa tracker loaded")
+except Exception as e:
+    logging.warning(f"Nyaa tracker not loaded: {e}")
+
+try:
+    import colab_leecher.anime_search
+    logging.info("🔎 Anime search (Nautiljon/MAL) loaded")
+except Exception as e:
+    logging.warning(f"Anime search not loaded: {e}")
+
+
+logging.info("💖 Myuu࣪ ☾ started.")
+get_event_loop().create_task(_startup_welcome())
+colab_bot.run()
