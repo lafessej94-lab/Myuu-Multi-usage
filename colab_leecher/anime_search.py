@@ -7,6 +7,9 @@ my_anime_liste.py.
 Indépendant du pipeline hardsub — nouvelle feature du repo myuu.
 """
 
+import json
+import os
+
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message,
@@ -18,10 +21,33 @@ from pyrogram.types import (
 import nautilijan
 import my_anime_liste
 
-# Cache en mémoire : {cache_key: [{"id": ..., "title": ..., "thumb": ...}, ...]}
+# Cache persistant sur disque (même logique que data/access.json) :
+# {cache_key: [{"id": ..., "title": ..., "thumb": ...}, ...]}
 # cache_key = str(message_id) de la commande d'origine, pour garder des
 # callback_data courts (limite Telegram : 64 octets).
-_SEARCH_CACHE: dict[str, list[dict]] = {}
+_CACHE_PATH = "data/anime_search_cache.json"
+
+
+def _load_cache() -> dict[str, list[dict]]:
+    if not os.path.exists(_CACHE_PATH):
+        return {}
+    try:
+        with open(_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_cache(cache: dict[str, list[dict]]) -> None:
+    os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
+    try:
+        with open(_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+_SEARCH_CACHE: dict[str, list[dict]] = _load_cache()
 
 
 def _format_caption(data: dict, source_label: str) -> str:
@@ -64,6 +90,7 @@ async def _send_menu(message: Message, results: list[dict], prefix: str, query: 
 
     cache_key = str(message.id)
     _SEARCH_CACHE[cache_key] = results
+    _save_cache(_SEARCH_CACHE)
 
     buttons = [
         [InlineKeyboardButton(r["title"], callback_data=f"{prefix}:{cache_key}:{i}")]
@@ -153,3 +180,4 @@ async def anime_selection_callback(client: Client, callback: CallbackQuery):
 
     # Nettoyage du cache une fois la fiche envoyée
     _SEARCH_CACHE.pop(cache_key, None)
+    _save_cache(_SEARCH_CACHE)
