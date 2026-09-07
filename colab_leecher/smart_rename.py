@@ -46,8 +46,11 @@ Exemples :
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+
+log = logging.getLogger(__name__)
 
 NEW_GROUP_TAG = "Myuus-Raws"
 
@@ -373,6 +376,60 @@ def build_final_name(
 
     final_ext = f".{output_ext.lstrip('.')}" if output_ext else ext
     return f"{new_base}{final_ext}"
+
+
+def finalize_download(
+    real_path: str,
+    *,
+    override_quality: str | None = None,
+    output_ext: str | None = None,
+) -> str:
+    """
+    Renomme SUR LE DISQUE un fichier déjà téléchargé sous son vrai nom pour
+    qu'il porte le nom final reconstruit (voir build_final_name).
+
+    Contrairement au pipeline FreeConvert (hardsub_remote_url dans
+    free_convert.py), qui calcule le nom final AVANT de télécharger et
+    écrit donc directement dedans (jamais de "vrai nom" sur le disque à
+    supprimer), cette fonction sert aux pipelines qui téléchargent d'abord
+    sous le nom réel de la source, puis doivent le remplacer après coup.
+
+    real_path : chemin complet du fichier déjà sur le disque, sous son
+    vrai nom (ex: "/downloads/RILAKKUMA S01E23 ... -Tsundere-Raws.mkv").
+
+    Renvoie le nouveau chemin complet (identique à real_path si le nom
+    n'a pas changé, ex: format non reconnu par build_final_name).
+
+    Si le nom ne change pas, aucune opération disque n'est faite. Sinon,
+    os.replace() est utilisé (rename atomique qui écrase une éventuelle
+    destination déjà existante) plutôt qu'un remove()+rename() séparé,
+    pour éviter de perdre le fichier en cas d'erreur entre les deux étapes.
+    """
+    real_dir = os.path.dirname(real_path)
+    real_name = os.path.basename(real_path)
+
+    new_name = build_final_name(
+        real_name, override_quality=override_quality, output_ext=output_ext
+    )
+    if new_name == real_name:
+        return real_path
+
+    new_path = os.path.join(real_dir, new_name)
+
+    if not os.path.exists(real_path):
+        log.warning("finalize_download: fichier source introuvable: %s", real_path)
+        return real_path
+
+    try:
+        os.replace(real_path, new_path)
+    except OSError as exc:
+        log.warning(
+            "finalize_download: échec du renommage %s -> %s (%s), fichier conservé sous son vrai nom.",
+            real_path, new_path, exc,
+        )
+        return real_path
+
+    return new_path
 
 
 if __name__ == "__main__":
