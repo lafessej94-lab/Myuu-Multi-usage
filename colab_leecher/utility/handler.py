@@ -175,6 +175,24 @@ async def Leech(folder_path: str, remove: bool, convert_videos: bool = True, sta
             else:
                 upload_name = file_name
 
+            # IMPORTANT : on renomme aussi le fichier RÉEL sur le disque pour
+            # qu'il porte upload_name, pas juste la variable Python. Sans ça,
+            # upload_file() envoie un fichier dont le nom local (celui que
+            # Telegram enregistre pour le download) reste le vrai nom
+            # d'origine -- seule la caption affichée dans le chat montrait
+            # le nom modifié, ce qui explique pourquoi retélécharger le
+            # fichier depuis Telegram redonnait le vrai nom.
+            if upload_name != ospath.basename(new_path):
+                renamed_path = ospath.join(ospath.dirname(new_path), upload_name)
+                try:
+                    os.replace(new_path, renamed_path)
+                    new_path = renamed_path
+                except OSError as exc:
+                    log.warning(
+                        "Impossible de renommer %s -> %s (%s), envoi sous le nom réel.",
+                        new_path, renamed_path, exc,
+                    )
+
             BotTimes.current_time = time()
             Messages.status_head  = f"📤 <b>UPLOADING</b>\n\n<code>{upload_name}</code>\n"
             try:
