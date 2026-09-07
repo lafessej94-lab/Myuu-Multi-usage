@@ -50,13 +50,38 @@ from colab_leecher.seedr import SeedrError, _del_folder, fetch_urls_via_seedr
 from colab_leecher.uploader.telegram import upload_file
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from colab_leecher.utility.variables import (
-    BOT, MSG, ActiveJobs, BotTimes, Messages, Paths, Transfer, ProcessTracker, TaskInfo,
+    BOT, MSG, ActiveJobs, BotTimes, Messages, Paths, Transfer, ProcessTracker, TaskInfo, Aria2c,
 )
 from colab_leecher.utility.converters import archive, extract, videoConverter, sizeChecker
 from colab_leecher.utility.helper import (
     fileType, getSize, getTime, keyboard,
     render_task_status, shortFileName, sizeUnit, sysINFO,
 )
+
+
+async def _finish_status(status_msg, text: str, reply_markup=None) -> None:
+    """Affiche le texte FINAL d'un job (succès/échec/annulation) et arrête
+    proprement le diaporama associé, s'il y en a un.
+
+    À utiliser à la place d'un simple `await status_msg.edit_text(...)`
+    partout où un handler termine sa tâche : un edit_text() seul ne coupe
+    jamais la boucle _loop() de StatusSlideshow (voir status_slideshow.py),
+    qui continuerait alors à changer l'image toutes les 5s indéfiniment,
+    même après que le job soit terminé/annulé/en échec — symptôme observé
+    en prod : job déjà marqué "failed" mais les images continuent de
+    tourner. `status_msg` peut être un StatusSlideshow OU un Message
+    Pyrogram classique (pas de diaporama) : dans ce 2e cas .stop() est
+    simplement absent et on ignore, edit_text() se comporte normalement.
+    """
+    if hasattr(status_msg, "stop"):
+        try:
+            await status_msg.stop()
+        except Exception:
+            pass
+    try:
+        await status_msg.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        pass
 
 
 async def Leech(folder_path: str, remove: bool, convert_videos: bool = True, status_msg=None):
@@ -660,16 +685,10 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
     statut dédiés à ce job, pas de dépendance à MSG.status_msg/BOT.State.
     """
     if not _seedr_ready():
-        try:
-            await status_msg.edit_text("❌ Seedr credentials are missing in your Colab launcher.")
-        except Exception:
-            pass
+        await _finish_status(status_msg, "❌ Seedr credentials are missing in your Colab launcher.")
         return
     if not BOT.Options.fc_api_keys:
-        try:
-            await status_msg.edit_text("❌ FreeConvert API key is missing in your Colab launcher.")
-        except Exception:
-            pass
+        await _finish_status(status_msg, "❌ FreeConvert API key is missing in your Colab launcher.")
         return
 
     job_id = uuid.uuid4().hex[:8]
@@ -764,10 +783,7 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Seedr+FC hardsub failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Seedr+FC hardsub failed</b>\n\n<code>{exc}</code>")
         finally:
             if folder_id and seedr_user and seedr_pwd:
                 await _del_folder(seedr_user, seedr_pwd, folder_id)
@@ -788,10 +804,7 @@ async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
     statut dédiés à ce job.
     """
     if not BOT.Options.cc_api_keys:
-        try:
-            await status_msg.edit_text("❌ CloudConvert API key is missing in your Colab launcher.")
-        except Exception:
-            pass
+        await _finish_status(status_msg, "❌ CloudConvert API key is missing in your Colab launcher.")
         return
 
     job_id = uuid.uuid4().hex[:8]
@@ -856,10 +869,7 @@ async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>CloudConvert hardsub failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>CloudConvert hardsub failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(subtitle_path):
                 try:
@@ -882,10 +892,7 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
     statut dédiés à ce job.
     """
     if not BOT.Options.fc_api_keys:
-        try:
-            await status_msg.edit_text("❌ FreeConvert API key is missing in your Colab launcher.")
-        except Exception:
-            pass
+        await _finish_status(status_msg, "❌ FreeConvert API key is missing in your Colab launcher.")
         return
 
     job_id = uuid.uuid4().hex[:8]
@@ -950,15 +957,9 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
             except Exception:
                 pass
         except asyncio.CancelledError:
-            try:
-                await status_msg.edit_text("⛔ <b>FreeConvert hardsub cancelled</b>", reply_markup=None)
-            except Exception:
-                pass
+            await _finish_status(status_msg, "⛔ <b>FreeConvert hardsub cancelled</b>", reply_markup=None)
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>FreeConvert hardsub failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>FreeConvert hardsub failed</b>\n\n<code>{exc}</code>")
         finally:
             ActiveJobs.unregister(job_id)
             if ospath.exists(subtitle_path):
@@ -1019,10 +1020,7 @@ async def Local_Video_Convert_Handler(source_message, height: int, status_msg) -
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Video Converter failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Video Converter failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1062,10 +1060,7 @@ async def Local_Merge_Handler(video_message, audio_path: str, status_msg) -> Non
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Merge failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Merge failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(audio_path):
                 try:
@@ -1101,10 +1096,7 @@ async def Local_Thumb_Handler(source_message, status_msg) -> None:
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Thumb failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Thumb failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1135,10 +1127,7 @@ async def Local_Screenshots_Handler(source_message, status_msg, count: int = 5) 
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Screenshots failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Screenshots failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1174,10 +1163,7 @@ async def Local_Trim_Handler(source_message, start: str, end: str, status_msg) -
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Trim failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Trim failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1212,10 +1198,7 @@ async def Local_Compress_Handler(source_message, status_msg, crf: int = 28) -> N
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Compress failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Compress failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1298,15 +1281,9 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
             except Exception:
                 pass
         except asyncio.CancelledError:
-            try:
-                await status_msg.edit_text(f"⛔ <b>{kind} cancelled</b>", reply_markup=None)
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"⛔ <b>{kind} cancelled</b>", reply_markup=None)
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>{kind} failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>{kind} failed</b>\n\n<code>{exc}</code>")
         finally:
             ActiveJobs.unregister(job_id)
             if ospath.exists(sub_path):
@@ -1342,10 +1319,7 @@ async def Local_ManualShot_Handler(source_message, timestamp: str, status_msg) -
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Manual Shot failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Manual Shot failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1374,10 +1348,7 @@ async def Local_Split_Handler(source_message, parts: int, status_msg) -> None:
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Split failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Split failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1409,10 +1380,7 @@ async def Local_Sample_Handler(source_message, duration: int, status_msg) -> Non
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Sample failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Sample failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1437,10 +1405,7 @@ async def Local_Rename_Handler(source_message, new_name: str, status_msg) -> Non
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Rename failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Rename failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1471,10 +1436,7 @@ async def Local_ToAudio_Handler(source_message, status_msg) -> None:
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>To Audio failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>To Audio failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1506,10 +1468,7 @@ async def Local_Mute_Handler(source_message, status_msg) -> None:
             except Exception:
                 pass
         except Exception as exc:
-            try:
-                await status_msg.edit_text(f"❌ <b>Mute failed</b>\n\n<code>{exc}</code>")
-            except Exception:
-                pass
+            await _finish_status(status_msg, f"❌ <b>Mute failed</b>\n\n<code>{exc}</code>")
         finally:
             if ospath.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1656,6 +1615,17 @@ async def cancelTask(reason: str):
         "<i>All downloads, uploads and processing stopped.</i>"
     )
     log_tail = _tail_log(60)
+
+    # NOTE : on stoppe explicitement le diaporama de MSG.status_msg ICI,
+    # AVANT le edit_text — sinon (cas du pipeline leech normal/CC, qui
+    # passe par ce MSG.status_msg global) la boucle 5s continuerait à
+    # tourner indéfiniment après un cancel, exactement comme pour les jobs
+    # FC/local qui appelaient status_msg.edit_text() directement.
+    if hasattr(MSG.status_msg, "stop"):
+        try:
+            await MSG.status_msg.stop()
+        except Exception:
+            pass
 
     try:
         await MSG.status_msg.edit_text(text)
