@@ -51,7 +51,6 @@ import re
 
 NEW_GROUP_TAG = "Myuus-Raws"
 
-# Ne pas forcer VOSTFR si la langue contient déjà "MULTI" (MULTI, MULTi, VF-MULTI, etc.)
 _MULTI_RE = re.compile(r"multi", re.IGNORECASE)
 
 _LANG_ALT = r"VOSTFR|VFF?Q?|MULTI\w*|SUBFRENCH|FRENCH|TRUEFRENCH"
@@ -62,38 +61,24 @@ _PLATFORM_ALT = (
     r"CR|ADN|DSNP|NF|AMZN|HULU|HIDIVE|FUNI|ABEMA|VRV|WAKANIM|B-?Global|iQ(?:iyi)?|U-?NEXT"
 )
 
-# --- Format 1 : scene/release style, séparateurs espace OU point ----------
-# Découpe : <titre> <SxxExx> [<lang>] <quality> <platform> <source>
-#           [DUAL] <audio> <video> [Subs] -<group>
-# --- Format 1 : scene/release style, séparateurs espace OU point ----------
-# Découpe : <titre> <SxxExx> [<titre d'épisode>] [<lang>] <quality> <platform>
-#           <source> [DUAL] <audio> <video> [Subs] -<group>
-#
-# Le bloc optionnel entre SxxExx et la qualité peut être :
-#   - absent                          (RILAKKUMA S01E23 1080p ...)
-#   - un simple tag de langue         (... S02E05 MULTI 1080p ...)
-#   - le titre de l'épisode           (... S01E09.I.Will.Make.Sure.to.Save.You.1080p...)
-# On le capture tel quel puis on décide après coup lequel des deux c'est.
 _SCENE_RE = re.compile(
     r"^(?P<title>.+?)[\s.]+(?P<se>S\d{2}E\d{2,4})"
     r"(?:[\s.]+(?P<middle>.+?))?[\s.]+"
     r"(?P<quality>\d{3,4}p)[\s.]+"
-    r"(?P<platform>" + _PLATFORM_ALT + r")[\s.]+"
+    r"(?:(?P<platform>" + _PLATFORM_ALT + r")[\s.]+)?"
     r"(?P<source>" + _SOURCE_ALT + r")[\s.]+"
     r"(?:(?P<dual>DUAL)[\s.]+)?"
-    r"(?P<audio>" + _AUDIO_ALT + r")[\s.]+"
+    r"(?:(?P<audio>" + _AUDIO_ALT + r")[\s.]+)?"
     r"(?P<video>" + _VIDEO_ALT + r")"
     r"(?:[\s.]M?Subs?)?"
     r"-(?P<group>.+)$",
     re.IGNORECASE,
 )
+# NOTE: platform et audio sont désormais optionnels (ex: Liar.Game...WEBRiP.x265-KAF
+# n'a ni plateforme ni tag audio).
 
-# Un "middle" n'est un tag de langue que s'il correspond EXACTEMENT à un des
-# alternatifs de langue connus (sinon c'est un titre d'épisode -> ignoré).
 _LANG_TOKEN_FULL_RE = re.compile(r"^(?:" + _LANG_ALT + r")$", re.IGNORECASE)
 
-# --- Format 2 : fansub bracket style, pas de saison explicite -------------
-# Découpe : [Groupe] Titre - Épisode <reste des tags entre crochets/parenthèses>
 _FANSUB_RE = re.compile(
     r"^\[(?P<fansub_group>[^\]]+)\]\s*"
     r"(?P<title>.+?)\s*-\s*(?P<episode>\d{1,4})\s*"
@@ -101,45 +86,76 @@ _FANSUB_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Un bloc entre crochets/parenthèses qui n'est que des caractères hex
-# (6 à 10) est presque toujours un hash/CRC de fichier, pas une info utile.
 _HEX_HASH_RE = re.compile(r"^[0-9A-Fa-f]{6,10}$")
 
-# --- Format 3 : underscore style, pas de saison/qualité/plateforme --------
-# Découpe : _Tag_ <reste> — le tag entre underscores en tête est le
-# "groupe" d'origine (fansub, ripper...), toujours supprimé et remplacé
-# par NEW_GROUP_TAG comme pour les 2 autres formats.
 _UNDERSCORE_RE = re.compile(r"^_(?P<tag>[^_]+)_\s*(?P<rest>.+)$")
+
+# --- Format 4 : bracket-group + SxxExx explicite + LANG + blob (...) ------
+# Découpe : [Groupe] Titre SxxExx LANG (source qualité vidéo audio ...)
+#           ex: [Team Arcedo] Onee-chan Gokko S01E01 VOSTFR (WEB-DL 1080p H.264 AAC)
+# Contrairement au format fansub (pas de SxxExx, "Titre - N"), ici la
+# saison/épisode et la langue sont déjà explicites dans le nom ; seul le
+# bloc entre parenthèses doit être analysé (ordre non garanti -> recherche
+# de token comme pour le fansub). La source reste entre parenthèses dans
+# le nom final, le reste (qualité/plateforme/vidéo/audio) en sort.
+_BRACKET_SCENE_RE = re.compile(
+    r"^\[(?P<group>[^\]]+)\]\s*"
+    r"(?P<title>.+?)[\s.]+(?P<se>S\d{2}E\d{2,4})[\s.]+"
+    r"(?P<lang>" + _LANG_ALT + r")[\s.]+"
+    r"\((?P<meta>[^)]*)\)\s*$",
+    re.IGNORECASE,
+)
+
+# --- Format 5 : bracket-group + SxxExx SANS langue explicite --------------
+# Découpe : [Groupe] Titre SxxExx [source qualité vidéo] (indice Multi/Dual Subs)
+#           ex: [Trix] Grand Blue Dreaming S03E10 [WEBRip 1080p AV1] (Multi Subs)
+# Contrairement au format 4, aucune langue n'apparaît en clair juste après
+# SxxExx : elle doit être déduite d'un indice "Multi Subs"/"Dual Subs" trouvé
+# dans les blocs entre crochets/parenthèses, et placée en FIN de nom (juste
+# avant le groupe), sous la forme "Multi-sub"/"Dual-sub". Le codec vidéo
+# détecté est toujours conservé tel quel ; si aucun tag audio n'est trouvé,
+# "AAC" est ajouté par défaut (contrairement au format fansub qui n'ajoute
+# jamais rien par défaut).
+_BRACKET_HINT_RE = re.compile(
+    r"^\[(?P<group>[^\]]+)\]\s*"
+    r"(?P<title>.+?)[\s.]+(?P<se>S\d{2}E\d{2,4})\s*"
+    r"(?P<meta>.*)$",
+    re.IGNORECASE,
+)
+
+_MULTI_DUAL_SUB_HINT_RE = re.compile(r"\b(?P<kind>multi|dual)[\s-]*sub", re.IGNORECASE)
+
+# --- Format 6 : titre nu + SxxExx (+ titre d'épisode), sans aucun tag -----
+# Découpe : Titre[_ ou espaces]SxxExx[_ ou espaces]TitreEpisode(optionnel)
+#           ex: Mushoku_Tensei_Jobless_Reincarnation_S03E08_The_Flying_Fortress
+#               The Apothecary Diaries S01E01 Maomao
+# Aucune info de langue/qualité/plateforme/source/codec n'est présente : le
+# titre d'épisode éventuel est ignoré (comme le "middle" du format scene),
+# et on force systématiquement "MULTI (WEB-DL) H.264 AAC" en l'absence de
+# toute autre info exploitable.
+_BARE_SE_RE = re.compile(
+    r"^(?P<title>.+?)[\s_]+(?P<se>S\d{2}E\d{2,4})"
+    r"(?:[\s_]+(?P<episode_title>.+))?$",
+    re.IGNORECASE,
+)
 
 
 def resolution_label(height: int) -> str:
-    """Convertit une hauteur (ex: 480 dans un resize (854, 480)) en tag qualité (ex: '480p')."""
     return f"{height}p"
 
 
 def _clean_title(raw: str) -> str:
-    """Normalise les séparateurs (points, espaces multiples) d'un titre en espaces simples."""
-    return re.sub(r"[.\s]+", " ", raw).strip(" .-_")
+    # Underscore ajouté aux séparateurs normalisés (format 6 : titres en
+    # underscores style "Mushoku_Tensei_Jobless_Reincarnation").
+    return re.sub(r"[._\s]+", " ", raw).strip(" .-_")
 
 
 def _search_token(text: str, alt: str) -> str | None:
-    """Cherche le premier token correspondant à l'un des alternatifs `alt`
-    (mot entier) n'importe où dans `text`. Renvoie le texte matché tel
-    quel (casse d'origine), ou None si absent."""
     m = re.search(r"\b(?:" + alt + r")\b", text, re.IGNORECASE)
     return m.group(0) if m else None
 
 
 def _final_lang(lang: str | None, dual: bool, multi_hint: bool) -> str:
-    """
-    Détermine le tag de langue final.
-
-    - Un tag de langue explicite contenant "multi" est conservé tel quel.
-    - Un tag de langue explicite qui NE contient PAS "multi" est toujours
-      remplacé par VOSTFR (comportement historique).
-    - Sans tag de langue explicite : "DUAL" (audio double) ou un indice
-      "MultiSub" détecté ailleurs dans le nom donnent MULTI ; sinon VOSTFR.
-    """
     if lang:
         return lang if _MULTI_RE.search(lang) else "VOSTFR"
     if multi_hint:
@@ -162,12 +178,9 @@ def _try_scene_format(base: str) -> str | None:
 
     middle = (parts.get("middle") or "").strip(" .")
     lang_tag = middle if middle and _LANG_TOKEN_FULL_RE.match(middle) else None
-    # Si "middle" n'est pas un tag de langue reconnu, c'est un titre
-    # d'épisode (ex: "I Will Make Sure to Save You") -> on l'ignore
-    # simplement, il ne fait pas partie du nom final reconstruit.
 
     lang = _final_lang(lang_tag, bool(parts.get("dual")), False)
-    platform = parts["platform"].upper()
+    platform = parts["platform"].upper() if parts["platform"] else None
 
     new_base = _join_parts(
         title, parts["se"], lang, parts["quality"], platform,
@@ -185,8 +198,6 @@ def _try_fansub_format(base: str) -> str | None:
     episode = int(parts["episode"])
     se = f"S01E{episode:02d}"
 
-    # Retire les blocs [xxx]/(xxx) qui ne sont qu'un hash/CRC, garde le reste
-    # du texte entre crochets/parenthèses comme simple blob à analyser.
     meta_clean = re.sub(
         r"[\[(]([^\])]*)[\])]",
         lambda m: "" if _HEX_HASH_RE.match(m.group(1).strip()) else f" {m.group(1)} ",
@@ -210,17 +221,98 @@ def _try_fansub_format(base: str) -> str | None:
     return f"{new_base}-{NEW_GROUP_TAG}"
 
 
-def _try_underscore_format(base: str) -> str | None:
+def _try_bracket_scene_format(base: str) -> str | None:
     """
-    Format underscore : _Tag_ Titre [lang] [autres tags optionnels].
+    Format 4 : [Groupe] Titre SxxExx LANG (source qualité vidéo audio ...).
 
-    Pas de saison/épisode supposée (contrairement au format fansub), pas
-    de plateforme/qualité/codec devinés s'ils sont absents. Le tag entre
-    underscores en tête est toujours supprimé. Comme ce format n'a en
-    général AUCUNE info de source, "WEB-DL" est ajouté par défaut si rien
-    de mieux n'est trouvé (WEBRip/BDRip/etc.), pour ne pas livrer un nom
-    totalement dépourvu de provenance.
+    La saison/épisode et la langue sont déjà explicites, seul le blob entre
+    parenthèses est analysé par recherche de token (ordre non garanti). La
+    source reste entre parenthèses dans le nom final ; qualité, plateforme,
+    vidéo et audio en sortent, dans cet ordre fixe.
     """
+    match = _BRACKET_SCENE_RE.match(base.strip())
+    if not match:
+        return None
+    parts = match.groupdict()
+    title = _clean_title(parts["title"])
+    meta = parts["meta"] or ""
+
+    lang = _final_lang(parts["lang"], False, False)
+
+    source = _search_token(meta, _SOURCE_ALT)
+    quality = _search_token(meta, r"\d{3,4}p")
+    platform = _search_token(meta, _PLATFORM_ALT)
+    video = _search_token(meta, _VIDEO_ALT)
+    audio = _search_token(meta, _AUDIO_ALT)
+
+    source_part = f"({source})" if source else None
+
+    new_base = _join_parts(
+        title, parts["se"], lang, source_part, quality,
+        platform.upper() if platform else None,
+        video, audio,
+    )
+    return f"{new_base}-{NEW_GROUP_TAG}"
+
+
+def _try_bracket_hint_format(base: str) -> str | None:
+    """
+    Format 5 : [Groupe] Titre SxxExx [source qualité vidéo] (Multi/Dual Subs).
+
+    Pas de langue explicite après SxxExx (sinon c'est le format 4). La
+    langue est déduite d'un indice "Multi Subs"/"Dual Subs" cherché dans
+    tout le blob restant, et placée en fin de nom ("Multi-sub"/"Dual-sub").
+    Codec vidéo conservé tel quel ; audio par défaut "AAC" si absent.
+    """
+    match = _BRACKET_HINT_RE.match(base.strip())
+    if not match:
+        return None
+    parts = match.groupdict()
+    title = _clean_title(parts["title"])
+    if not title:
+        return None
+    se = parts["se"].upper()
+    meta = re.sub(r"[\[\]()]", " ", parts.get("meta") or "")
+
+    hint_match = _MULTI_DUAL_SUB_HINT_RE.search(meta)
+    if not hint_match:
+        # Pas d'indice Multi/Dual Subs -> ce n'est pas ce format (évite de
+        # capturer par erreur un nom qui devrait matcher un autre format,
+        # ex: le format 4 avec langue explicite ou le fansub classique).
+        return None
+
+    source = _search_token(meta, _SOURCE_ALT)
+    quality = _search_token(meta, r"\d{3,4}p")
+    video = _search_token(meta, _VIDEO_ALT)
+    audio = _search_token(meta, _AUDIO_ALT) or "AAC"
+    lang_label = hint_match.group("kind").capitalize() + "-sub"
+
+    new_base = _join_parts(title, se, source, quality, video, audio, lang_label)
+    return f"{new_base}-{NEW_GROUP_TAG}"
+
+
+def _try_bare_se_format(base: str) -> str | None:
+    """
+    Format 6 : Titre (espaces ou underscores) SxxExx [titre d'épisode].
+
+    Aucun groupe, aucune langue/qualité/source/codec dans le nom source :
+    le titre d'épisode éventuel est ignoré et "MULTI (WEB-DL) H.264 AAC"
+    est toujours ajouté par défaut.
+    """
+    match = _BARE_SE_RE.match(base.strip())
+    if not match:
+        return None
+    parts = match.groupdict()
+    title = _clean_title(parts["title"])
+    if not title:
+        return None
+    se = parts["se"].upper()
+
+    new_base = _join_parts(title, se, "MULTI", "(WEB-DL)", "H.264", "AAC")
+    return f"{new_base}-{NEW_GROUP_TAG}"
+
+
+def _try_underscore_format(base: str) -> str | None:
     match = _UNDERSCORE_RE.match(base.strip())
     if not match:
         return None
@@ -231,8 +323,6 @@ def _try_underscore_format(base: str) -> str | None:
     lang_tag = _search_token(rest, _LANG_ALT)
     title_part = rest
     if lang_tag:
-        # Retire précisément le tag de langue trouvé, où qu'il soit dans
-        # le nom, pour qu'il ne reste pas dans le titre reconstruit.
         title_part = re.sub(r"\b" + re.escape(lang_tag) + r"\b", "", rest, count=1)
     title = _clean_title(title_part)
     if not title:
@@ -259,33 +349,16 @@ def build_final_name(
     override_quality: str | None = None,
     output_ext: str | None = None,
 ) -> str:
-    """
-    Construit le nom final à uploader à partir du vrai nom de fichier source.
-
-    override_quality : à fournir pour le pipeline FreeConvert/CloudConvert
-    quand un resize est appliqué (ex: "480p") -- la qualité réellement
-    encodée doit apparaître dans le nom, pas celle du fichier source
-    d'origine, pour ne pas induire en erreur (ex: pas de "1080p" dans le
-    nom si le fichier livré est en 480p). Laisser None pour garder la
-    qualité du nom source telle quelle. Si le nom source ne contient pas
-    de tag de qualité (certains formats fansub/underscore), il est
-    simplement ajouté.
-
-    output_ext : à fournir quand le moteur réencode toujours vers un
-    conteneur fixe (ex: "mp4" pour FreeConvert/CloudConvert, même si la
-    source est un .mkv). Laisser None pour garder l'extension du fichier
-    source telle quelle (cas FFmpeg local en mux/copy par exemple).
-
-    Si le nom ne correspond à aucun format reconnu, on renvoie le nom
-    d'origine sans y toucher (mieux vaut un nom non modifié qu'un nom cassé).
-    """
     base, ext = os.path.splitext(real_filename)
     base = base.strip()
 
     new_base = (
         _try_scene_format(base)
+        or _try_bracket_scene_format(base)
+        or _try_bracket_hint_format(base)
         or _try_fansub_format(base)
         or _try_underscore_format(base)
+        or _try_bare_se_format(base)
     )
     if new_base is None:
         return real_filename
@@ -294,8 +367,6 @@ def build_final_name(
         if re.search(r"\d{3,4}p", new_base):
             new_base = re.sub(r"\d{3,4}p", override_quality, new_base, count=1)
         else:
-            # Pas de tag qualité dans le nom reconstruit (ex: fansub/underscore
-            # sans info de résolution) -> on l'insère juste avant le groupe final.
             new_base = new_base.replace(
                 f"-{NEW_GROUP_TAG}", f" {override_quality}-{NEW_GROUP_TAG}"
             )
@@ -306,19 +377,16 @@ def build_final_name(
 
 if __name__ == "__main__":
     tests = [
-        # Scene style historique
         "RILAKKUMA S01E23 SUBFRENCH 1080p CR WEB-DL AAC2.0 H.264-Tsundere-Raws.mkv",
         "SOME ANIME S02E05 MULTI 1080p CR WEB-DL AAC2.0 H.264-SomeGroup.mkv",
         "OTHER ANIME S01E01 VOSTFR 1080p ADN WEB-DL AAC2.0 H.264-OldGroup.mkv",
         "OTHER ANIME S01E01 VOSTFR 1080p AMZN WEB-DL AAC2.0 H.264-OldGroup.mkv",
         "UNPARSEABLE NAME.mkv",
-        # Fansub bracket style
         "[Erai-raws] Rilakkuma - 23 [1080p CR WEB-DL AVC AAC][MultiSub][45752258].mkv",
         "[SubsPlease] Rilakkuma - 23 (480p) [E2E141F1].mkv",
         "RILAKKUMA.S01E23.1080p.CR.WEB-DL.DUAL.AAC2.0.H.264.MSubs-ToonsHub.mkv",
         "RILAKKUMA S01E23 1080p CR WEB-DL DUAL AAC2.0 H.264-VARYG.mkv",
         "Though.I.Am.an.Inept.Villainess.S01E09.I.Will.Make.Sure.to.Save.You.1080p.DSNP.WEB-DL.AAC2.0.H.264-VARYG.mkv",
-        # Underscore style (nouveau)
         "_Meda-Arcedo_ Virgin Punk Clockwork Girl VOSTFR.mp4",
         "_SomeRipper_ Another Show Title MULTI.mkv",
         "_SomeRipper_ Another Show Title.mp4",
@@ -326,8 +394,6 @@ if __name__ == "__main__":
     for name in tests:
         print(f"{name}\n  -> {build_final_name(name)}\n")
 
-    # Cas FreeConvert/CloudConvert avec resize (854, 480) -> qualité annoncée
-    # suit le resize, et l'extension est forcée en mp4 même si la source est un mkv.
     fc_source = "RILAKKUMA S01E23 SUBFRENCH 1080p CR WEB-DL AAC2.0 H.264-Tsundere-Raws.mkv"
     print(
         f"{fc_source}\n  -> "
