@@ -300,7 +300,7 @@ async def handle_incoming_video(client, message: Message):
 # Callback principal — vid|<action>|<key>
 # ─────────────────────────────────────────────────────────────
 
-@colab_bot.on_callback_query(filters.regex(r"^vid\|"))
+@colab_bot.on_callback_query(filters.regex(r"^vid\|"), group=-1)
 async def video_menu_cb(client, cq: CallbackQuery):
     parts = cq.data.split("|", 2)
     if len(parts) < 3:
@@ -397,7 +397,7 @@ async def video_menu_cb(client, cq: CallbackQuery):
     await cq.answer("Action inconnue.", show_alert=True)
 
 
-@colab_bot.on_callback_query(filters.regex(r"^vidres\|"))
+@colab_bot.on_callback_query(filters.regex(r"^vidres\|"), group=-1)
 async def video_resolution_cb(client, cq: CallbackQuery):
     parts = cq.data.split("|", 2)
     if len(parts) < 3:
