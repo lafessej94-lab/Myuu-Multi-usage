@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import shutil
 import logging
 
@@ -8,11 +9,13 @@ log = logging.getLogger(__name__)
 import pathlib
 import uuid
 from asyncio import sleep
+from contextlib import asynccontextmanager
 from time import time
 from colab_leecher import OWNER, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot
 from natsort import natsorted
 from datetime import datetime
 from os import makedirs, path as ospath
+from pyrogram import raw
 from colab_leecher.cloudconvert import (
     cc_mode_label,
     compress_file,
@@ -82,6 +85,111 @@ async def _finish_status(status_msg, text: str, reply_markup=None) -> None:
         await status_msg.edit_text(text, reply_markup=reply_markup)
     except Exception:
         pass
+
+
+BATCH_STICKER_PACK_SHORT_NAME = "Cosmic_Princess_Kaguya_Pack2"
+
+_sticker_pack_cache: list | None = None
+
+
+async def _get_sticker_pack_documents() -> list:
+    """Récupère (et met en cache pour la durée de vie du process) les
+    documents du pack de stickers de fin de batch. Un seul appel réseau
+    au total -- le pack ne change pas en cours de route."""
+    global _sticker_pack_cache
+    if _sticker_pack_cache is not None:
+        return _sticker_pack_cache
+    try:
+        result = await colab_bot.invoke(
+            raw.functions.messages.GetStickerSet(
+                stickerset=raw.types.InputStickerSetShortName(
+                    short_name=BATCH_STICKER_PACK_SHORT_NAME
+                ),
+                hash=0,
+            )
+        )
+        _sticker_pack_cache = list(result.documents)
+    except Exception as exc:
+        log.warning(
+            "Impossible de charger le pack de stickers %s: %s",
+            BATCH_STICKER_PACK_SHORT_NAME, exc,
+        )
+        _sticker_pack_cache = []
+    return _sticker_pack_cache
+
+
+async def _send_batch_sticker_to(chat_id) -> None:
+    documents = await _get_sticker_pack_documents()
+    if not documents:
+        return
+    doc = random.choice(documents)
+    try:
+        peer = await colab_bot.resolve_peer(chat_id)
+        input_doc = raw.types.InputDocument(
+            id=doc.id, access_hash=doc.access_hash, file_reference=doc.file_reference,
+        )
+        await colab_bot.invoke(
+            raw.functions.messages.SendMedia(
+                peer=peer,
+                media=raw.types.InputMediaDocument(id=input_doc),
+                message="",
+                random_id=random.randint(-(2**63), 2**63 - 1),
+            )
+        )
+    except Exception as exc:
+        log.warning("Envoi du sticker de fin de batch échoué (chat %s): %s", chat_id, exc)
+
+
+async def _maybe_send_batch_sticker() -> None:
+    """N'envoie le sticker QUE si l'auto-forward est actif -- cette
+    fonctionnalité est rattachée au forward, pas indépendante. Envoyé dans
+    le(s) salon(s) de dump, jamais dans le chat principal. Appelé UNIQUEMENT
+    par _BatchJobTracker quand le DERNIER job FC/CC/local en cours se
+    termine (compteur qui retombe à 0), pas à chaque job individuel."""
+    if not BOT.Options.auto_forward or not BOT.Options.dump_ids:
+        return
+    for dump_target in list(BOT.Options.dump_ids):
+        await _send_batch_sticker_to(dump_target)
+
+
+class _BatchJobTracker:
+    """Compte les jobs FC/CC/local (hardsub, convert, resize, compress,
+    tous les Local_* ffmpeg) actuellement en cours, tous types confondus
+    dans un seul groupe commun. Le DERNIER à se terminer (le compteur
+    retombe à 0) déclenche l'envoi du sticker de fin de batch -- donc si 3
+    jobs FC tournent en même temps, un seul sticker est envoyé, après le
+    3e à finir d'uploader (2e si seulement 2 jobs, etc.)."""
+
+    def __init__(self):
+        self._active = 0
+        self._lock = asyncio.Lock()
+
+    async def enter(self) -> None:
+        async with self._lock:
+            self._active += 1
+
+    async def exit(self) -> None:
+        async with self._lock:
+            self._active = max(0, self._active - 1)
+            is_last = self._active == 0
+        if is_last:
+            await _maybe_send_batch_sticker()
+
+
+_batch_tracker = _BatchJobTracker()
+
+
+@asynccontextmanager
+async def _batch_job():
+    """À utiliser en 'async with _batch_job():' autour du corps complet
+    d'un handler FC/CC/local -- incrémente à l'entrée, décrémente (et
+    déclenche potentiellement le sticker) à la sortie, même en cas
+    d'exception."""
+    await _batch_tracker.enter()
+    try:
+        yield
+    finally:
+        await _batch_tracker.exit()
 
 
 async def _rewrite_video_title(path: str, title: str) -> None:
