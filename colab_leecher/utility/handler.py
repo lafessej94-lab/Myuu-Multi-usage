@@ -84,6 +84,49 @@ async def _finish_status(status_msg, text: str, reply_markup=None) -> None:
         pass
 
 
+async def _rewrite_video_title(path: str, title: str) -> None:
+    """
+    Réécrit le tag "title" des métadonnées du conteneur pour qu'il
+    corresponde au nom final smart_rename, en simple REMUX (-c copy,
+    aucun ré-encodage : quasi instantané, zéro perte de qualité).
+
+    Nécessaire car les fichiers sources (scene/fansub) embarquent souvent
+    un vieux tag "title" (fréquemment en style underscore, convention
+    scene old-school) que Telegram Desktop semble parfois reprendre comme
+    nom de fichier suggéré au téléchargement -- au lieu du nom réel du
+    document envoyé -- d'où les noms remplis d'underscores constatés côté
+    utilisateur, alors que la légende/le nom affichés dans le chat étaient
+    corrects.
+    """
+    ext = ospath.splitext(path)[1]
+    tmp_path = f"{path}.retitled.tmp{ext}"
+    try:
+        await _run_tracked_process(
+            [
+                "ffmpeg", "-y",
+                "-i", path,
+                "-map", "0",
+                "-c", "copy",
+                "-metadata", f"title={title}",
+                tmp_path,
+            ],
+            "ffmpeg-retitle",
+        )
+    except Exception as exc:
+        log.warning("Rewrite du titre conteneur échoué pour %s: %s", path, exc)
+        if ospath.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return
+
+    if ospath.exists(tmp_path) and ospath.getsize(tmp_path) > 0:
+        os.replace(tmp_path, path)
+    elif ospath.exists(tmp_path):
+        os.remove(tmp_path)
+
+
 async def Leech(folder_path: str, remove: bool, convert_videos: bool = True, status_msg=None):
     """
     status_msg optionnel : si fourni (cas des jobs FreeConvert concurrents),
@@ -192,6 +235,13 @@ async def Leech(folder_path: str, remove: bool, convert_videos: bool = True, sta
                         "Impossible de renommer %s -> %s (%s), envoi sous le nom réel.",
                         new_path, renamed_path, exc,
                     )
+
+            # Réécrit le tag "title" du conteneur pour qu'il corresponde au
+            # nom final (voir _rewrite_video_title) -- évite que Telegram
+            # Desktop ne suggère un vieux nom underscoré embarqué dans les
+            # métadonnées d'origine au moment du téléchargement.
+            if fileType(new_path) == "video":
+                await _rewrite_video_title(new_path, ospath.splitext(upload_name)[0])
 
             BotTimes.current_time = time()
             Messages.status_head  = f"📤 <b>UPLOADING</b>\n\n<code>{upload_name}</code>\n"
