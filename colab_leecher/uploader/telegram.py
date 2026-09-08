@@ -58,6 +58,8 @@ async def upload_file(file_path, real_name, is_last: bool = False, status_msg=No
     # BOT.TargetChat (pipeline leech classique, un seul job à la fois).
     target_chat = target_msg.chat.id if target_msg else BOT.TargetChat
 
+    thmb_path = None
+
     async def _progress(current, total):
         await progress_bar(current, total, target_msg)
 
@@ -81,12 +83,12 @@ async def upload_file(file_path, real_name, is_last: bool = False, status_msg=No
             )
 
         elif f_type == "audio":
-            thmb_path = Paths.THMB_PATH if ospath.exists(Paths.THMB_PATH) else None
+            thmb_path_local = Paths.THMB_PATH if ospath.exists(Paths.THMB_PATH) else None
             sent = await colab_bot.send_audio(
                 chat_id=target_chat,
                 audio=file_path,
                 caption=caption,
-                thumb=thmb_path,
+                thumb=thmb_path_local,
                 progress=_progress,
             )
 
@@ -100,23 +102,26 @@ async def upload_file(file_path, real_name, is_last: bool = False, status_msg=No
 
         else:  # document
             if ospath.exists(Paths.THMB_PATH):
-                thmb_path = Paths.THMB_PATH
+                thmb_path_local = Paths.THMB_PATH
             elif type_ == "video":
-                thmb_path, _ = thumbMaintainer(file_path)
+                thmb_path_local, _ = thumbMaintainer(file_path)
             else:
-                thmb_path = None
+                thmb_path_local = None
             sent = await colab_bot.send_document(
                 chat_id=target_chat,
                 document=file_path,
                 caption=caption,
-                thumb=thmb_path,
+                thumb=thmb_path_local,
                 progress=_progress,
             )
 
         MSG.sent_msg = sent
         Transfer.sent_file.append(sent)
         Transfer.sent_file_names.append(real_name)
-        await maybe_autoforward(sent)
+        # thmb_path n'existe (et n'est pertinent pour "cover") que dans la
+        # branche vidéo -- None pour audio/photo/document, où copy_message
+        # (fallback dans _forward_to) suffit très bien.
+        await maybe_autoforward(sent, thumb_path=thmb_path if f_type == "video" else None)
 
         # Delete the progress status message once the last file lands
         if is_last:
@@ -135,26 +140,46 @@ async def upload_file(file_path, real_name, is_last: bool = False, status_msg=No
         raise RuntimeError(f"Telegram upload failed for {real_name}: {e}") from e
 
 
-async def maybe_autoforward(message) -> None:
+async def maybe_autoforward(message, thumb_path: str | None = None) -> None:
     if not BOT.Options.auto_forward or not BOT.Options.dump_ids:
         return
     for dump_target in list(BOT.Options.dump_ids):
-        await _forward_to(message, dump_target)
+        await _forward_to(message, dump_target, thumb_path=thumb_path)
 
 
-async def _forward_to(message, dump_target, retries: int = 0) -> None:
+async def _forward_to(message, dump_target, thumb_path: str | None = None, retries: int = 0) -> None:
     try:
-        await colab_bot.copy_message(
-            chat_id=dump_target,
-            from_chat_id=BOT.TargetChat,
-            message_id=message.id,
-        )
+        if message.video and thumb_path and ospath.exists(thumb_path):
+            # copy_message ne propage PAS le "cover" (grande preview HD à
+            # l'ouverture) : c'est un attribut propre à Pyrofork appliqué
+            # au moment de l'envoi, pas stocké comme un attribut standard
+            # du document qui se copierait tel quel via copy_message. On
+            # renvoie donc la vidéo via son file_id (aucun ré-upload réel,
+            # juste une référence -- quasi instantané) en repassant
+            # explicitement cover=thumb_path, comme à l'envoi initial.
+            await colab_bot.send_video(
+                chat_id=dump_target,
+                video=message.video.file_id,
+                caption=message.caption.html if message.caption else None,
+                thumb=thumb_path,
+                cover=thumb_path,
+                duration=message.video.duration,
+                width=message.video.width,
+                height=message.video.height,
+                supports_streaming=True,
+            )
+        else:
+            await colab_bot.copy_message(
+                chat_id=dump_target,
+                from_chat_id=BOT.TargetChat,
+                message_id=message.id,
+            )
     except FloodWait as e:
         if retries >= 3:
             logging.warning(f"Autoforward to {dump_target} gave up after {retries} FloodWaits")
             return
         logging.warning(f"Autoforward FloodWait {e.value}s (target {dump_target})")
         await sleep(e.value)
-        await _forward_to(message, dump_target, retries + 1)
+        await _forward_to(message, dump_target, thumb_path=thumb_path, retries=retries + 1)
     except Exception as exc:
         logging.warning(f"Autoforward to {dump_target} skipped: {exc}")
