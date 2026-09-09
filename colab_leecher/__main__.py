@@ -55,6 +55,22 @@ from colab_leecher.stream_extractor import (
     dl_video, dl_audio, dl_sub,
 )
 
+# ── Sectioned link menu (Download / Inspect / Process / Cloud), mirroring
+#    services/url_views.py's navigation pattern. Every leaf button below
+#    still carries the SAME callback_data ("normal", "cc_convert",
+#    "seedr_fc_hardsub", "sx_open", ...) that the existing callbacks()
+#    if/elif chain already handles — only the pre-menu navigation changed.
+#    See colab_leecher/link_menu.py for the pure text/keyboard builders.
+from colab_leecher.link_menu import (
+    kind_label as _lk_kind_label,
+    link_header as _lk_header,
+    main_kb as _lk_main_kb,
+    download_kb as _lk_download_kb,
+    inspect_kb as _lk_inspect_kb,
+    process_kb as _lk_process_kb,
+    cloud_kb as _lk_cloud_kb,
+)
+
 
 _initial_dump = str(DUMP_ID or "").strip()
 if _initial_dump not in ("", "0"):
@@ -71,11 +87,12 @@ BOT.Options.cc_api_keys = [k.strip() for k in str(CC_API_KEY or "").split(",") i
 BOT.Options.fc_api_keys = [k.strip() for k in str(FC_API_KEY or "").split(",") if k.strip()]
 
 # ── État en mémoire pour le hardsub FreeConvert concurrent ──────────────────
-# _link_sessions : message_id (du message "Choose mode:") -> liste de sources.
-#   Nécessaire pour que plusieurs liens envoyés d'affilée ne se marchent pas
-#   dessus sur le global BOT.SOURCE — chaque bouton "mode" retrouve SON lien
-#   via le message auquel il est attaché, pas via BOT.SOURCE (qui ne reflète
-#   que le tout dernier lien envoyé).
+# _link_sessions : message_id (du message "Choisis une section :") -> liste
+#   de sources. Nécessaire pour que plusieurs liens envoyés d'affilée ne se
+#   marchent pas dessus sur le global BOT.SOURCE — chaque bouton retrouve SON
+#   lien via le message auquel il est attaché, pas via BOT.SOURCE (qui ne
+#   reflète que le tout dernier lien envoyé). Sert aussi de "token" implicite
+#   pour la navigation par sections (lk|sec|...).
 # _pending_fc_subtitle : message_id (du message "Envoie le sous-titre...") ->
 #   {"url":..., "name":...}. Permet plusieurs hardsub FC en attente de
 #   sous-titre en même temps — l'utilisateur répond (reply) au bon message
@@ -863,45 +880,8 @@ async def setFix(client, message):
 
 
 # ══════════════════════════════════════════════
-#  Link handler — mode selection
+#  Link handler — sectioned menu (Download / Inspect / Process / Cloud)
 # ══════════════════════════════════════════════
-
-def _mode_keyboard():
-    first = (BOT.SOURCE or [""])[0].strip()
-    is_magnet = first.startswith("magnet:?xt=urn:btih:")
-    is_http = first.startswith("http://") or first.startswith("https://")
-
-    rows = [
-        [InlineKeyboardButton("── 📦 Fichier ──", callback_data="noop")],
-        [InlineKeyboardButton("📄 Normal",      callback_data="normal"),
-         InlineKeyboardButton("🗜 Compresser",  callback_data="zip")],
-        [InlineKeyboardButton("📂 Extraire",    callback_data="unzip"),
-         InlineKeyboardButton("♻️ Ré-archiver", callback_data="undzip")],
-        [InlineKeyboardButton("── ☁️ CloudConvert ──", callback_data="noop")],
-        [InlineKeyboardButton("🔄 Convertir",       callback_data="cc_convert"),
-         InlineKeyboardButton("📐 Redimensionner",  callback_data="cc_resize")],
-        [InlineKeyboardButton("🧱 Compresser", callback_data="cc_compress")],
-    ]
-
-    if is_magnet:
-        rows.append([InlineKeyboardButton("── 🧲 Seedr + Hardsub ──", callback_data="noop")])
-        rows.append([InlineKeyboardButton("☁️ Seedr+CC Convert", callback_data="seedr_cc_convert")])
-        rows.append([
-            InlineKeyboardButton("☁️ CC Hardsub", callback_data="seedr_cc_hardsub"),
-            InlineKeyboardButton("🆓 FC Hardsub", callback_data="seedr_fc_hardsub"),
-        ])
-    elif is_http:
-        rows.append([InlineKeyboardButton("── 🧲 Hardsub ──", callback_data="noop")])
-        rows.append([
-            InlineKeyboardButton("☁️ CC Hardsub", callback_data="cc_hardsub_manual"),
-            InlineKeyboardButton("🆓 FC Hardsub", callback_data="fc_hardsub_manual"),
-        ])
-
-    rows.append([InlineKeyboardButton("── 🎞 Autre ──", callback_data="noop")])
-    rows.append([InlineKeyboardButton("🎞 Extraire pistes (streams)", callback_data="sx_open")])
-
-    return InlineKeyboardMarkup(rows)
-
 
 @colab_bot.on_message(filters.create(isLink) & ~filters.photo & filters.private)
 async def handle_url(client, message):
@@ -945,16 +925,12 @@ async def handle_url(client, message):
 
     n = len([l for l in src if l.strip()])
     first_src = (src or [""])[0].strip()
-    if BOT.Mode.ytdl:
-        kind_label = "🏮 Lien YTDL"
-    elif first_src.startswith("magnet:?xt=urn:btih:"):
-        kind_label = "🧲 Magnet détecté"
-    else:
-        kind_label = "🔗 Lien détecté"
+    is_magnet = first_src.startswith("magnet:?xt=urn:btih:")
+    label = _lk_kind_label(BOT.Mode.ytdl, is_magnet)
 
     sent = await message.reply_text(
-        f"{kind_label}\n<code>{n}</code> source(s) · <b>Choisis un mode :</b>",
-        reply_markup=_mode_keyboard(), quote=True,
+        _lk_header(label, n),
+        reply_markup=_lk_main_kb(is_magnet), quote=True,
     )
     _link_sessions[sent.id] = src
 
@@ -972,6 +948,57 @@ async def callbacks(client, cq):
     # ── Labels de section non-cliquables (juste des repères visuels) ──
     if data == "noop":
         await cq.answer()
+        return
+
+    # ── Navigation du menu de lien (Download / Inspect / Process / Cloud) ──
+    # Ces deux entrées ("lk|sec|<section>" et "lk|cancel") sont les SEULES
+    # nouvelles callback_data ajoutées par le menu sectionné. Elles ne font
+    # que reconstruire le texte/clavier via colab_leecher.link_menu (pur,
+    # aucun I/O) puis éditer le message — aucun job, aucun texte de statut
+    # de job n'est touché. Tous les boutons feuilles de ces claviers
+    # renvoient les callback_data historiques ("normal", "cc_convert",
+    # "seedr_fc_hardsub", "sx_open", ...) traités plus bas, inchangés.
+    if data.startswith("lk|sec|") or data == "lk|cancel":
+        session_src = _link_sessions.get(cq.message.id, BOT.SOURCE or [""])
+        first = (session_src or [""])[0].strip()
+        is_magnet = first.startswith("magnet:?xt=urn:btih:")
+        is_http = first.startswith("http://") or first.startswith("https://")
+        n = len([l for l in session_src if l.strip()])
+        label = _lk_kind_label(BOT.Mode.ytdl, is_magnet)
+
+        if data == "lk|cancel":
+            _link_sessions.pop(cq.message.id, None)
+            await cq.answer()
+            await cq.message.delete()
+            return
+
+        section = data.split("|", 2)[2]
+        await cq.answer()
+        if section == "main":
+            await cq.message.edit_text(_lk_header(label, n), reply_markup=_lk_main_kb(is_magnet))
+        elif section == "download":
+            await cq.message.edit_text(
+                _lk_header(label, n, "Download", "Choisis le format de sortie."),
+                reply_markup=_lk_download_kb(),
+            )
+        elif section == "inspect":
+            await cq.message.edit_text(
+                _lk_header(label, n, "Inspect", "Analyse la source avant de lancer quoi que ce soit."),
+                reply_markup=_lk_inspect_kb(),
+            )
+        elif section == "process":
+            await cq.message.edit_text(
+                _lk_header(label, n, "Process", "CloudConvert / hardsub sur ce lien."),
+                reply_markup=_lk_process_kb(is_http),
+            )
+        elif section == "cloud":
+            if not is_magnet:
+                await cq.answer("Cloud needs a magnet link.", show_alert=True)
+                return
+            await cq.message.edit_text(
+                _lk_header(label, n, "Cloud", "Seedr + FreeConvert / CloudConvert."),
+                reply_markup=_lk_cloud_kb(),
+            )
         return
 
     # ── Help/Settings from /start ──────────────
@@ -1501,10 +1528,12 @@ async def callbacks(client, cq):
     if data == "sx_back":
         clear_session(chat_id)
         n     = len([l for l in (BOT.SOURCE or []) if l.strip()])
-        label = "🏮 Lien YTDL" if BOT.Mode.ytdl else "🔗 Lien détecté"
+        first_src = (BOT.SOURCE or [""])[0].strip()
+        is_magnet = first_src.startswith("magnet:?xt=urn:btih:")
+        label = _lk_kind_label(BOT.Mode.ytdl, is_magnet)
         await cq.message.edit_text(
-            f"{label}\n<code>{n}</code> source(s) · <b>Choisis un mode :</b>",
-            reply_markup=_mode_keyboard()
+            _lk_header(label, n),
+            reply_markup=_lk_main_kb(is_magnet)
         )
         return
 
