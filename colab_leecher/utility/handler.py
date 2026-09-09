@@ -66,8 +66,10 @@ from colab_leecher.utility.helper import (
 #    helpers pulled out of this file to remove duplication. The rendered
 #    status text and job behavior are unchanged; only where the code lives
 #    changed.
-from services.job_views import fc_job_status_view, seedr_status_view
-from services.subtitle_probe import (
+# NOTE: import relatif (".." = colab_leecher) car services/ vit dans
+# colab_leecher/services/, PAS comme package top-level.
+from ..services.job_views import fc_job_status_view, seedr_status_view
+from ..services.subtitle_probe import (
     run_tracked_process,
     probe_remote_video,
     pick_french_text_subtitle,
