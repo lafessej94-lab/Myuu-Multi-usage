@@ -12,7 +12,7 @@ from urllib.parse import unquote
 
 import aiohttp
 
-from colab_leecher.house_style import apply_hardsub_style
+from colab_leecher.house_style import apply_hardsub_style, DEFAULT_STYLE_KEY
 from colab_leecher.smart_rename import build_final_name, resolution_label
 
 log = logging.getLogger(__name__)
@@ -343,6 +343,7 @@ async def hardsub_remote_url(
     *,
     quality_profile: str = "balanced",
     resize: Optional[tuple[int, int]] = None,
+    style_key: str = DEFAULT_STYLE_KEY,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
     url_cb: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -352,12 +353,12 @@ async def hardsub_remote_url(
     ASS (police/contour/ombre) avant envoi puisque FreeConvert applique
     tel quel le style écrit dans le fichier sous-titre reçu.
 
-    Le style appliqué n'est plus un profil unique passé en paramètre : depuis
-    la refonte de `house_style.apply_hardsub_style`, chaque nom de style
-    trouvé dans le fichier source (TopLeft, TopCenter, ..., BottomCenter,
-    Default, ou un nom tiers inconnu) reçoit automatiquement le bon profil
-    (dialogue ou accent) avec le bon alignment — fidèle au fichier ASS
-    Crunchyroll de référence. On ne force donc plus un `style=` ici.
+    `style_key` sélectionne le preset de rendu ("a" ou "b", voir
+    house_style.STYLE_PRESETS) — choisi par l'utilisateur juste après la
+    résolution, avant l'envoi du sous-titre. Chaque nom de style trouvé dans
+    le fichier source (TopLeft, TopCenter, ..., BottomCenter, Default, ou un
+    nom tiers inconnu) reçoit automatiquement le bon alignment pour ce
+    preset — voir house_style.apply_hardsub_style.
 
     resize : optionnel — (largeur, hauteur) cible, ex (854, 480) pour du
     480p. Réduit le temps de traitement FreeConvert ET le poids du fichier
@@ -391,18 +392,15 @@ async def hardsub_remote_url(
     output_name = build_final_name(clean_source_name, override_quality=quality_override, output_ext="mp4")
     output_path = os.path.join(dest_dir, output_name)
 
-    # Pré-stylage : force le rendu, indépendamment de ce que contenait le fichier source.
-    # apply_hardsub_style() n'accepte plus de paramètre `style` : elle applique
-    # elle-même le bon profil par position (voir house_style.py).
-    #
-    # Ce fichier stylé n'est utilisé QUE pour construire le payload envoyé à
-    # FreeConvert (encodage base64 ci-dessous) -- il n'est plus destiné à
-    # être uploadé sur Telegram. On le supprime juste après l'avoir encodé :
-    # le laisser dans dest_dir (job_dir) le ferait ramasser par Leech() comme
-    # un fichier à envoyer en plus de la vidéo, ce qui double le nombre
-    # d'appels d'envoi Telegram par job et augmente le risque de FloodWait.
+    # Pré-stylage : force le rendu choisi (style_key), indépendamment de ce
+    # que contenait le fichier source. Ce fichier stylé n'est utilisé QUE
+    # pour construire le payload envoyé à FreeConvert (encodage base64
+    # ci-dessous) -- il n'est plus destiné à être uploadé sur Telegram. On
+    # le supprime juste après l'avoir encodé : le laisser dans dest_dir
+    # (job_dir) le ferait ramasser par Leech() comme un fichier à envoyer en
+    # plus de la vidéo.
     styled_sub_path = os.path.join(dest_dir, f"{base}.VOSTFR.ass")
-    apply_hardsub_style(subtitle_path, styled_sub_path)
+    apply_hardsub_style(subtitle_path, styled_sub_path, style_key=style_key)
     try:
         subtitle_b64 = _encode_subtitle_b64(styled_sub_path)
     finally:
