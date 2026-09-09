@@ -1,5 +1,5 @@
 r"""
-services/subtitle_style.py
+colab_leecher/house_style.py
 
 Pré-stylage des sous-titres avant hardsub (tous moteurs : CC, FC, FFmpeg local).
 
@@ -27,29 +27,26 @@ bas-centré que pour un nom de style inconnu (raw non-CR, style "Italique",
 MAJ 1 : le profil visuel (police, taille, contour, ombre, marges) est
 désormais IDENTIQUE quelle que soit la position ASS. Seuls l'alignment
 (numpad) et les marges associées changent selon le nom de style trouvé dans
-la source. Avant ce correctif, les lignes non-BottomCenter/Default (ex:
-TopCenter) recevaient un profil "accent" différent (taille 23 au lieu de 22,
-outline 2 sans ombre au lieu de outline 1 + ombre 1), ce qui rendait ces
-lignes visiblement différentes du reste du sous-titre (rendu plus épais et
-sans ombre) alors qu'elles font pourtant partie du même sous-titrage. Le but
-recherché est un seul et même "style maison" partout, avec juste le
-positionnement à l'écran qui change.
+la source.
 
 MAJ 2 : on ne réécrit plus PlayResX/PlayResY à une valeur fixe (640x360).
-Sur des sources autres que Mushoku Tensei S3E9 (raws/fansubs calibrés en
-1920x1080 ou autre), forcer le PlayRes cassait le positionnement de toute
-ligne utilisant des tags \pos()/\move() en coordonnées absolues : ces
-coordonnées sont écrites par rapport au PlayRes DÉCLARÉ par la source, donc
-changer ce PlayRes après coup décale le texte à l'écran, indépendamment du
-style appliqué.
-
 Le moteur de rendu ASS scale de toute façon le rendu (texte ET \pos())
 proportionnellement au ratio "résolution vidéo réelle / PlayRes déclaré".
-On garde donc le PlayRes d'origine du fichier source intact (les \pos()
-restent justes), et on scale à la place fontsize/outline/shadow/margins de
-HOUSE_STYLE selon le ratio "PlayResY_source / 360" (360 = référence
-Mushoku Tensei) pour obtenir la même taille apparente à l'écran, quelle que
-soit la résolution dans laquelle la source a été calibrée.
+On garde donc le PlayRes d'origine du fichier source intact, et on scale à
+la place fontsize/outline/shadow/margins du profil choisi selon le ratio
+"PlayResY_source / 360" (360 = référence Mushoku Tensei) pour obtenir la
+même taille apparente à l'écran, quelle que soit la résolution dans laquelle
+la source a été calibrée.
+
+MAJ 3 (presets multiples) : deux profils de rendu nommés "a" et "b" sont
+désormais disponibles dans STYLE_PRESETS, sélectionnables par l'utilisateur
+avant chaque hardsub (menu Telegram, voir main.py) via le paramètre
+`style_key` de apply_hardsub_style()/apply_house_style(). Actuellement les
+deux presets utilisent la même police (Trebuchet MS) à la demande de
+l'utilisateur — ils produisent donc un rendu visuellement identique. Pour
+les différencier plus tard, il suffit de modifier la valeur de STYLE_B
+ci-dessous (ex: fontname="Arial") ; tout le reste du pipeline (menu, burn
+FC/CC) fonctionne déjà sans autre changement.
 """
 import os
 import re
@@ -77,21 +74,97 @@ class AssStyle:
     margin_v: int = 20
 
 
-# ── Profil unique ─────────────────────────────────────────────────────────
-# Un seul et même rendu visuel (police, taille, contour, ombre) pour TOUTES
-# les positions ASS. Seul l'alignment (et donc la position à l'écran) varie
-# selon le nom de style trouvé dans la source — voir _profile_for_style_name.
-HOUSE_STYLE = AssStyle(fontsize=22, outline=1, shadow=1, alignment=2)
+# ── Profils disponibles ──────────────────────────────────────────────────
+# Style A : profil historique (inchangé) — un seul rendu uniforme
+# (Trebuchet MS) appliqué à tous les noms de style trouvés dans la source,
+# seul l'alignment change selon le nom (voir _profile_for_style_name).
+STYLE_A = AssStyle(fontname="Trebuchet MS", fontsize=22, outline=1, shadow=1, alignment=2)
+
+# Style B : sert de profil de repli pour Style B sur un nom de style non
+# reconnu (voir RAW_CR_STYLE_PROFILES juste en dessous, qui prend le dessus
+# pour les 7 noms standard Crunchyroll).
+STYLE_B = STYLE_A
+
+STYLE_PRESETS: dict[str, AssStyle] = {"a": STYLE_A, "b": STYLE_B}
+DEFAULT_STYLE_KEY = "a"
+
+STYLE_PRESET_LABELS: dict[str, str] = {
+    "a": "Style A",
+    "b": "Style B (CR)",
+}
+
+# ── Style B : reproduction fidèle d'un fichier ASS Crunchyroll de référence ──
+# Contrairement à Style A (un seul rendu uniforme), Style B garde le rendu
+# ORIGINAL par nom de style tel que fourni par Crunchyroll : police, taille,
+# couleurs, contour, ombre et marges propres à chaque nom (Default,
+# Italique, titre-ep, Sign, preview, preview-title, TiretsDefault). Valeurs
+# reprises telles quelles du fichier de référence (PlayRes 640x360) ; comme
+# pour Style A, elles sont mises à l'échelle selon le PlayResY de la source
+# réelle (voir _scale_ass_style / _raw_profile_for_name).
+RAW_CR_STYLE_PROFILES: dict[str, AssStyle] = {
+    "Default": AssStyle(
+        fontname="Trebuchet MS", fontsize=22,
+        primary_colour="&H00FFFFFF", secondary_colour="&H000000FF",
+        outline_colour="&H00000000", back_colour="&H00000000",
+        bold=0, italic=0, border_style=1, outline=2, shadow=1,
+        alignment=2, margin_l=2, margin_r=2, margin_v=25,
+    ),
+    "Italique": AssStyle(
+        fontname="Trebuchet MS", fontsize=22,
+        primary_colour="&H00FFFFFF", secondary_colour="&H000000FF",
+        outline_colour="&H00000000", back_colour="&H00000000",
+        bold=0, italic=-1, border_style=1, outline=2, shadow=1,
+        alignment=2, margin_l=2, margin_r=2, margin_v=25,
+    ),
+    "titre-ep": AssStyle(
+        fontname="Times New Roman", fontsize=18,
+        primary_colour="&H00FFFFFF", secondary_colour="&H000000FF",
+        outline_colour="&H00000000", back_colour="&H00000000",
+        bold=-1, italic=0, border_style=1, outline=1, shadow=1,
+        alignment=3, margin_l=10, margin_r=42, margin_v=70,
+    ),
+    "Sign": AssStyle(
+        fontname="Arial", fontsize=18,
+        primary_colour="&H00FFFFFF", secondary_colour="&H00CF002D",
+        outline_colour="&H00212121", back_colour="&H00000000",
+        bold=-1, italic=0, border_style=1, outline=2, shadow=0,
+        alignment=8, margin_l=10, margin_r=10, margin_v=20,
+    ),
+    "preview": AssStyle(
+        fontname="Times New Roman", fontsize=22,
+        primary_colour="&H00FFFDFC", secondary_colour="&H000000FF",
+        outline_colour="&H00FFFFFF", back_colour="&H00CB8F4B",
+        bold=-1, italic=0, border_style=1, outline=0, shadow=0,
+        alignment=8, margin_l=10, margin_r=10, margin_v=25,
+    ),
+    "preview-title": AssStyle(
+        fontname="Times New Roman", fontsize=22,
+        primary_colour="&H002B2C2A", secondary_colour="&H000000FF",
+        outline_colour="&H00FFFFFF", back_colour="&H00CB8F4B",
+        bold=0, italic=0, border_style=1, outline=0, shadow=0,
+        alignment=8, margin_l=10, margin_r=10, margin_v=25,
+    ),
+    "TiretsDefault": AssStyle(
+        fontname="Trebuchet MS", fontsize=22,
+        primary_colour="&H00FFFFFF", secondary_colour="&H000000FF",
+        outline_colour="&H00000000", back_colour="&H00000000",
+        bold=0, italic=0, border_style=1, outline=2, shadow=1,
+        alignment=1, margin_l=20, margin_r=2, margin_v=25,
+    ),
+}
+
+
+def normalize_style_key(style_key: str | None) -> str:
+    key = (style_key or DEFAULT_STYLE_KEY).strip().lower()
+    return key if key in STYLE_PRESETS else DEFAULT_STYLE_KEY
+
 
 # Alias conservés pour compat (ancien code/imports qui référencerait encore
-# ces noms) : les deux profils "dialogue" et "accent" sont désormais
-# strictement identiques.
-DIALOGUE_STYLE = HOUSE_STYLE
-ACCENT_STYLE = HOUSE_STYLE
-
-# Style par défaut utilisé pour tout nom de style non reconnu (fallback sûr,
-# identique au comportement de l'ancienne version).
-DEFAULT_HARDSUB_STYLE = HOUSE_STYLE
+# ces noms).
+HOUSE_STYLE = STYLE_A
+DIALOGUE_STYLE = STYLE_A
+ACCENT_STYLE = STYLE_A
+DEFAULT_HARDSUB_STYLE = STYLE_A
 
 # Alignment ASS (numpad layout) par nom de style CR standard.
 STYLE_NAME_ALIGNMENT = {
@@ -104,10 +177,7 @@ STYLE_NAME_ALIGNMENT = {
 # Noms de style (hors les 9 positions CR standard) qui désignent en réalité
 # des incrustations à l'écran (cartons de titre, panneaux, texte visible
 # dans l'image) plutôt que du dialogue -- ex: "Sign" chez Erai-raws et la
-# plupart des fansubs. Gardé comme signal supplémentaire en complément de la
-# détection par tags (voir _classify_style_names) : un nom qui matche ici est
-# toujours traité comme overlay même si ses lignes n'ont, par coïncidence,
-# aucun tag graphique (fichier très simple, ex: juste "SIGN" en texte brut).
+# plupart des fansubs.
 _SIGN_STYLE_MARKERS = ("sign", "signe", "carton", "panneau", "onscreen", "on-screen")
 _OVERLAY_ALIGNMENT = 8  # top-center — évite la collision avec le dialogue en bas
 
@@ -115,27 +185,17 @@ _OVERLAY_ALIGNMENT = 8  # top-center — évite la collision avec le dialogue en
 # nom de compétence/monstre, carton de titre...) plutôt qu'une simple ligne
 # de dialogue : changement de couleur, taille de police custom, flou,
 # masque de révélation, fondu, animation, échelle horizontale/verticale.
-# Une ligne de dialogue normale (même "Italique" ou "TiretsDefault") n'a
-# jamais ces tags — au pire un simple {\i1}/{\i0}.
 _OVERLAY_TAG_PATTERN = re.compile(
     r"\\c&|\\[1234]c&|\\fs\d|\\blur|\\clip\(|\\fad\(|\\t\(|\\fscx|\\fscy"
 )
 # \pos()/\move() sans \an accompagnant sur la même ligne : la position réelle
-# à l'écran dépend alors de l'Alignment du Style (c'est lui qui définit quel
-# point du texte correspond aux coordonnées données). Changer l'alignment
-# d'un tel style casserait le placement calculé par le fansubber -- il faut
-# impérativement garder l'alignment déclaré par la source pour ces noms-là.
+# à l'écran dépend alors de l'Alignment du Style.
 _POS_TAG_PATTERN = re.compile(r"\\pos\(|\\move\(")
 _AN_TAG_PATTERN = re.compile(r"\\an[0-9]")
 
 # Noms de style qui désignent une variante EN ITALIQUE du dialogue (pensées,
 # narration, voix off...) -- ex: "Italique" chez Erai-raws et la plupart des
-# fansubs FR. HOUSE_STYLE a italic=0 par défaut (texte droit) : sans ce
-# correctif, un style nommé "Italique" perdrait son italique après passage
-# dans notre outil, quelle que soit la valeur Italic déclarée par la source,
-# puisqu'on réécrit tout le bloc [V4+ Styles] avec un seul profil commun.
-# Détection par sous-chaîne insensible à la casse -> couvre "Italique",
-# "Italic", "ItaliqueDefault", etc.
+# fansubs FR.
 _ITALIC_STYLE_MARKERS = ("italiq", "italic")
 
 # Résolution de référence du script — DOIT matcher celle du fichier source
@@ -146,32 +206,42 @@ PLAY_RES_X = 640
 PLAY_RES_Y = 360
 
 
-def _scale_house_style(source_play_res_y: int) -> AssStyle:
-    """
-    Renvoie HOUSE_STYLE mis à l'échelle pour que sa taille apparente à
-    l'écran reste identique quel que soit le PlayResY déclaré par la
-    source (au lieu de forcer un PlayRes fixe, ce qui casserait les
-    \\pos()/\\move() en coordonnées absolues déjà présents dans le fichier).
-
-    Le ratio est calculé par rapport à PLAY_RES_Y (360, la résolution de
-    référence de Mushoku Tensei) : une source calibrée en 1080p (PlayResY
-    ~1080) aura donc un fontsize/outline/shadow/margins x3 par rapport aux
-    valeurs de base de HOUSE_STYLE, pour un rendu visuellement équivalent.
-    """
+def _resolution_scale(source_play_res_y: int) -> float:
+    """Ratio par rapport à PLAY_RES_Y (360, référence Mushoku Tensei/CR)."""
     if not source_play_res_y or source_play_res_y <= 0:
-        scale = 1.0
-    else:
-        scale = source_play_res_y / PLAY_RES_Y
+        return 1.0
+    return source_play_res_y / PLAY_RES_Y
 
+
+def _scale_ass_style(base_style: AssStyle, scale: float) -> AssStyle:
+    """Met `base_style` à l'échelle (fontsize/outline/shadow/margins) pour
+    obtenir la même taille apparente à l'écran quel que soit le PlayResY de
+    la source réelle (voir _resolution_scale)."""
     return replace(
-        HOUSE_STYLE,
-        fontsize=max(1, round(HOUSE_STYLE.fontsize * scale)),
-        outline=round(HOUSE_STYLE.outline * scale, 2),
-        shadow=round(HOUSE_STYLE.shadow * scale, 2),
-        margin_l=max(0, round(HOUSE_STYLE.margin_l * scale)),
-        margin_r=max(0, round(HOUSE_STYLE.margin_r * scale)),
-        margin_v=max(0, round(HOUSE_STYLE.margin_v * scale)),
+        base_style,
+        fontsize=max(1, round(base_style.fontsize * scale)),
+        outline=round(base_style.outline * scale, 2),
+        shadow=round(base_style.shadow * scale, 2),
+        margin_l=max(0, round(base_style.margin_l * scale)),
+        margin_r=max(0, round(base_style.margin_r * scale)),
+        margin_v=max(0, round(base_style.margin_v * scale)),
     )
+
+
+def _scale_house_style(source_play_res_y: int, base_style: AssStyle = STYLE_A) -> AssStyle:
+    """Compat wrapper — voir _scale_ass_style."""
+    return _scale_ass_style(base_style, _resolution_scale(source_play_res_y))
+
+
+def _raw_profile_for_name(name: str, scale: float) -> AssStyle | None:
+    """Renvoie le profil Style B exact (RAW_CR_STYLE_PROFILES) pour ce nom
+    de style, mis à l'échelle — ou None si ce nom n'est pas l'un des 7 noms
+    standard Crunchyroll (fallback sur le comportement générique Style A
+    dans ce cas, voir apply_hardsub_style)."""
+    base = RAW_CR_STYLE_PROFILES.get(name)
+    if base is None:
+        return None
+    return _scale_ass_style(base, scale)
 
 
 def _classify_style_names(lines: list[str]) -> tuple[dict[str, int], dict[str, bool], dict[str, bool]]:
@@ -184,16 +254,6 @@ def _classify_style_names(lines: list[str]) -> tuple[dict[str, int], dict[str, b
     - si au moins une de ses lignes porte des tags d'incrustation stylée
       (has_overlay_tags) -> candidat à un repositionnement en haut d'écran
       pour éviter toute collision avec le dialogue.
-
-    Ça permet de distinguer automatiquement, sans liste de noms à maintenir
-    à la main :
-    - un vrai variant de dialogue (ex: "Italique", "TiretsDefault") : pas de
-      tags graphiques -> reste aligné comme le dialogue.
-    - une incrustation positionnée à la main via \\pos() (ex: un carton de
-      titre) : alignment déclaré préservé tel quel, pour ne pas casser le
-      point d'ancrage utilisé par le fansubber.
-    - une incrustation sans \\pos() du tout (ex: un encart de statut/jeu) :
-      remontée en haut d'écran pour ne jamais chevaucher le dialogue.
     """
     source_alignment: dict[str, int] = {}
     in_styles = False
@@ -251,17 +311,15 @@ def _profile_for_style_name(
 ) -> AssStyle:
     """
     Retourne l'AssStyle à utiliser pour un nom de style donné, à partir du
-    HOUSE_STYLE déjà mis à l'échelle (scaled_style) pour ce fichier source.
+    profil déjà mis à l'échelle (scaled_style) pour ce fichier source.
 
     Le rendu (police, taille, contour, ombre, marges) est toujours celui de
     scaled_style. Seul l'alignment change, décidé dans cet ordre :
     1. Nom reconnu parmi les 9 positions CR + Default -> alignment correspondant.
     2. Au moins une ligne de ce style utilise \\pos()/\\move() sans \\an
-       -> on garde l'alignment D'ORIGINE déclaré dans la source, pour ne pas
-       casser le point d'ancrage calculé par le fansubber.
+       -> on garde l'alignment D'ORIGINE déclaré dans la source.
     3. Sinon, si le style porte des tags d'incrustation stylée OU que son nom
-       ressemble à un panneau/carton (_SIGN_STYLE_MARKERS) -> haut d'écran,
-       pour ne jamais chevaucher le dialogue.
+       ressemble à un panneau/carton (_SIGN_STYLE_MARKERS) -> haut d'écran.
     4. Sinon (vrai variant de dialogue, ex: "Italique") -> alignment par
        défaut du dialogue (bas-centré), comme avant.
     """
@@ -280,10 +338,6 @@ def _profile_for_style_name(
         else:
             profile = replace(scaled_style, alignment=scaled_style.alignment)
 
-    # Le flag Italic est ensuite ajusté indépendamment de l'alignment : un
-    # nom de style "Italique" doit garder son rendu en italique même s'il a
-    # aussi été classé "overlay" ou "position préservée" ci-dessus -- les
-    # deux logiques (position et italique) sont orthogonales.
     if any(marker in name.lower() for marker in _ITALIC_STYLE_MARKERS):
         profile = replace(profile, italic=-1)
 
@@ -294,10 +348,7 @@ def _ass_style_line(style: AssStyle, name: str = "Default") -> str:
     """Construit la ligne 'Style:' au format ASS v4+."""
     # Certains moteurs de burn-in "simplifiés" (dont FreeConvert) ignorent le
     # flag Bold du style et se contentent de chercher la police par son nom
-    # exact. On ajoute donc "Bold" au nom de la police en plus du flag —
-    # double sécurité qui ne casse rien pour les moteurs qui respectent le
-    # flag normalement (testé/confirmé : forcer le nom donne le même rendu
-    # gras qu'un vrai Bold=-1, indépendamment du flag).
+    # exact. On ajoute donc "Bold" au nom de la police en plus du flag.
     fontname = f"{style.fontname} Bold" if style.bold else style.fontname
     fields = [
         name, fontname, str(style.fontsize),
@@ -331,20 +382,20 @@ def _srt_to_ass(srt_path: str, ass_path: str) -> None:
         raise RuntimeError(f"Échec conversion srt->ass: {result.stderr.decode(errors='ignore')[:300]}")
 
 
-def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
+def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = DEFAULT_STYLE_KEY) -> str:
     """
     Force le style de rendu d'un sous-titre (.srt ou .ass) et écrit le résultat
     en .ass prêt à être envoyé au burn-in (FC, CC, ou FFmpeg local).
 
-    Chaque nom de style trouvé dans le fichier source reçoit le même rendu
-    visuel (HOUSE_STYLE) ; seul l'alignment change selon le nom (voir
-    _profile_for_style_name) : un style "BottomCenter" ou "TopCenter" garde
-    son positionnement d'origine mais un rendu strictement identique
-    (police, taille, contour, ombre), un style non reconnu retombe sur
-    l'alignment bas-centré par défaut.
+    `style_key` sélectionne le profil de rendu à appliquer parmi
+    STYLE_PRESETS ("a" ou "b", voir en haut du fichier). Chaque nom de style
+    trouvé dans le fichier source reçoit ce même rendu visuel ; seul
+    l'alignment change selon le nom (voir _profile_for_style_name).
 
     Retourne le chemin du fichier .ass stylé (= output_path).
     """
+    base_style = STYLE_PRESETS[normalize_style_key(style_key)]
+
     ext = ospath.splitext(subtitle_path)[1].lower()
     work_path = subtitle_path
 
@@ -358,10 +409,6 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
     with open(work_path, "r", encoding="utf-8-sig", errors="replace") as fh:
         lines = fh.readlines()
 
-    # 1er passage : on récupère les noms de tous les styles définis dans le
-    # fichier source (pour l'alignment) ET le PlayResY déclaré par la source
-    # (pour scaler HOUSE_STYLE à une taille apparente équivalente, sans
-    # jamais réécrire le PlayRes lui-même -- voir _scale_house_style).
     style_names: list[str] = []
     source_play_res_y: int = 0
     in_styles_scan = False
@@ -387,19 +434,21 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
     if not style_names:
         style_names = ["Default"]
 
-    # PlayResY absent/à 0 (rare, certains raws n'en déclarent pas) -> on
-    # suppose la référence Mushoku Tensei (360), donc scale = 1.0, aucun
-    # changement de taille par rapport au comportement actuel.
-    scaled_style = _scale_house_style(source_play_res_y or PLAY_RES_Y)
+    scale = _resolution_scale(source_play_res_y or PLAY_RES_Y)
+    scaled_style = _scale_ass_style(base_style, scale)
+    normalized_key = normalize_style_key(style_key)
 
-    # Analyse des lignes [Events] pour détecter, par nom de style : un \pos()
-    # non ancré (alignment source à préserver) ou des tags d'incrustation
-    # stylée (candidat à un repositionnement en haut d'écran) -- voir
-    # _classify_style_names pour le détail du raisonnement.
     source_alignment, has_unanchored_pos, has_overlay_tags = _classify_style_names(lines)
 
-    # 2e passage : on reconstruit le fichier en remplaçant tout le bloc de
-    # styles par une ligne "Style:" par nom trouvé, chacune avec son alignment.
+    def _resolve_profile(name: str) -> AssStyle:
+        if normalized_key == "b":
+            raw = _raw_profile_for_name(name, scale)
+            if raw is not None:
+                return raw
+        return _profile_for_style_name(
+            name, scaled_style, source_alignment, has_unanchored_pos, has_overlay_tags
+        )
+
     out_lines: list[str] = []
     in_styles_section = False
     styles_written = False
@@ -407,39 +456,25 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
     for line in lines:
         stripped = line.strip()
 
-        # PlayResX/PlayResY de la source ne sont PLUS réécrits : les
-        # \pos()/\move() déjà présents dans le fichier sont calculés par
-        # rapport à ce PlayRes d'origine. Le renderer ASS scale de toute
-        # façon tout le rendu (texte + coordonnées) selon le ratio
-        # résolution_vidéo/PlayRes, donc garder le PlayRes source préserve
-        # le positionnement -- c'est le scaling de HOUSE_STYLE
-        # (_scale_house_style) qui compense pour garder la même taille
-        # apparente de police.
-
         if stripped.lower() in ("[v4+ styles]", "[v4 styles]"):
             in_styles_section = True
             out_lines.append("[V4+ Styles]\n")
             out_lines.append(_STYLE_FORMAT_HEADER + "\n")
             for name in style_names:
-                profile = _profile_for_style_name(
-                    name, scaled_style, source_alignment, has_unanchored_pos, has_overlay_tags
-                )
+                profile = _resolve_profile(name)
                 out_lines.append(_ass_style_line(profile, name=name) + "\n")
             styles_written = True
             continue
 
         if in_styles_section:
-            # On saute tout l'ancien bloc de styles (Format: + toutes les Style:)
             if stripped.startswith("[") and stripped.lower() not in ("[v4+ styles]", "[v4 styles]"):
                 in_styles_section = False
                 out_lines.append(line)
-            # sinon on ignore la ligne (ancien Format:/Style:)
             continue
 
         out_lines.append(line)
 
     if not styles_written:
-        # Pas de section styles trouvée (rare) -> on l'ajoute avant [Events]
         final_lines: list[str] = []
         inserted = False
         for line in out_lines:
@@ -447,9 +482,7 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
                 final_lines.append("[V4+ Styles]\n")
                 final_lines.append(_STYLE_FORMAT_HEADER + "\n")
                 for name in style_names:
-                    profile = _profile_for_style_name(
-                        name, scaled_style, source_alignment, has_unanchored_pos, has_overlay_tags
-                    )
+                    profile = _resolve_profile(name)
                     final_lines.append(_ass_style_line(profile, name=name) + "\n")
                 final_lines.append("\n")
                 inserted = True
@@ -469,14 +502,16 @@ def apply_hardsub_style(subtitle_path: str, output_path: str) -> str:
 # L'ancien module exposait `async def apply_house_style(sub_path, tmp_dir)`,
 # appelé ainsi dans le reste du pipeline (hardsub CC/FC/local) :
 #
-#     styled_path = await subtitle_style.apply_house_style(sub_path, tmp_dir)
+#     styled_path = await house_style.apply_house_style(sub_path, tmp_dir)
 #
-# Ce wrapper garde ce point d'entrée fonctionnel sans toucher aux call sites,
-# en le faisant passer par la nouvelle logique apply_hardsub_style() ci-dessus.
-async def apply_house_style(sub_path: str, tmp_dir: str) -> str:
+# Ce wrapper garde ce point d'entrée fonctionnel sans toucher aux call sites
+# existants qui n'ont pas encore de sélection de style (ils utilisent alors
+# le style par défaut "a"), en le faisant passer par la nouvelle logique
+# apply_hardsub_style() ci-dessus.
+async def apply_house_style(sub_path: str, tmp_dir: str, style_key: str = DEFAULT_STYLE_KEY) -> str:
     out_path = os.path.join(tmp_dir, "hs_house_styled.ass")
     try:
-        return apply_hardsub_style(sub_path, out_path)
+        return apply_hardsub_style(sub_path, out_path, style_key=style_key)
     except Exception:
         # Fallback silencieux comme l'ancien module : le job continue avec
         # le sous-titre original plutôt que de planter.
