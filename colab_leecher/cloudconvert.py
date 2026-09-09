@@ -14,7 +14,7 @@ from typing import Awaitable, Callable, Optional
 
 import aiohttp
 
-from colab_leecher.house_style import apply_hardsub_style
+from colab_leecher.house_style import apply_hardsub_style, DEFAULT_STYLE_KEY
 from colab_leecher.smart_rename import build_final_name, resolution_label
 
 log = logging.getLogger(__name__)
@@ -540,19 +540,20 @@ async def _create_hardsub_job(
     crf: int,
     preset: str,
     scale_height: int = 0,
+    style_key: str = DEFAULT_STYLE_KEY,
 ) -> dict:
     v_safe = _arg_safe(video_filename)
     s_safe = _arg_safe(subtitle_filename)
     o_safe = _arg_safe(output_filename)
 
-    # Force notre house style (police/gras/contour/ombre, alignment par
-    # position) avant l'envoi, comme pour FreeConvert — sinon ffmpeg
+    # Force le preset de style choisi (police/gras/contour/ombre, alignment
+    # par position) avant l'envoi, comme pour FreeConvert — sinon ffmpeg
     # utiliserait le style brut du fichier source, qui varie selon d'où
     # vient le sous-titre. apply_hardsub_style() choisit le profil tout
-    # seul par nom de style (BottomCenter/TopCenter/...), plus de
-    # paramètre `style` à lui passer.
+    # seul par nom de style (BottomCenter/TopCenter/...) pour le preset
+    # sélectionné (style_key).
     styled_sub_path = subtitle_path + ".styled.ass"
-    apply_hardsub_style(subtitle_path, styled_sub_path)
+    apply_hardsub_style(subtitle_path, styled_sub_path, style_key=style_key)
     with open(styled_sub_path, "rb") as fh:
         subtitle_b64 = base64.b64encode(fh.read()).decode("ascii")
     try:
@@ -780,11 +781,16 @@ async def hardsub_remote_url(
     quality_profile: str = "balanced",
     resolution: str | None = None,
     encode_speed: str | None = None,
+    style_key: str = DEFAULT_STYLE_KEY,
     process_cb: ProgressCB = None,
     download_cb: ProgressCB = None,
     url_cb: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> str:
     """
+    `style_key` sélectionne le preset de rendu ("a" ou "b", voir
+    house_style.STYLE_PRESETS) — choisi par l'utilisateur juste après la
+    résolution.
+
     url_cb : optionnel — appelé avec le lien de téléchargement direct dès
     que CloudConvert a fini son job, AVANT qu'on commence à télécharger le
     résultat. Filet de sécurité : si le download/upload plante ensuite,
@@ -816,6 +822,7 @@ async def hardsub_remote_url(
         crf=crf,
         preset=preset,
         scale_height=scale_height,
+        style_key=style_key,
     )
     job = await _wait_for_job(api_key, job.get("id", "?"), process_cb)
     url = _export_url(job)
