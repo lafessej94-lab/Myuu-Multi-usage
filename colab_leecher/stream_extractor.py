@@ -12,6 +12,7 @@ import subprocess
 import yt_dlp
 from asyncio import get_event_loop
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import unquote
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 _sessions: dict = {}
@@ -44,6 +45,57 @@ def _flag(code: str) -> str:
     return _FLAGS.get(code.split("-")[0].lower()[:3], "🌐")
 
 
+def track_flags(tracks: list[dict]) -> str:
+    """
+    Renvoie les drapeaux (dédupliqués, dans l'ordre d'apparition, séparés
+    par un espace) des langues présentes dans une liste de pistes
+    (video/audio/subs — chaque dict a une clé "lang"). Utilisé sur l'écran
+    "Choose track type" (comptes + drapeaux) et sur les boutons du menu de
+    type — voir kb_type ci-dessous.
+    """
+    seen: list[str] = []
+    flags: list[str] = []
+    for t in tracks:
+        lang = (t.get("lang") or "").split("-")[0].lower()
+        if lang in seen:
+            continue
+        seen.append(lang)
+        flags.append(_flag(t.get("lang") or ""))
+    return " ".join(flags) if flags else "🌐"
+
+
+# Codec audio (nom ffprobe) -> vraie extension de fichier. Utilisé pour
+# l'extraction "-c copy" (voir dl_audio/_dl_ffmpeg plus bas) : sans ce
+# mapping toutes les pistes audio sortaient en .mka générique quel que
+# soit le codec réel, au lieu de leur conteneur natif (.mp3, .aac, .opus,
+# .wav pour du PCM, etc.). -c copy ne réencode pas, donc changer
+# l'extension ne marche que si le conteneur cible supporte ce codec tel
+# quel -- la table ci-dessous ne liste que des paires codec/conteneur
+# valides pour un simple remux.
+_AUDIO_CODEC_EXT: dict[str, str] = {
+    "aac": "aac",
+    "mp3": "mp3",
+    "opus": "opus",
+    "vorbis": "ogg",
+    "flac": "flac",
+    "ac3": "ac3",
+    "eac3": "eac3",
+    "dts": "dts",
+    "truehd": "thd",
+    "alac": "m4a",
+    "pcm_s16le": "wav",
+    "pcm_s24le": "wav",
+    "pcm_s32le": "wav",
+    "pcm_f32le": "wav",
+    "wmav1": "wma",
+    "wmav2": "wma",
+}
+
+
+def _audio_ext(codec_name: str) -> str:
+    return _AUDIO_CODEC_EXT.get((codec_name or "").lower(), "mka")
+
+
 # ─── ffprobe (liens directs, fichiers locaux) ─
 
 def _ffprobe_sync(url: str) -> dict | None:
@@ -74,7 +126,10 @@ def _parse_ffprobe(info: dict, url: str) -> dict:
     fmt       = info.get("format", {})
     duration  = float(fmt.get("duration") or 0)
     total_sz  = int(fmt.get("size") or 0)
-    title     = fmt.get("tags", {}).get("title") or url.split("/")[-1][:80]
+    # unquote : l'URL (ex: liens seedr) arrive souvent avec "%20" etc. à la
+    # place des espaces -- sans ça le titre affiché dans le menu Stream
+    # Extractor gardait les "%20" littéraux au lieu d'espaces.
+    title     = fmt.get("tags", {}).get("title") or unquote(url.split("/")[-1])[:80]
 
     videos, audios, subs = [], [], []
 
@@ -131,7 +186,7 @@ def _parse_ffprobe(info: dict, url: str) -> dict:
                 "abr": br // 1000 if br else 0,
                 "sz": sz, "lang": lang,
                 "map": f"0:{idx}",
-                "ext": "mka",
+                "ext": _audio_ext(codec_name),
             })
 
         elif codec_type == "subtitle":
@@ -300,11 +355,13 @@ def clear_session(chat_id: int):
 
 # ─── keyboards ────────────────────────────────
 
-def kb_type(v, a, s) -> InlineKeyboardMarkup:
+def kb_type(session) -> InlineKeyboardMarkup:
+    v, a, s = session["video"], session["audio"], session["subs"]
+    v_flags, a_flags, s_flags = track_flags(v), track_flags(a), track_flags(s)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🎬 Vidéo  ({v})",       callback_data="sx_video"),
-         InlineKeyboardButton(f"🎵 Audio  ({a})",       callback_data="sx_audio")],
-        [InlineKeyboardButton(f"💬 Sous-titres  ({s})", callback_data="sx_subs")],
+        [InlineKeyboardButton(f"🎬 Vidéo  ({len(v)})  {v_flags}", callback_data="sx_video"),
+         InlineKeyboardButton(f"🎵 Audio  ({len(a)})  {a_flags}", callback_data="sx_audio")],
+        [InlineKeyboardButton(f"💬 Sous-titres  ({len(s)})  {s_flags}", callback_data="sx_subs")],
         [InlineKeyboardButton("⏎ Retour",               callback_data="sx_back")],
     ])
 
