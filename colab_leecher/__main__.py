@@ -17,6 +17,7 @@ from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR
 from colab_leecher.access import is_allowed as access_is_allowed, is_banned as access_is_banned
 from colab_leecher.status_slideshow import StatusSlideshow
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
+from colab_leecher.house_style import STYLE_PRESET_LABELS
 from colab_leecher.utility.handler import (
     Direct_CC_Hardsub_Handler,
     Direct_FC_Hardsub_Handler,
@@ -94,9 +95,9 @@ BOT.Options.fc_api_keys = [k.strip() for k in str(FC_API_KEY or "").split(",") i
 #   reflète que le tout dernier lien envoyé). Sert aussi de "token" implicite
 #   pour la navigation par sections (lk|sec|...).
 # _pending_fc_subtitle : message_id (du message "Envoie le sous-titre...") ->
-#   {"url":..., "name":...}. Permet plusieurs hardsub FC en attente de
-#   sous-titre en même temps — l'utilisateur répond (reply) au bon message
-#   avec le bon fichier pour lever l'ambiguïté.
+#   {"url":..., "name":..., "resize":..., "style_key":...}. Permet plusieurs
+#   hardsub FC en attente de sous-titre en même temps — l'utilisateur répond
+#   (reply) au bon message avec le bon fichier pour lever l'ambiguïté.
 _link_sessions: dict[int, list[str]] = {}
 _pending_fc_subtitle: dict[int, dict] = {}
 
@@ -106,7 +107,22 @@ _pending_fc_subtitle: dict[int, dict] = {}
 # renvoyer, sans lancer aucun job vidéo.
 _pending_style_sub: dict[int, dict] = {}
 
+# _pending_style_choice : message_id (du prompt "Choisis le style") ->
+#   {"flow": "fc_magnet"|"fc_direct"|"cc_direct", ...données du flow...}.
+# Étape intermédiaire insérée après le choix de résolution (FC magnet, FC
+# direct, CC direct) et avant l'étape suivante (lancement direct, ou prompt
+# sous-titre) — le flow "cc_seedr" n'en a PAS besoin, il stocke directement
+# le style choisi dans _cc_hardsub_session (déjà keyé par message_id).
+_pending_style_choice: dict[int, dict] = {}
+
 _AUDIO_EXTS = (".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus")
+
+
+def _style_kb(flow: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"🅰️ {STYLE_PRESET_LABELS.get('a', 'Style A')}", callback_data=f"hs_style|{flow}|a"),
+        InlineKeyboardButton(f"🅱️ {STYLE_PRESET_LABELS.get('b', 'Style B')}", callback_data=f"hs_style|{flow}|b"),
+    ]])
 
 
 def _fmt_hms(seconds: float) -> str:
@@ -267,14 +283,14 @@ _CC_RES_CODE_TO_LABEL: dict[str, str] = {
 }
 
 # _pending_cc_subtitle : message_id (du prompt "envoie le sous-titre") ->
-# {"url": str, "name": str, "resolution": str|None}. Namespace séparé de
-# _pending_fc_subtitle pour ne pas mélanger les deux moteurs si les deux
-# flows tournent en même temps.
+# {"url": str, "name": str, "resolution": str|None, "style_key": str}.
+# Namespace séparé de _pending_fc_subtitle pour ne pas mélanger les deux
+# flows si les deux flows tournent en même temps.
 _pending_cc_subtitle: dict[int, dict] = {}
 
 
-# ── CC Hardsub : résolution puis vitesse d'encodage, choisies avant de lancer ──
-# _cc_hardsub_session : message_id -> {"magnet": str, "resolution": str|None}
+# ── CC Hardsub : résolution puis style puis vitesse d'encodage, choisis avant de lancer ──
+# _cc_hardsub_session : message_id -> {"magnet": str, "resolution": str|None, "style_key": str|None}
 _cc_hardsub_session: dict[int, dict] = {}
 
 CC_RESOLUTION_LABELS: dict[str, str] = {
@@ -1214,10 +1230,97 @@ async def callbacks(client, cq):
         await cq.message.edit_text(
             "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"Résolution : <code>{CC_RESOLUTION_LABELS.get(resolution, resolution)}</code>\n\n"
-            "Choisis la vitesse d'encodage :\n"
-            "<i>Plus rapide = moins de compression, fichier un peu plus lourd.</i>",
-            reply_markup=_cc_speed_kb(),
+            "Choisis le style de sous-titre :",
+            reply_markup=_style_kb("cc_seedr"),
         )
+        return
+
+    # ── Choix du style (Style A / Style B) — inséré après le choix de
+    # résolution sur les 4 flows hardsub. "cc_seedr" stocke directement le
+    # choix dans _cc_hardsub_session (déjà keyé par message.id) puis affiche
+    # le clavier de vitesse ; les 3 autres flows utilisent _pending_style_choice
+    # et reprennent l'étape qui suivait la résolution AVANT cet ajout
+    # (lancement direct pour fc_magnet, prompt sous-titre pour fc_direct/cc_direct).
+    if data.startswith("hs_style|"):
+        _, flow, style_key = data.split("|", 2)
+        style_key = style_key if style_key in ("a", "b") else "a"
+
+        if flow == "cc_seedr":
+            session = _cc_hardsub_session.get(cq.message.id)
+            if not session:
+                await cq.answer("Session expirée, renvoie le lien.", show_alert=True)
+                return
+            session["style_key"] = style_key
+            await cq.answer()
+            await cq.message.edit_text(
+                "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Résolution : <code>{CC_RESOLUTION_LABELS.get(session.get('resolution'), session.get('resolution'))}</code>\n"
+                f"Style : <code>{STYLE_PRESET_LABELS.get(style_key, style_key)}</code>\n\n"
+                "Choisis la vitesse d'encodage :\n"
+                "<i>Plus rapide = moins de compression, fichier un peu plus lourd.</i>",
+                reply_markup=_cc_speed_kb(),
+            )
+            return
+
+        pending = _pending_style_choice.pop(cq.message.id, None)
+        if not pending or pending.get("flow") != flow:
+            await cq.answer("Session expirée, renvoie le lien.", show_alert=True)
+            return
+
+        if flow == "fc_magnet":
+            await cq.answer("🆓 Hardsub FreeConvert démarré (en parallèle)")
+            await cq.message.delete()
+            job_status_msg = await StatusSlideshow().start(
+                BOT.TargetChat,
+                text="⏳ <i>Starting Seedr + FreeConvert hardsub job...</i>",
+            )
+            get_event_loop().create_task(
+                Seedr_FC_Hardsub_Handler(
+                    pending["magnet"], job_status_msg,
+                    resize=pending.get("resize"), style_key=style_key,
+                )
+            )
+            return
+
+        if flow == "fc_direct":
+            await cq.answer()
+            prompt = await cq.message.edit_text(
+                "🆓 <b>FREECONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<code>{pending['name']}</code>\n\n"
+                "📎 <b>Réponds à ce message</b> (reply) avec le fichier de sous-titres "
+                "(<code>.ass</code> ou <code>.srt</code>) à utiliser.\n\n"
+                "<i>Le style sélectionné sera appliqué automatiquement. "
+                "Tu peux lancer un autre lien pendant que celui-ci tourne.</i>",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✖ Annuler", callback_data="fc_hardsub_cancel"),
+                ]]),
+            )
+            _pending_fc_subtitle[prompt.id] = {
+                "url": pending["url"], "name": pending["name"],
+                "resize": pending.get("resize"), "style_key": style_key,
+            }
+            return
+
+        if flow == "cc_direct":
+            await cq.answer()
+            prompt = await cq.message.edit_text(
+                "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<code>{pending['name']}</code>\n\n"
+                "📎 <b>Réponds à ce message</b> (reply) avec le fichier de sous-titres "
+                "(<code>.ass</code> ou <code>.srt</code>) à utiliser.\n\n"
+                "<i>Le style sélectionné sera appliqué automatiquement. "
+                "Tu peux lancer un autre lien pendant que celui-ci tourne.</i>",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✖ Annuler", callback_data="cc_hardsub_cancel"),
+                ]]),
+            )
+            _pending_cc_subtitle[prompt.id] = {
+                "url": pending["url"], "name": pending["name"],
+                "resolution": pending.get("resolution"), "style_key": style_key,
+            }
+            return
+
+        await cq.answer("Flow inconnu.", show_alert=True)
         return
 
     if data.startswith("cc_speed|"):
@@ -1232,6 +1335,7 @@ async def callbacks(client, cq):
 
         magnet = session["magnet"]
         resolution = session.get("resolution")
+        style_key = session.get("style_key", "a")
 
         await cq.message.delete()
         MSG.status_msg = await StatusSlideshow().start(
@@ -1249,7 +1353,7 @@ async def callbacks(client, cq):
         TaskInfo.set(phase="process", engine="Seedr+CloudConvert", started_at=datetime.now().timestamp())
         BOT.Mode.type = "seedr_cc_hardsub"
         BOT.TASK = get_event_loop().create_task(
-            Seedr_CC_Hardsub_Handler(magnet, resolution=resolution, encode_speed=speed)
+            Seedr_CC_Hardsub_Handler(magnet, resolution=resolution, encode_speed=speed, style_key=style_key)
         )
         await BOT.TASK
         BOT.State.task_going = False
@@ -1289,13 +1393,13 @@ async def callbacks(client, cq):
             await cq.answer("Session expirée ou déjà lancé.", show_alert=True)
             return
 
-        await cq.answer("🆓 Hardsub FreeConvert démarré (en parallèle)")
-        await cq.message.delete()
-        job_status_msg = await StatusSlideshow().start(
-            BOT.TargetChat,
-            text="⏳ <i>Starting Seedr + FreeConvert hardsub job...</i>",
+        await cq.answer()
+        await cq.message.edit_text(
+            "🆓 <b>FREECONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Choisis le style de sous-titre :",
+            reply_markup=_style_kb("fc_magnet"),
         )
-        get_event_loop().create_task(Seedr_FC_Hardsub_Handler(magnet, job_status_msg, resize=resize))
+        _pending_style_choice[cq.message.id] = {"flow": "fc_magnet", "magnet": magnet, "resize": resize}
         return
 
     # ── FreeConvert Hardsub sur lien direct (sous-titre fourni manuellement) ──
@@ -1330,18 +1434,14 @@ async def callbacks(client, cq):
 
         name = BOT.Options.custom_name or os.path.basename(urlparse(url).path) or "video.mp4"
 
-        prompt = await cq.message.edit_text(
+        await cq.answer()
+        await cq.message.edit_text(
             "🆓 <b>FREECONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<code>{name}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec le fichier de sous-titres "
-            "(<code>.ass</code> ou <code>.srt</code>) à utiliser.\n\n"
-            "<i>Le style (police, gras, contour...) sera appliqué automatiquement. "
-            "Tu peux lancer un autre lien pendant que celui-ci tourne.</i>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="fc_hardsub_cancel"),
-            ]]),
+            "Choisis le style de sous-titre :",
+            reply_markup=_style_kb("fc_direct"),
         )
-        _pending_fc_subtitle[prompt.id] = {"url": url, "name": name, "resize": resize}
+        _pending_style_choice[cq.message.id] = {"flow": "fc_direct", "url": url, "name": name, "resize": resize}
         return
 
     # ── CloudConvert Hardsub sur lien direct (sous-titre fourni manuellement) ──
@@ -1375,18 +1475,16 @@ async def callbacks(client, cq):
 
         name = BOT.Options.custom_name or os.path.basename(urlparse(url).path) or "video.mp4"
 
-        prompt = await cq.message.edit_text(
+        await cq.answer()
+        await cq.message.edit_text(
             "☁️ <b>CLOUDCONVERT HARDSUB</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<code>{name}</code>\n\n"
-            "📎 <b>Réponds à ce message</b> (reply) avec le fichier de sous-titres "
-            "(<code>.ass</code> ou <code>.srt</code>) à utiliser.\n\n"
-            "<i>Le style (police, gras, contour...) sera appliqué automatiquement. "
-            "Tu peux lancer un autre lien pendant que celui-ci tourne.</i>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Annuler", callback_data="cc_hardsub_cancel"),
-            ]]),
+            "Choisis le style de sous-titre :",
+            reply_markup=_style_kb("cc_direct"),
         )
-        _pending_cc_subtitle[prompt.id] = {"url": url, "name": name, "resolution": resolution}
+        _pending_style_choice[cq.message.id] = {
+            "flow": "cc_direct", "url": url, "name": name, "resolution": resolution,
+        }
         return
 
     if data == "cc_hardsub_cancel":
@@ -1852,6 +1950,7 @@ async def handle_subtitle_document(client, message):
             Direct_CC_Hardsub_Handler(
                 pending_cc["url"], pending_cc["name"], subtitle_path, status_msg,
                 resolution=pending_cc.get("resolution"),
+                style_key=pending_cc.get("style_key", "a"),
             )
         )
         return
@@ -1919,7 +2018,10 @@ async def handle_subtitle_document(client, message):
     # Fire-and-forget : ne bloque pas ce handler, donc le bot reste réactif
     # pour recevoir d'autres liens/sous-titres pendant que celui-ci tourne.
     get_event_loop().create_task(
-        Direct_FC_Hardsub_Handler(pending["url"], pending["name"], subtitle_path, status_msg, resize=pending.get("resize"))
+        Direct_FC_Hardsub_Handler(
+            pending["url"], pending["name"], subtitle_path, status_msg,
+            resize=pending.get("resize"), style_key=pending.get("style_key", "a"),
+        )
     )
 
 
