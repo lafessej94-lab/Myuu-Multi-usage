@@ -655,7 +655,7 @@ async def Seedr_CC_Convert_Handler(magnet: str) -> None:
             await _del_folder(seedr_user, seedr_pwd, folder_id)
 
 
-async def Seedr_CC_Hardsub_Handler(magnet: str, resolution: str | None = None, encode_speed: str | None = None) -> None:
+async def Seedr_CC_Hardsub_Handler(magnet: str, resolution: str | None = None, encode_speed: str | None = None, style_key: str = "a") -> None:
     if not _seedr_ready():
         await cancelTask("Seedr credentials are missing in your Colab launcher.")
         return
@@ -721,6 +721,7 @@ async def Seedr_CC_Hardsub_Handler(magnet: str, resolution: str | None = None, e
                 cc_mode=BOT.Options.cc_engine_mode,
                 quality_profile=BOT.Options.cc_quality_profile,
                 encode_speed=encode_speed,
+                style_key=style_key,
                 process_cb=_process_cb,
                 download_cb=_download_cb,
             )
@@ -735,7 +736,7 @@ async def Seedr_CC_Hardsub_Handler(magnet: str, resolution: str | None = None, e
             await _del_folder(seedr_user, seedr_pwd, folder_id)
 
 
-async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, int] | None = None) -> None:
+async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, int] | None = None, style_key: str = "a") -> None:
     """
     Équivalent de Seedr_CC_Hardsub_Handler mais via FreeConvert au lieu de
     CloudConvert. Même pipeline : Seedr -> sonde la piste FR -> extrait le
@@ -828,6 +829,7 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
                     job_dir,
                     quality_profile=BOT.Options.cc_quality_profile,
                     resize=resize,
+                    style_key=style_key,
                     process_cb=_process_cb,
                     download_cb=_download_cb,
                     url_cb=_url_cb,
@@ -850,7 +852,7 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
                     shutil.rmtree(d, ignore_errors=True)
 
 
-async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: str, status_msg, resolution: str | None = None) -> None:
+async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: str, status_msg, resolution: str | None = None, style_key: str = "a") -> None:
     """
     Équivalent CloudConvert de Direct_FC_Hardsub_Handler : hardsub sur un
     lien direct (Seedr, HTTP classique...) avec sous-titre fourni
@@ -912,6 +914,7 @@ async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
                 cc_mode=BOT.Options.cc_engine_mode,
                 quality_profile=BOT.Options.cc_quality_profile,
                 resolution=resolution,
+                style_key=style_key,
                 process_cb=_process_cb,
                 download_cb=_download_cb,
                 url_cb=_url_cb,
@@ -935,7 +938,7 @@ async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
                 shutil.rmtree(job_dir, ignore_errors=True)
 
 
-async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: str, status_msg, resize: tuple[int, int] | None = None) -> None:
+async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: str, status_msg, resize: tuple[int, int] | None = None, style_key: str = "a") -> None:
     """
     Hardsub FreeConvert sur un lien direct (ex: lien Seedr, lien HTTP classique),
     avec un fichier de sous-titres fourni manuellement par l'utilisateur —
@@ -996,6 +999,7 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
                 job_dir,
                 quality_profile=BOT.Options.cc_quality_profile,
                 resize=resize,
+                style_key=style_key,
                 process_cb=_process_cb,
                 download_cb=_download_cb,
                 url_cb=_url_cb,
