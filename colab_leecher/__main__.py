@@ -53,7 +53,7 @@ from colab_leecher.house_style import apply_house_style
 from colab_leecher.stream_extractor import (
     analyse, get_session, clear_session,
     kb_type, kb_video, kb_audio, kb_subs,
-    dl_video, dl_audio, dl_sub,
+    dl_video, dl_audio, dl_sub, track_flags,
 )
 
 # ── Sectioned link menu (Download / Inspect / Process / Cloud), mirroring
@@ -1861,14 +1861,17 @@ async def _show_type_menu(msg, session):
     a = len(session["audio"])
     s = len(session["subs"])
     title = session["title"]
+    v_flags = track_flags(session["video"])
+    a_flags = track_flags(session["audio"])
+    s_flags = track_flags(session["subs"])
     await msg.edit_text(
         "🎞 <b>STREAM EXTRACTOR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📌  <b>{title}</b>\n\n"
-        f"🎬  Video tracks     <code>{v}</code>\n"
-        f"🎵  Audio tracks     <code>{a}</code>\n"
-        f"💬  Subtitles        <code>{s}</code>\n\n"
+        f"🎬  Video tracks     <code>{v}</code>  {v_flags}\n"
+        f"🎵  Audio tracks     <code>{a}</code>  {a_flags}\n"
+        f"💬  Subtitles        <code>{s}</code>  {s_flags}\n\n"
         "Choose track type:",
-        reply_markup=kb_type(v, a, s)
+        reply_markup=kb_type(session)
     )
 
 
