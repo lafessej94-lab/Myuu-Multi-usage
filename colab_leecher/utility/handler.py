@@ -61,6 +61,19 @@ from colab_leecher.utility.helper import (
     render_task_status, shortFileName, sizeUnit, sysINFO,
 )
 
+# ── Extracted services (see services/job_views.py and
+#    services/subtitle_probe.py) — pure text builders and ffprobe/ffmpeg
+#    helpers pulled out of this file to remove duplication. The rendered
+#    status text and job behavior are unchanged; only where the code lives
+#    changed.
+from services.job_views import fc_job_status_view, seedr_status_view
+from services.subtitle_probe import (
+    run_tracked_process,
+    probe_remote_video,
+    pick_french_text_subtitle,
+    extract_subtitle_from_url,
+)
+
 
 async def _finish_status(status_msg, text: str, reply_markup=None) -> None:
     """Affiche le texte FINAL d'un job (succès/échec/annulation) et arrête
@@ -209,7 +222,7 @@ async def _rewrite_video_title(path: str, title: str) -> None:
     ext = ospath.splitext(path)[1]
     tmp_path = f"{path}.retitled.tmp{ext}"
     try:
-        await _run_tracked_process(
+        await run_tracked_process(
             [
                 "ffmpeg", "-y",
                 "-i", path,
@@ -326,13 +339,6 @@ async def Leech(folder_path: str, remove: bool, convert_videos: bool = True, sta
             else:
                 upload_name = file_name
 
-            # IMPORTANT : on renomme aussi le fichier RÉEL sur le disque pour
-            # qu'il porte upload_name, pas juste la variable Python. Sans ça,
-            # upload_file() envoie un fichier dont le nom local (celui que
-            # Telegram enregistre pour le download) reste le vrai nom
-            # d'origine -- seule la caption affichée dans le chat montrait
-            # le nom modifié, ce qui explique pourquoi retélécharger le
-            # fichier depuis Telegram redonnait le vrai nom.
             if upload_name != ospath.basename(new_path):
                 renamed_path = ospath.join(ospath.dirname(new_path), upload_name)
                 try:
@@ -344,10 +350,6 @@ async def Leech(folder_path: str, remove: bool, convert_videos: bool = True, sta
                         new_path, renamed_path, exc,
                     )
 
-            # Réécrit le tag "title" du conteneur pour qu'il corresponde au
-            # nom final (voir _rewrite_video_title) -- évite que Telegram
-            # Desktop ne suggère un vieux nom underscoré embarqué dans les
-            # métadonnées d'origine au moment du téléchargement.
             if fileType(new_path) == "video":
                 await _rewrite_video_title(new_path, ospath.splitext(upload_name)[0])
 
@@ -507,28 +509,6 @@ def _seedr_video_files(files: list[dict]) -> list[dict]:
     return sorted(videos, key=lambda item: int(item.get("size", 0) or 0), reverse=True)
 
 
-async def _run_tracked_process(args: list[str], label: str) -> tuple[str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    ProcessTracker.register(proc.pid, label)
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
-    except asyncio.TimeoutError as exc:
-        proc.kill()
-        raise RuntimeError(f"{label} timed out after 1800 seconds") from exc
-    finally:
-        ProcessTracker.unregister(proc.pid)
-    out = stdout.decode("utf-8", errors="replace")
-    err = stderr.decode("utf-8", errors="replace")
-    if proc.returncode != 0:
-        detail = err.strip() or out.strip() or f"{label} failed with code {proc.returncode}"
-        raise RuntimeError(detail)
-    return out, err
-
-
 def _tail_log(lines: int = 80) -> str:
     try:
         if not ospath.exists(Paths.LOG_PATH):
@@ -541,27 +521,28 @@ def _tail_log(lines: int = 80) -> str:
 
 
 async def _seedr_status(kind: str, stage: str, pct: float, detail: str, filename: str = "") -> None:
-    pct = max(0.0, min(float(pct), 100.0))
+    """Thin wrapper: text comes from services.job_views.seedr_status_view
+    (pure, no I/O); only the TaskInfo.set() side effect and the actual
+    edit_text() + try/except live here. Rendered text is unchanged."""
+    pct_clamped = max(0.0, min(float(pct), 100.0))
     TaskInfo.set(
         phase="process",
         engine="Seedr+CloudConvert",
         filename=filename or TaskInfo.filename or Messages.download_name,
-        percentage=pct,
+        percentage=pct_clamped,
         speed=detail,
         eta="-",
     )
-    text = (
-        f"☁️ <b>{kind}</b>\n\n"
-        f"<code>{filename or Messages.download_name or 'Seedr job'}</code>\n\n"
-        f"<b>Stage</b>  <code>{stage}</code>\n"
-        f"<b>Progress</b>  <code>{pct:.1f}%</code>\n"
-        f"<b>Mode</b>  <code>{cc_mode_label(BOT.Options.cc_engine_mode)}</code>\n"
-        f"<b>Preset</b>  <code>{quality_label(BOT.Options.cc_quality_profile)}</code>\n"
-        f"<b>Detail</b>  <code>{detail}</code>"
+    text = seedr_status_view(
+        kind, stage, pct, detail, filename,
+        task_msg_prefix=Messages.task_msg,
+        engine_mode_label=cc_mode_label(BOT.Options.cc_engine_mode),
+        quality_label=quality_label(BOT.Options.cc_quality_profile),
+        sys_info=sysINFO(),
     )
     try:
         await MSG.status_msg.edit_text(
-            text=Messages.task_msg + text + sysINFO(),
+            text=text,
             reply_markup=keyboard(),
             disable_web_page_preview=True,
         )
@@ -590,122 +571,24 @@ CC_HARDSUB_CONCURRENCY = 5
 _cc_hardsub_semaphore = asyncio.Semaphore(CC_HARDSUB_CONCURRENCY)
 
 
-_KIND_EMOJI = {
-    "FreeConvert Hardsub": "🆓",
-    "CloudConvert Hardsub": "☁️",
-    "Seedr + FreeConvert Hardsub": "🆓",
-    "Burn Subs": "🖥️",
-    "Mux Subs": "🖥️",
-}
-
-
 async def _fc_job_status(status_msg, kind: str, stage: str, pct: float, detail: str, filename: str = "", job_id: str = "") -> None:
-    """Comme _seedr_status, mais édite un message dédié à CE job précis
-    plutôt que le MSG.status_msg global — permet à plusieurs jobs FreeConvert
-    de tourner en parallèle sans que leurs messages de statut ne s'écrasent.
+    """Thin wrapper: text/keyboard come from services.job_views.fc_job_status_view
+    (pure, no I/O); only the actual edit_text() + try/except live here.
+    Rendered text is unchanged.
 
-    `job_id`, quand fourni, ajoute un bouton ❌ Cancel branché sur
-    ActiveJobs.cancel(job_id) — pour les jobs lancés en asyncio.create_task
-    (FC hardsub direct-link, FFmpeg local burn/mux) qui ne passent pas par
-    BOT.TASK/cancelTask() du pipeline leech classique."""
-    pct = max(0.0, min(float(pct), 100.0))
-    emoji = _KIND_EMOJI.get(kind, "⚙️")
-    text = render_task_status(
-        emoji=emoji,
-        title=kind.upper(),
-        filename=filename or "job",
-        pct=pct,
-        lines=[
-            ("Stage", stage),
-            ("Detail", detail),
-            ("Preset", fc_quality_label(BOT.Options.cc_quality_profile)),
-            ("Engine", kind),
-        ],
-        stop_hint=f"/canceljob_{job_id}" if job_id else "Tap ❌ Cancel below",
-    )
-    kb = (
-        InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"canceljob_{job_id}")]])
-        if job_id else None
+    `job_id`, when provided, still adds the ❌ Cancel button wired to
+    ActiveJobs.cancel(job_id) — for jobs launched via asyncio.create_task
+    (FC hardsub direct-link, FFmpeg local burn/mux) that don't go through
+    BOT.TASK/cancelTask() of the classic leech pipeline."""
+    text, kb = fc_job_status_view(
+        kind, stage, pct, detail, filename, job_id,
+        quality_label=fc_quality_label(BOT.Options.cc_quality_profile),
+        render_task_status=render_task_status,
     )
     try:
         await status_msg.edit_text(text, disable_web_page_preview=True, reply_markup=kb)
     except Exception:
         pass
-
-
-async def _probe_remote_video(url: str) -> dict:
-    out, _ = await _run_tracked_process(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_streams",
-            "-show_format",
-            url,
-        ],
-        "ffprobe",
-    )
-    return json.loads(out or "{}")
-
-
-def _pick_french_text_subtitle(info: dict) -> dict | None:
-    allowed = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
-    best = None
-    best_score = -1
-    for stream in info.get("streams") or []:
-        if str(stream.get("codec_type") or "").lower() != "subtitle":
-            continue
-        codec = str(stream.get("codec_name") or "").lower()
-        if codec not in allowed:
-            continue
-        tags = {str(k).lower(): str(v).lower() for k, v in (stream.get("tags") or {}).items()}
-        lang = tags.get("language", "")
-        title = " ".join(filter(None, [tags.get("title", ""), tags.get("handler_name", "")]))
-        score = 0
-        if lang in {"fr", "fra", "fre"}:
-            score += 100
-        elif "fr" in lang or "french" in lang:
-            score += 70
-        if "vostfr" in title:
-            score += 40
-        if "french" in title or "francais" in title or "français" in title:
-            score += 30
-        if "full" in title:
-            score += 5
-        if "forced" in title:
-            score += 3
-        if score > best_score:
-            best = stream
-            best_score = score
-    return best if best_score > 0 else None
-
-
-async def _extract_subtitle_from_url(video_url: str, stream: dict, dest_dir: str, stem: str) -> str:
-    os.makedirs(dest_dir, exist_ok=True)
-    codec = str(stream.get("codec_name") or "").lower()
-    ext = ".ass" if codec in {"ass", "ssa"} else ".srt"
-    out_path = ospath.join(dest_dir, f"{stem}.fr{ext}")
-    sub_codec = "ass" if ext == ".ass" else "srt"
-    stream_index = int(stream.get("index"))
-    await _run_tracked_process(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            video_url,
-            "-map",
-            f"0:{stream_index}",
-            "-c:s",
-            sub_codec,
-            out_path,
-        ],
-        "ffmpeg-subtitle",
-    )
-    if not ospath.exists(out_path) or ospath.getsize(out_path) == 0:
-        raise RuntimeError("Subtitle extraction produced an empty file.")
-    return out_path
 
 
 async def Seedr_CC_Convert_Handler(magnet: str) -> None:
@@ -809,13 +692,13 @@ async def Seedr_CC_Hardsub_Handler(magnet: str, resolution: str | None = None, e
             base_end = 30.0 + (((idx + 1) / total) * 55.0)
 
             await _seedr_status("Seedr + CloudConvert Hardsub", "Probe", base_start, "Inspecting subtitle streams", name)
-            probe = await _probe_remote_video(video_url)
-            sub_stream = _pick_french_text_subtitle(probe)
+            probe = await probe_remote_video(video_url)
+            sub_stream = pick_french_text_subtitle(probe)
             if not sub_stream:
                 raise RuntimeError(f"No French text subtitle stream found in {name}")
 
             await _seedr_status("Seedr + CloudConvert Hardsub", "Extract", base_start + 6.0, "Extracting French subtitles", name)
-            subtitle_path = await _extract_subtitle_from_url(video_url, sub_stream, subtitle_dir, stem)
+            subtitle_path = await extract_subtitle_from_url(video_url, sub_stream, subtitle_dir, stem)
 
             async def _process_cb(pct: float, detail: str, filename: str = name) -> None:
                 overall = (base_start + 10.0) + ((base_end - (base_start + 10.0)) * max(0.0, min(pct, 100.0)) / 100.0)
@@ -898,13 +781,13 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
                 base_end = 30.0 + (((idx + 1) / total) * 55.0)
 
                 await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Probe", base_start, "Inspecting subtitle streams", name)
-                probe = await _probe_remote_video(video_url)
-                sub_stream = _pick_french_text_subtitle(probe)
+                probe = await probe_remote_video(video_url)
+                sub_stream = pick_french_text_subtitle(probe)
                 if not sub_stream:
                     raise RuntimeError(f"No French text subtitle stream found in {name}")
 
                 await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Extract", base_start + 6.0, "Extracting French subtitles", name)
-                subtitle_path = await _extract_subtitle_from_url(video_url, sub_stream, subtitle_dir, stem)
+                subtitle_path = await extract_subtitle_from_url(video_url, sub_stream, subtitle_dir, stem)
 
                 async def _process_cb(pct: float, detail: str, filename: str = name) -> None:
                     overall = (base_start + 10.0) + ((base_end - (base_start + 10.0)) * max(0.0, min(pct, 100.0)) / 100.0)
@@ -916,9 +799,6 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
 
                 await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Queue", base_start + 10.0, "Submitting FreeConvert hardsub job", name)
 
-                # Nom qui sera réellement utilisé à l'upload (voir smart_rename.py) —
-                # affiché ici au lieu du vrai nom d'origine, pour cohérence avec
-                # le fichier qu'on recevra à la fin.
                 _quality_override = resolution_label(resize[1]) if resize else None
                 _renamed_name = build_final_name(name, override_quality=_quality_override, output_ext="mp4")
 
@@ -1001,9 +881,6 @@ async def Direct_CC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
 
             await _fc_job_status(status_msg, "CloudConvert Hardsub", "Queue", 5.0, "Submitting CloudConvert hardsub job", name)
 
-            # Nom qui sera réellement utilisé à l'upload (voir smart_rename.py) —
-            # affiché ici au lieu du vrai nom d'origine, pour cohérence avec
-            # le fichier qu'on recevra à la fin.
             _res = (resolution or "").strip().lower()
             _quality_override = resolution if _res and _res != "original" else None
             _renamed_name = build_final_name(name, override_quality=_quality_override, output_ext="mp4")
@@ -1090,9 +967,6 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
 
             await _fc_job_status(status_msg, "FreeConvert Hardsub", "Queue", 5.0, "Submitting FreeConvert hardsub job", name, job_id=job_id)
 
-            # Nom qui sera réellement utilisé à l'upload (voir smart_rename.py) —
-            # affiché ici au lieu du vrai nom d'origine, pour cohérence avec
-            # le fichier qu'on recevra à la fin.
             _quality_override = resolution_label(resize[1]) if resize else None
             _renamed_name = build_final_name(name, override_quality=_quality_override, output_ext="mp4")
 
@@ -1147,25 +1021,11 @@ async def Direct_FC_Hardsub_Handler(video_url: str, name: str, subtitle_path: st
                 shutil.rmtree(job_dir, ignore_errors=True)
 
 
-# ═════════════════════════════════════════════════════════════
-# Video Converter local (ffmpeg sur le CPU de Colab)
-#
-# Contrairement à FreeConvert (qui tourne sur leurs serveurs), l'encodage ici
-# consomme le CPU partagé de Colab — on limite donc la concurrence à 2 jobs
-# max (au lieu de 3 pour FreeConvert), sinon les encodages se marchent
-# dessus et ralentissent tout le monde au lieu d'aider.
-# ═════════════════════════════════════════════════════════════
-
 LOCAL_CONVERT_CONCURRENCY = 5
 _local_convert_semaphore = asyncio.Semaphore(LOCAL_CONVERT_CONCURRENCY)
 
 
 async def Local_Video_Convert_Handler(source_message, height: int, status_msg) -> None:
-    """
-    Télécharge une vidéo envoyée directement au bot (message Telegram), la
-    convertit en local à la résolution demandée via ffmpeg, puis l'upload.
-    Job isolé (dossier + message de statut dédiés), comme les jobs FreeConvert.
-    """
     job_id = uuid.uuid4().hex[:8]
     job_dir = f"{Paths.temp_cc_path}_local_{job_id}"
     makedirs(job_dir, exist_ok=True)
@@ -1203,11 +1063,6 @@ async def Local_Video_Convert_Handler(source_message, height: int, status_msg) -
 
 
 async def Local_Merge_Handler(video_message, audio_path: str, status_msg) -> None:
-    """
-    Fusionne une vidéo envoyée au bot avec un fichier audio séparé (envoyé
-    ensuite en reply). Traitement local ffmpeg, même sémaphore CPU que le
-    Video Converter (pas de course entre les deux pour le CPU Colab).
-    """
     job_id = uuid.uuid4().hex[:8]
     job_dir = f"{Paths.temp_cc_path}_merge_{job_id}"
     makedirs(job_dir, exist_ok=True)
@@ -1248,7 +1103,6 @@ async def Local_Merge_Handler(video_message, audio_path: str, status_msg) -> Non
 
 
 async def Local_Thumb_Handler(source_message, status_msg) -> None:
-    """Extrait un thumbnail à un timestamp aléatoire (10%-90% de la durée)."""
     job_id = uuid.uuid4().hex[:8]
     job_dir = f"{Paths.temp_cc_path}_thumb_{job_id}"
     makedirs(job_dir, exist_ok=True)
@@ -1279,7 +1133,6 @@ async def Local_Thumb_Handler(source_message, status_msg) -> None:
 
 
 async def Local_Screenshots_Handler(source_message, status_msg, count: int = 5) -> None:
-    """Prend N screenshots répartis sur la durée (avec jitter aléatoire)."""
     job_id = uuid.uuid4().hex[:8]
     job_dir = f"{Paths.temp_cc_path}_shots_{job_id}"
     makedirs(job_dir, exist_ok=True)
@@ -1381,28 +1234,18 @@ async def Local_Compress_Handler(source_message, status_msg, crf: int = 28) -> N
 
 
 async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: bool) -> None:
-    """burn=True -> hardsub (incrusté, ré-encodé) ; burn=False -> mux (piste, copy)."""
     job_id = uuid.uuid4().hex[:8]
     job_dir = f"{Paths.temp_cc_path}_subs_{job_id}"
     makedirs(job_dir, exist_ok=True)
     kind = "Burn Subs" if burn else "Mux Subs"
     ActiveJobs.register(job_id, asyncio.current_task())
 
-    # Vrai nom du fichier source, pour le rename automatique — pris sur le
-    # message Telegram lui-même : video_message.download() sauvegarde sous
-    # un nom fixe "source_video", donc le chemin local ne porte pas le vrai
-    # nom (titre/saison-épisode/qualité/plateforme).
     real_name = (
         getattr(video_message.video, "file_name", None)
         or getattr(video_message.document, "file_name", None)
         or "video.mp4"
     )
 
-    # Nom final calculé AVANT la conversion ffmpeg (au lieu d'après), pour
-    # pouvoir passer directement le bon titre à burn_subtitles/mux_subtitles :
-    # celles-ci écrivent ce titre dans les métadonnées du conteneur de sortie
-    # et effacent celles copiées par défaut depuis la source (qui pouvaient
-    # contenir le vrai nom d'origine dans leur tag "title").
     renamed_output_ext = "mp4" if burn else "mkv"
     if BOT.Options.custom_name:
         has_ext = bool(ospath.splitext(BOT.Options.custom_name)[1])
@@ -1411,16 +1254,7 @@ async def Local_Subs_Handler(video_message, sub_path: str, status_msg, burn: boo
             else f"{BOT.Options.custom_name}.{renamed_output_ext}"
         )
     else:
-        # Rename automatique : reprend le vrai nom (titre/saison-épisode/
-        # qualité/plateforme), langue normalisée en VOSTFR, tag de fin
-        # remplacé par Myuus-Raws (voir smart_rename.py). Pas de resize sur
-        # ce moteur local -> pas d'override de qualité (contrairement à
-        # FreeConvert/CloudConvert).
         built_name = build_final_name(real_name, output_ext=renamed_output_ext)
-        # Si le nom réel ne matche pas le format attendu, build_final_name
-        # renvoie real_name inchangé : dans ce cas on garde quand même le
-        # vrai nom d'origine (juste avec la bonne extension), plutôt qu'un
-        # nom de fichier temporaire généré localement sans signification.
         real_base = ospath.splitext(real_name)[0]
         upload_name = built_name if built_name != real_name else f"{real_base}.{renamed_output_ext}"
     metadata_title = ospath.splitext(upload_name)[0]
@@ -1669,15 +1503,7 @@ async def Local_Metadata_Handler(source_message, status_msg) -> None:
             shutil.rmtree(job_dir, ignore_errors=True)
 
 
-
 async def _burn_prefix_suffix_in_dir(job_dir: str, status_msg, label: str) -> None:
-    """Grave BOT.Setting.prefix/suffix directement dans l'image de chaque
-    vidéo trouvée dans job_dir, EN PLACE (remplace le fichier d'origine).
-    No-op silencieux si prefix et suffix sont vides — c'est le comportement
-    historique (juste dans le nom de fichier/caption) qui continue à
-    s'appliquer dans ce cas. status_msg peut être None (pipeline Seedr+CC
-    historique, pas de message dédié) : dans ce cas on grave sans notifier
-    de progression détaillée, juste un log."""
     prefix = (BOT.Setting.prefix or "").strip()
     suffix = (BOT.Setting.suffix or "").strip()
     if not prefix and not suffix:
@@ -1792,11 +1618,6 @@ async def cancelTask(reason: str):
     )
     log_tail = _tail_log(60)
 
-    # NOTE : on stoppe explicitement le diaporama de MSG.status_msg ICI,
-    # AVANT le edit_text — sinon (cas du pipeline leech normal/CC, qui
-    # passe par ce MSG.status_msg global) la boucle 5s continuerait à
-    # tourner indéfiniment après un cancel, exactement comme pour les jobs
-    # FC/local qui appelaient status_msg.edit_text() directement.
     if hasattr(MSG.status_msg, "stop"):
         try:
             await MSG.status_msg.stop()
@@ -1849,8 +1670,6 @@ def _in_mode_tag() -> str:
 
 
 async def _owner_tag() -> str:
-    """@username du propriétaire du bot, mis en cache après le 1er appel
-    (évite un appel API get_users à chaque tâche terminée)."""
     global _owner_tag_cache
     if _owner_tag_cache is not None:
         return _owner_tag_cache
