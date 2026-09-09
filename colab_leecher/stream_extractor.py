@@ -31,18 +31,31 @@ def _sz(b) -> str:
     return f"{b:.1f} GB"
 
 _FLAGS = {
+    # ISO 639-1 (2 lettres)
     "en":"🇬🇧","fr":"🇫🇷","de":"🇩🇪","es":"🇪🇸","pt":"🇵🇹",
     "it":"🇮🇹","ru":"🇷🇺","ja":"🇯🇵","ko":"🇰🇷","zh":"🇨🇳",
     "ar":"🇸🇦","hi":"🇮🇳","tr":"🇹🇷","nl":"🇳🇱","pl":"🇵🇱",
     "sv":"🇸🇪","da":"🇩🇰","fi":"🇫🇮","cs":"🇨🇿","uk":"🇺🇦",
     "ro":"🇷🇴","hu":"🇭🇺","el":"🇬🇷","he":"🇮🇱","th":"🇹🇭",
-    "vi":"🇻🇳","id":"🇮🇩","ms":"🇲🇾","no":"🇳🇴","und":"🌐",
+    "vi":"🇻🇳","id":"🇮🇩","ms":"🇲🇾","no":"🇳🇴",
+    # ISO 639-2 (3 lettres) — c'est ce format que ffprobe utilise le plus
+    # souvent dans ses tags "language" (ex: "fre" et non "fr"), d'où le
+    # dico ci-dessus qui ne matchait quasiment jamais avant cet ajout.
+    "eng":"🇬🇧","fre":"🇫🇷","fra":"🇫🇷","ger":"🇩🇪","deu":"🇩🇪",
+    "spa":"🇪🇸","por":"🇵🇹","ita":"🇮🇹","rus":"🇷🇺","jpn":"🇯🇵",
+    "kor":"🇰🇷","chi":"🇨🇳","zho":"🇨🇳","ara":"🇸🇦","hin":"🇮🇳",
+    "tur":"🇹🇷","dut":"🇳🇱","nld":"🇳🇱","pol":"🇵🇱","swe":"🇸🇪",
+    "dan":"🇩🇰","fin":"🇫🇮","cze":"🇨🇿","ces":"🇨🇿","ukr":"🇺🇦",
+    "rum":"🇷🇴","ron":"🇷🇴","hun":"🇭🇺","gre":"🇬🇷","ell":"🇬🇷",
+    "heb":"🇮🇱","tha":"🇹🇭","vie":"🇻🇳","ind":"🇮🇩","may":"🇲🇾",
+    "msa":"🇲🇾","nor":"🇳🇴",
+    "und":"🌐",
 }
 
 def _flag(code: str) -> str:
     if not code:
         return "🌐"
-    return _FLAGS.get(code.split("-")[0].lower()[:3], "🌐")
+    return _FLAGS.get(code.split("-")[0].lower(), "🌐")
 
 
 def track_flags(tracks: list[dict]) -> str:
