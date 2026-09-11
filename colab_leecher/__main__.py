@@ -15,7 +15,10 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot, OWNER
 from colab_leecher.access import is_allowed as access_is_allowed, is_banned as access_is_banned
-from colab_leecher.claude_agent import start_agent, stop_agent, is_agent_running
+from colab_leecher.claude_agent import (
+    start_agent, stop_agent, is_agent_running,
+    search_nyaa, run_manual_hardsub,
+)
 from colab_leecher.status_slideshow import StatusSlideshow
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.house_style import STYLE_PRESET_LABELS
@@ -117,6 +120,14 @@ _pending_style_sub: dict[int, dict] = {}
 _pending_style_choice: dict[int, dict] = {}
 
 _AUDIO_EXTS = (".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus")
+
+# ── /search_claude <nom> — recherche manuelle sur nyaa.si/Erai-raws ─────────
+# Utilisable uniquement quand l'agent est réveillé (/Relève). Contrairement
+# au flow auto (360p ET 720p imposés), ici l'OWNER choisit lui-même UNE
+# seule qualité de sortie.
+# _pending_claude_search : message_id -> {"entry": NyaaEntry} — porte
+# l'entrée trouvée à travers les 2 étapes (Oui/Non puis choix de qualité).
+_pending_claude_search: dict[int, dict] = {}
 
 
 def _style_kb(flow: str) -> InlineKeyboardMarkup:
@@ -413,7 +424,8 @@ async def help_cmd(client, message):
         "  /banned    — list banned users\n"
         "  /broadcast — reply to a message to send it to all authorized users\n"
         "  /Relève    — réveille Claude (agent auto, owner uniquement)\n"
-        "  /Arise     — rendort Claude\n\n"
+        "  /Arise     — rendort Claude\n"
+        "  /search_claude <anime> — recherche + hardsub manuel (Claude réveillé)\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📡 <b>Nyaa Anime Search</b>\n"
         "  /nyaa_search <query> — search Nyaa.si\n"
@@ -685,6 +697,61 @@ async def arise_cmd(client, message):
         await message.reply_text("💤 <b>Claude se rendort.</b>\nTu peux réutiliser le bot normalement.")
     else:
         await message.reply_text("⚠️ Claude n'était pas actif.")
+
+
+def _claude_quality_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 Qualité d'origine", callback_data="claude_res|orig")],
+        [InlineKeyboardButton("360p", callback_data="claude_res|360"),
+         InlineKeyboardButton("480p", callback_data="claude_res|480")],
+        [InlineKeyboardButton("720p", callback_data="claude_res|720")],
+    ])
+
+
+@colab_bot.on_message(filters.command("search_claude") & filters.private)
+async def search_claude_cmd(client, message):
+    if not _owner(message):
+        return
+    await message.delete()
+
+    if not is_agent_running():
+        msg = await message.reply_text(
+            "⚠️ Claude doit être réveillé pour ça — utilise /Relève d'abord.",
+            quote=True,
+        )
+        await sleep(8); await msg.delete()
+        return
+
+    if len(message.command) < 2:
+        msg = await message.reply_text(
+            "Usage: <code>/search_claude nom de l'anime</code>", quote=True,
+        )
+        await sleep(8); await msg.delete()
+        return
+
+    query = " ".join(message.command[1:])
+    status = await message.reply_text(f"🔎 Recherche de <code>{query}</code> sur nyaa.si/Erai-raws...")
+
+    try:
+        entry = await search_nyaa(query)
+    except Exception as exc:
+        await status.edit_text(f"❌ Recherche échouée\n\n<code>{exc}</code>")
+        return
+
+    if not entry:
+        await status.edit_text(f"❌ Aucune release 480p trouvée pour <code>{query}</code>.")
+        return
+
+    _pending_claude_search[status.id] = {"entry": entry}
+    await status.edit_text(
+        "📦 <b>Release trouvée</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<code>{entry.title}</code>\n\n"
+        "Lancer l'encodage ?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Oui", callback_data="claude_search_yes"),
+            InlineKeyboardButton("❌ Non", callback_data="claude_search_no"),
+        ]]),
+    )
 
 
 @colab_bot.on_message(filters.command("settings") & filters.private)
@@ -999,6 +1066,54 @@ async def callbacks(client, cq):
     # ── Labels de section non-cliquables (juste des repères visuels) ──
     if data == "noop":
         await cq.answer()
+        return
+
+    # ── /search_claude : Oui/Non puis choix de qualité (une seule, au
+    # contraire du flow auto qui impose 360p ET 720p) ──────────────────────
+    if data == "claude_search_no":
+        _pending_claude_search.pop(cq.message.id, None)
+        await cq.answer()
+        await cq.message.edit_text("❌ Encodage annulé.")
+        return
+
+    if data == "claude_search_yes":
+        pending = _pending_claude_search.get(cq.message.id)
+        if not pending:
+            await cq.answer("Session expirée, relance /search_claude.", show_alert=True)
+            return
+        await cq.answer()
+        await cq.message.edit_text(
+            "📦 <b>Release trouvée</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<code>{pending['entry'].title}</code>\n\n"
+            "Choisis la qualité de sortie :",
+            reply_markup=_claude_quality_kb(),
+        )
+        return
+
+    if data.startswith("claude_res|"):
+        code = data.split("|", 1)[1]
+        pending = _pending_claude_search.pop(cq.message.id, None)
+        if not pending:
+            await cq.answer("Session expirée, relance /search_claude.", show_alert=True)
+            return
+        if not BOT.Options.fc_api_keys:
+            await cq.answer("FreeConvert API key missing — use /addfc YOUR_KEY.", show_alert=True)
+            return
+
+        entry = pending["entry"]
+        resize = FC_RESOLUTIONS.get(code)
+        quality_label_txt = {
+            "orig": "Qualité d'origine", "360": "360p", "480": "480p", "720": "720p",
+        }.get(code, code)
+
+        await cq.answer()
+        await cq.message.edit_text(
+            f"🤖 <b>Claude démarre l'encodage</b>\n\n"
+            f"<code>{entry.title}</code>\n"
+            f"Qualité : <code>{quality_label_txt}</code>\n\n"
+            "Tu recevras une notification à chaque étape."
+        )
+        get_event_loop().create_task(run_manual_hardsub(entry, resize, quality_label_txt))
         return
 
     # ── Navigation du menu de lien (Download / Inspect / Process / Cloud) ──
