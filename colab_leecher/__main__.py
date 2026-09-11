@@ -739,7 +739,11 @@ async def search_claude_cmd(client, message):
         return
 
     if not entry:
-        await status.edit_text(f"❌ Aucune release 480p trouvée pour <code>{query}</code>.")
+        # NOTE : le message ne mentionne plus "480p" — search_nyaa() accepte
+        # désormais toutes les résolutions pour la recherche manuelle (le
+        # hardsub FreeConvert redimensionne de toute façon la sortie), donc
+        # un échec ici signifie vraiment "rien trouvé", pas "pas en 480p".
+        await status.edit_text(f"❌ Aucune release trouvée pour <code>{query}</code>.")
         return
 
     _pending_claude_search[status.id] = {"entry": entry}
