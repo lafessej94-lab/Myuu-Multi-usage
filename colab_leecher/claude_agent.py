@@ -110,7 +110,19 @@ class NyaaEntry:
     magnet: str
 
 
-def _parse_nyaa_rss(text: str) -> list[NyaaEntry]:
+def _parse_nyaa_rss(text: str, require_480p: bool = True) -> list[NyaaEntry]:
+    """
+    Parse le flux RSS nyaa.si.
+
+    require_480p=True  (poll auto) : ne garde QUE les releases taguées
+      "[480p" dans le titre — l'agent veut toujours partir du plus petit
+      fichier pour que Seedr aille vite.
+    require_480p=False (recherche manuelle) : garde TOUTES les résolutions.
+      Le hardsub FreeConvert redimensionne de toute façon la sortie
+      (360p/720p) quelle que soit la résolution d'entrée, donc filtrer ici
+      ne fait que rejeter des releases valides (720p/1080p only, tag
+      différent, etc.) sans aucun bénéfice.
+    """
     root = ET.fromstring(text)
     entries: list[NyaaEntry] = []
 
@@ -120,7 +132,7 @@ def _parse_nyaa_rss(text: str) -> list[NyaaEntry]:
         guid = (item.findtext("guid") or "").strip()
         magnet = (item.findtext("{https://nyaa.si/xmlns/nyaa}magnetURI") or link).strip()
 
-        if not QUALITY_480P_RE.search(title):
+        if require_480p and not QUALITY_480P_RE.search(title):
             continue
 
         id_match = NYAA_VIEW_ID_RE.search(guid or link)
@@ -137,14 +149,16 @@ async def fetch_nyaa_entries(session: aiohttp.ClientSession) -> list[NyaaEntry]:
     async with session.get(NYAA_RSS_URL, timeout=NYAA_TIMEOUT, headers=NYAA_HEADERS) as resp:
         resp.raise_for_status()
         text = await resp.text()
-    return _parse_nyaa_rss(text)
+    return _parse_nyaa_rss(text, require_480p=True)
 
 
 async def search_nyaa(query: str) -> Optional[NyaaEntry]:
     """
     Recherche manuelle (commande /search_claude) : filtre le flux Erai-raws
-    par mot-clé côté serveur nyaa.si, ne garde que les 480p, retourne la
-    release la plus récente qui correspond.
+    par mot-clé côté serveur nyaa.si, retourne la release la plus récente
+    qui correspond — TOUTES résolutions confondues (voir _parse_nyaa_rss).
+    On préfère quand même une release 480p si plusieurs correspondent,
+    pour rester rapide sur Seedr comme le flow auto.
 
     IMPORTANT : nyaa.si traite un "-" dans la query comme un opérateur
     D'EXCLUSION (ex: "Azur Lane - Ni - 10" est compris comme "Azur Lane"
@@ -157,7 +171,15 @@ async def search_nyaa(query: str) -> Optional[NyaaEntry]:
     """
     from urllib.parse import quote
 
-    sanitized = re.sub(r"[:\-]", " ", query)
+    # Retire d'abord tout bloc entre crochets ("[Erai-raws]", "[480p CR
+    # WEB-DL AVC AAC]", "[MultiSub]", "[B16775B9]", ...) — ce sont des tags
+    # de release group / qualité / hash, pas le titre de l'anime. Les
+    # laisser dans la query cassait la recherche côté nyaa.si quand
+    # l'utilisateur collait le titre brut complet d'une release au lieu de
+    # juste "Nom de l'anime - NN".
+    stripped = re.sub(r"\[[^\]]*\]", " ", query)
+
+    sanitized = re.sub(r"[:\-]", " ", stripped)
     sanitized = re.sub(r"\s+", " ", sanitized).strip()
 
     url = f"https://nyaa.si/?page=rss&u=Erai-raws&q={quote(sanitized)}"
@@ -166,17 +188,25 @@ async def search_nyaa(query: str) -> Optional[NyaaEntry]:
             resp.raise_for_status()
             text = await resp.text()
 
-    entries = _parse_nyaa_rss(text)
+    entries = _parse_nyaa_rss(text, require_480p=False)
 
     # Refiltrage local : chaque mot significatif (>=2 caractères) de la
-    # requête d'origine doit apparaître dans le titre, insensible à la casse.
-    query_words = [w.lower() for w in re.findall(r"\w+", query) if len(w) >= 2]
+    # requête nettoyée (tags entre crochets déjà retirés) doit apparaître
+    # dans le titre, insensible à la casse.
+    query_words = [w.lower() for w in re.findall(r"\w+", stripped) if len(w) >= 2]
     matching = [
         e for e in entries
         if all(w in e.title.lower() for w in query_words)
     ]
+    if not matching:
+        return None
 
-    return matching[0] if matching else (entries[0] if entries else None)
+    # Préfère une release 480p si disponible parmi les correspondances,
+    # sinon prend la première (la plus récente, nyaa.si trie déjà par date).
+    for e in matching:
+        if QUALITY_480P_RE.search(e.title):
+            return e
+    return matching[0]
 
 
 # --------------------------------------------------------------------------
