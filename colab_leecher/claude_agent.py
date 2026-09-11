@@ -110,12 +110,7 @@ class NyaaEntry:
     magnet: str
 
 
-async def fetch_nyaa_entries(session: aiohttp.ClientSession) -> list[NyaaEntry]:
-    """Récupère et parse le flux RSS Erai-raws, ne garde que les 480p."""
-    async with session.get(NYAA_RSS_URL, timeout=NYAA_TIMEOUT, headers=NYAA_HEADERS) as resp:
-        resp.raise_for_status()
-        text = await resp.text()
-
+def _parse_nyaa_rss(text: str) -> list[NyaaEntry]:
     root = ET.fromstring(text)
     entries: list[NyaaEntry] = []
 
@@ -137,6 +132,32 @@ async def fetch_nyaa_entries(session: aiohttp.ClientSession) -> list[NyaaEntry]:
     return entries
 
 
+async def fetch_nyaa_entries(session: aiohttp.ClientSession) -> list[NyaaEntry]:
+    """Récupère et parse le flux RSS Erai-raws (poll auto), ne garde que les 480p."""
+    async with session.get(NYAA_RSS_URL, timeout=NYAA_TIMEOUT, headers=NYAA_HEADERS) as resp:
+        resp.raise_for_status()
+        text = await resp.text()
+    return _parse_nyaa_rss(text)
+
+
+async def search_nyaa(query: str) -> Optional[NyaaEntry]:
+    """
+    Recherche manuelle (commande /search_claude) : filtre le flux Erai-raws
+    par mot-clé côté serveur nyaa.si, ne garde que les 480p, retourne la
+    release la plus récente qui correspond.
+    """
+    from urllib.parse import quote
+
+    url = f"https://nyaa.si/?page=rss&u=Erai-raws&q={quote(query)}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=NYAA_TIMEOUT, headers=NYAA_HEADERS) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+
+    entries = _parse_nyaa_rss(text)
+    return entries[0] if entries else None
+
+
 # --------------------------------------------------------------------------
 # Pipeline : seedr -> sonde/extrait sub FR -> FC hardsub (360p puis 720p)
 # --------------------------------------------------------------------------
@@ -155,75 +176,118 @@ async def _notify_owner(text: str) -> None:
         log.warning("Notif OWNER échouée: %s", exc)
 
 
-async def run_pipeline_for_entry(entry: NyaaEntry) -> None:
-    """
-    Pipeline complet pour un nouvel épisode Erai-raws détecté.
-    Réutilise les briques du repo (seedr, subtitle_probe, freeconvert)
-    plutôt que de les réimplémenter.
-    """
-    log.info("Nouvel épisode détecté: %s (id=%s)", entry.title, entry.id)
-    await _notify_owner(f"🤖 <b>Claude a détecté un nouvel épisode</b>\n\n<code>{entry.title}</code>")
+@dataclass
+class PreparedSource:
+    video_url: str
+    name: str
+    subtitle_path: str
+    job_dir: str
+    subtitle_dir: str
+    folder_id: Optional[str]
+    seedr_user: str
+    seedr_pwd: str
 
-    job_id = uuid.uuid4().hex[:8]
-    job_dir = f"{Paths.temp_cc_path}_claude_{job_id}"
-    subtitle_dir = os.path.join(Paths.WORK_PATH, f"claude_subs_{job_id}")
+
+async def _prepare_source_and_subtitle(entry: NyaaEntry, job_tag: str) -> PreparedSource:
+    """
+    Seedr (magnet -> lien direct) + sonde/extraction de la piste de
+    sous-titres FR. Commun aux deux flows (auto et /search_claude) : le
+    sous-titre n'est extrait qu'une seule fois ici, quel que soit le
+    nombre de hardsub lancés ensuite dessus.
+    """
+    job_dir = f"{Paths.temp_cc_path}_{job_tag}"
+    subtitle_dir = os.path.join(Paths.WORK_PATH, f"subs_{job_tag}")
     os.makedirs(job_dir, exist_ok=True)
     os.makedirs(subtitle_dir, exist_ok=True)
 
-    folder_id = None
-    seedr_user = seedr_pwd = ""
+    await _notify_owner(f"🧲 <code>{entry.title}</code>\nEnvoi vers seedr.cc...")
+    files, folder_id, seedr_user, seedr_pwd = await fetch_urls_via_seedr(entry.magnet)
+    video = _pick_video_file(files)
+    if not video:
+        raise SeedrError("Seedr terminé, mais aucun fichier vidéo trouvé dans le torrent.")
+
+    video_url = video["url"]
+    name = video["name"]
+    stem = os.path.splitext(os.path.basename(name))[0]
+
+    await _notify_owner(f"🔎 <code>{name}</code>\nAnalyse des pistes de sous-titres...")
+    probe = await probe_remote_video(video_url)
+    sub_stream = pick_french_text_subtitle(probe)
+    if not sub_stream:
+        raise RuntimeError(f"Aucune piste de sous-titres FR (texte) trouvée dans {name}")
+
+    subtitle_path = await extract_subtitle_from_url(video_url, sub_stream, subtitle_dir, stem)
+    await _notify_owner(f"💬 Sous-titre FR extrait pour <code>{name}</code>")
+
+    return PreparedSource(
+        video_url=video_url, name=name, subtitle_path=subtitle_path,
+        job_dir=job_dir, subtitle_dir=subtitle_dir,
+        folder_id=folder_id, seedr_user=seedr_user, seedr_pwd=seedr_pwd,
+    )
+
+
+async def _hardsub_and_upload_once(
+    prep: PreparedSource, resize: Optional[tuple[int, int]], quality_label: str,
+) -> None:
+    await _notify_owner(f"🆓 Hardsub FreeConvert {quality_label} (style B) démarré...")
+    output_path = await fc_hardsub_remote_url(
+        ",".join(BOT.Options.fc_api_keys),
+        prep.video_url,
+        prep.name,
+        prep.subtitle_path,
+        prep.job_dir,
+        quality_profile=BOT.Options.cc_quality_profile,
+        resize=resize,
+        style_key=HARDSUB_STYLE_KEY,
+    )
+    await upload_file(output_path, os.path.basename(output_path), is_last=True)
+    await _notify_owner(f"✅ {quality_label} envoyé : <code>{os.path.basename(output_path)}</code>")
+
+
+async def _cleanup_prepared(prep: PreparedSource) -> None:
+    if prep.folder_id and prep.seedr_user and prep.seedr_pwd:
+        await _del_folder(prep.seedr_user, prep.seedr_pwd, prep.folder_id)
+    for d in (prep.job_dir, prep.subtitle_dir):
+        if os.path.exists(d):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+async def run_pipeline_for_entry(entry: NyaaEntry) -> None:
+    """Flow AUTO (agent réveillé) : 360p puis 720p, style B, sans choix."""
+    log.info("Nouvel épisode détecté: %s (id=%s)", entry.title, entry.id)
+    await _notify_owner(f"🤖 <b>Claude a détecté un nouvel épisode</b>\n\n<code>{entry.title}</code>")
+
+    prep: Optional[PreparedSource] = None
     try:
-        # 1. Seedr : magnet -> lien de stream direct
-        await _notify_owner(f"🧲 <code>{entry.title}</code>\nEnvoi vers seedr.cc...")
-        files, folder_id, seedr_user, seedr_pwd = await fetch_urls_via_seedr(entry.magnet)
-        video = _pick_video_file(files)
-        if not video:
-            raise SeedrError("Seedr terminé, mais aucun fichier vidéo trouvé dans le torrent.")
-
-        video_url = video["url"]
-        name = video["name"]
-        stem = os.path.splitext(os.path.basename(name))[0]
-
-        # 2. Sonde + extrait la piste de sous-titres FR (une seule fois,
-        #    réutilisée pour les deux hardsub qui suivent)
-        await _notify_owner(f"🔎 <code>{name}</code>\nAnalyse des pistes de sous-titres...")
-        probe = await probe_remote_video(video_url)
-        sub_stream = pick_french_text_subtitle(probe)
-        if not sub_stream:
-            raise RuntimeError(f"Aucune piste de sous-titres FR (texte) trouvée dans {name}")
-
-        subtitle_path = await extract_subtitle_from_url(video_url, sub_stream, subtitle_dir, stem)
-        await _notify_owner(f"💬 Sous-titre FR extrait pour <code>{name}</code>")
-
-        # 3 & 4. FC hardsub 360p puis 720p, même style, même sous-titre
+        prep = await _prepare_source_and_subtitle(entry, f"claude_{uuid.uuid4().hex[:8]}")
         for quality_label, resize in HARDSUB_QUALITIES:
-            await _notify_owner(f"🆓 Hardsub FreeConvert {quality_label} (style B) démarré...")
-
-            output_path = await fc_hardsub_remote_url(
-                ",".join(BOT.Options.fc_api_keys),
-                video_url,
-                name,
-                subtitle_path,
-                job_dir,
-                quality_profile=BOT.Options.cc_quality_profile,
-                resize=resize,
-                style_key=HARDSUB_STYLE_KEY,
-            )
-
-            await upload_file(output_path, os.path.basename(output_path), is_last=True)
-            await _notify_owner(f"✅ {quality_label} envoyé : <code>{os.path.basename(output_path)}</code>")
-
+            await _hardsub_and_upload_once(prep, resize, quality_label)
         log.info("Pipeline terminé pour %s", entry.title)
-
     except Exception as exc:
         log.exception("Pipeline échoué pour %s", entry.title)
         await _notify_owner(f"❌ <b>Pipeline échoué</b>\n<code>{entry.title}</code>\n\n<code>{exc}</code>")
     finally:
-        if folder_id and seedr_user and seedr_pwd:
-            await _del_folder(seedr_user, seedr_pwd, folder_id)
-        for d in (job_dir, subtitle_dir):
-            if os.path.exists(d):
-                shutil.rmtree(d, ignore_errors=True)
+        if prep:
+            await _cleanup_prepared(prep)
+
+
+async def run_manual_hardsub(
+    entry: NyaaEntry, resize: Optional[tuple[int, int]], quality_label: str,
+) -> None:
+    """
+    Flow MANUEL (/search_claude) : une seule qualité, choisie par
+    l'utilisateur, contrairement au flow auto qui impose 360p ET 720p.
+    """
+    prep: Optional[PreparedSource] = None
+    try:
+        prep = await _prepare_source_and_subtitle(entry, f"search_{uuid.uuid4().hex[:8]}")
+        await _hardsub_and_upload_once(prep, resize, quality_label)
+    except Exception as exc:
+        log.exception("Hardsub manuel échoué pour %s", entry.title)
+        await _notify_owner(f"❌ <b>Hardsub échoué</b>\n<code>{entry.title}</code>\n\n<code>{exc}</code>")
+    finally:
+        if prep:
+            await _cleanup_prepared(prep)
 
 
 # --------------------------------------------------------------------------
