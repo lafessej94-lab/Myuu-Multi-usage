@@ -15,6 +15,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot, OWNER
 from colab_leecher.access import is_allowed as access_is_allowed, is_banned as access_is_banned
+from colab_leecher.claude_agent import start_agent, stop_agent, is_agent_running
 from colab_leecher.status_slideshow import StatusSlideshow
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.house_style import STYLE_PRESET_LABELS
@@ -410,7 +411,9 @@ async def help_cmd(client, message):
         "  /users     — list authorized users (alias /allowed)\n"
         "  /ban /unban — block/unblock a user entirely\n"
         "  /banned    — list banned users\n"
-        "  /broadcast — reply to a message to send it to all authorized users\n\n"
+        "  /broadcast — reply to a message to send it to all authorized users\n"
+        "  /Relève    — réveille Claude (agent auto, owner uniquement)\n"
+        "  /Arise     — rendort Claude\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📡 <b>Nyaa Anime Search</b>\n"
         "  /nyaa_search <query> — search Nyaa.si\n"
@@ -650,6 +653,38 @@ async def stop_bot(client, message):
         await cancelTask("Bot shutdown")
     await message.reply_text("🛑 <b>Shutting down...</b> 👋")
     await sleep(2); await client.stop(); os._exit(0)
+
+
+# ── Intégration Claude : /Relève réveille l'agent (surveillance Erai-raws
+#    + pipeline seedr/hardsub automatique), /Arise le rendort. Owner
+#    uniquement — l'agent n'agit que pour lui, même si d'autres users ont
+#    accès au bot par ailleurs (voir colab_leecher/claude_agent.py).
+@colab_bot.on_message(filters.command("Relève") & filters.private)
+async def releve_cmd(client, message):
+    if not _owner(message):
+        return
+    await message.delete()
+    if start_agent():
+        await message.reply_text(
+            "🤖 <b>Claude est réveillé</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Surveillance de nyaa.si/Erai-raws active (toutes les 20s).\n"
+            "Nouvel épisode détecté → hardsub FC 360p puis 720p (style B) automatique.\n\n"
+            "Utilise /Arise pour l'arrêter."
+        )
+    else:
+        await message.reply_text("⚠️ Claude est déjà actif.")
+
+
+@colab_bot.on_message(filters.command("Arise") & filters.private)
+async def arise_cmd(client, message):
+    if not _owner(message):
+        return
+    await message.delete()
+    if stop_agent():
+        await message.reply_text("💤 <b>Claude se rendort.</b>\nTu peux réutiliser le bot normalement.")
+    else:
+        await message.reply_text("⚠️ Claude n'était pas actif.")
 
 
 @colab_bot.on_message(filters.command("settings") & filters.private)
