@@ -145,17 +145,38 @@ async def search_nyaa(query: str) -> Optional[NyaaEntry]:
     Recherche manuelle (commande /search_claude) : filtre le flux Erai-raws
     par mot-clé côté serveur nyaa.si, ne garde que les 480p, retourne la
     release la plus récente qui correspond.
+
+    IMPORTANT : nyaa.si traite un "-" dans la query comme un opérateur
+    D'EXCLUSION (ex: "Azur Lane - Ni - 10" est compris comme "Azur Lane"
+    SANS "Ni" SANS "10", ce qui exclut la release elle-même puisqu'elle
+    contient justement ces mots). On remplace donc les "-" et ":" par des
+    espaces avant d'envoyer la query à nyaa.si, puis on refiltre localement
+    en vérifiant que chaque mot significatif de la requête d'origine
+    apparaît bien dans le titre — pour rester précis malgré la
+    simplification envoyée au serveur.
     """
     from urllib.parse import quote
 
-    url = f"https://nyaa.si/?page=rss&u=Erai-raws&q={quote(query)}"
+    sanitized = re.sub(r"[:\-]", " ", query)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+
+    url = f"https://nyaa.si/?page=rss&u=Erai-raws&q={quote(sanitized)}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=NYAA_TIMEOUT, headers=NYAA_HEADERS) as resp:
             resp.raise_for_status()
             text = await resp.text()
 
     entries = _parse_nyaa_rss(text)
-    return entries[0] if entries else None
+
+    # Refiltrage local : chaque mot significatif (>=2 caractères) de la
+    # requête d'origine doit apparaître dans le titre, insensible à la casse.
+    query_words = [w.lower() for w in re.findall(r"\w+", query) if len(w) >= 2]
+    matching = [
+        e for e in entries
+        if all(w in e.title.lower() for w in query_words)
+    ]
+
+    return matching[0] if matching else (entries[0] if entries else None)
 
 
 # --------------------------------------------------------------------------
