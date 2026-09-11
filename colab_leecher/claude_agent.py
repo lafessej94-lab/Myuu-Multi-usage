@@ -58,6 +58,10 @@ log = logging.getLogger("claude_agent")
 
 NYAA_RSS_URL = "https://nyaa.si/?page=rss&u=Erai-raws"
 POLL_INTERVAL_SECONDS = 20
+# 15s était trop court pour nyaa.si depuis Colab (TimeoutError en boucle
+# observé en prod) ; nyaa.si peut répondre lentement, surtout sans UA.
+NYAA_TIMEOUT = aiohttp.ClientTimeout(total=30)
+NYAA_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MyuuBot/1.0)"}
 
 DATA_DIR = Path("data")
 SEEN_IDS_FILE = DATA_DIR / "nyaa_seen.json"
@@ -108,7 +112,7 @@ class NyaaEntry:
 
 async def fetch_nyaa_entries(session: aiohttp.ClientSession) -> list[NyaaEntry]:
     """Récupère et parse le flux RSS Erai-raws, ne garde que les 480p."""
-    async with session.get(NYAA_RSS_URL, timeout=15) as resp:
+    async with session.get(NYAA_RSS_URL, timeout=NYAA_TIMEOUT, headers=NYAA_HEADERS) as resp:
         resp.raise_for_status()
         text = await resp.text()
 
