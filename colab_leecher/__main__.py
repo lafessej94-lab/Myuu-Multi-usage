@@ -17,7 +17,7 @@ from colab_leecher import CC_API_KEY, FC_API_KEY, DUMP_ID, SEEDR_PASSWORD, SEEDR
 from colab_leecher.access import is_allowed as access_is_allowed, is_banned as access_is_banned
 from colab_leecher.claude_agent import (
     start_agent, stop_agent, is_agent_running,
-    search_nyaa, run_manual_hardsub,
+    search_nyaa, run_manual_hardsub, get_recent_entries, run_pipeline_for_entry,
 )
 from colab_leecher.status_slideshow import StatusSlideshow
 from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
@@ -128,6 +128,13 @@ _AUDIO_EXTS = (".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus")
 # _pending_claude_search : message_id -> {"entry": NyaaEntry} — porte
 # l'entrée trouvée à travers les 2 étapes (Oui/Non puis choix de qualité).
 _pending_claude_search: dict[int, dict] = {}
+
+# ── Picker "animés récents" affiché juste après /Relève ─────────────────────
+# _pending_claude_picker : message_id -> {"entries": list[NyaaEntry],
+#   "selected": NyaaEntry|None}. Affiche un bouton par animé détecté dans
+# les 15 dernières minutes ; sélectionner un animé montre Done/Cancel pour
+# confirmer avant de lancer l'encodage auto (360p ET 720p, style B).
+_pending_claude_picker: dict[int, dict] = {}
 
 
 def _style_kb(flow: str) -> InlineKeyboardMarkup:
@@ -671,21 +678,67 @@ async def stop_bot(client, message):
 #    + pipeline seedr/hardsub automatique), /Arise le rendort. Owner
 #    uniquement — l'agent n'agit que pour lui, même si d'autres users ont
 #    accès au bot par ailleurs (voir colab_leecher/claude_agent.py).
+def _claude_picker_kb(entries: list) -> InlineKeyboardMarkup:
+    rows = []
+    for i, entry in enumerate(entries):
+        label = entry.title[:60] + ("…" if len(entry.title) > 60 else "")
+        rows.append([InlineKeyboardButton(f"🎬 {label}", callback_data=f"claude_pick|{i}")])
+    rows.append([InlineKeyboardButton("❌ Fermer", callback_data="claude_pick_close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _claude_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Done", callback_data="claude_pick_done"),
+        InlineKeyboardButton("❌ Cancel", callback_data="claude_pick_cancel"),
+    ]])
+
+
 @colab_bot.on_message(filters.command("Relève") & filters.private)
 async def releve_cmd(client, message):
     if not _owner(message):
         return
     await message.delete()
-    if start_agent():
-        await message.reply_text(
+
+    if not start_agent():
+        await message.reply_text("⚠️ Claude est déjà actif.")
+        return
+
+    status = await message.reply_text(
+        "🤖 <b>Claude est réveillé</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Surveillance de nyaa.si/Erai-raws active (toutes les 20s).\n"
+        "Vérification des épisodes des 15 dernières minutes..."
+    )
+
+    try:
+        recent = await get_recent_entries()
+    except Exception as exc:
+        await status.edit_text(
             "🤖 <b>Claude est réveillé</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Surveillance de nyaa.si/Erai-raws active (toutes les 20s).\n"
-            "Nouvel épisode détecté → hardsub FC 360p puis 720p (style B) automatique.\n\n"
-            "Utilise /Arise pour l'arrêter."
+            f"⚠️ Vérification initiale échouée : <code>{exc}</code>\n"
+            "La surveillance continue en arrière-plan."
         )
-    else:
-        await message.reply_text("⚠️ Claude est déjà actif.")
+        return
+
+    if not recent:
+        await status.edit_text(
+            "🤖 <b>Claude est réveillé</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Aucun épisode dans les 15 dernières minutes.\n"
+            "Surveillance active — utilise /Arise pour l'arrêter."
+        )
+        return
+
+    _pending_claude_picker[status.id] = {"entries": recent, "selected": None}
+    await status.edit_text(
+        "🤖 <b>Claude est réveillé</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>{len(recent)} épisode(s)</b> détecté(s) dans les 15 dernières minutes.\n"
+        "Choisis lequel encoder (360p + 720p, style B) :",
+        reply_markup=_claude_picker_kb(recent),
+    )
 
 
 @colab_bot.on_message(filters.command("Arise") & filters.private)
@@ -739,11 +792,7 @@ async def search_claude_cmd(client, message):
         return
 
     if not entry:
-        # NOTE : le message ne mentionne plus "480p" — search_nyaa() accepte
-        # désormais toutes les résolutions pour la recherche manuelle (le
-        # hardsub FreeConvert redimensionne de toute façon la sortie), donc
-        # un échec ici signifie vraiment "rien trouvé", pas "pas en 480p".
-        await status.edit_text(f"❌ Aucune release trouvée pour <code>{query}</code>.")
+        await status.edit_text(f"❌ Aucune release 480p trouvée pour <code>{query}</code>.")
         return
 
     _pending_claude_search[status.id] = {"entry": entry}
@@ -1118,6 +1167,65 @@ async def callbacks(client, cq):
             "Tu recevras une notification à chaque étape."
         )
         get_event_loop().create_task(run_manual_hardsub(entry, resize, quality_label_txt))
+        return
+
+    # ── Picker "animés récents" affiché après /Relève ───────────────────────
+    if data == "claude_pick_close":
+        _pending_claude_picker.pop(cq.message.id, None)
+        await cq.answer()
+        await cq.message.edit_text("🤖 Claude reste réveillé — surveillance active en arrière-plan.")
+        return
+
+    if data.startswith("claude_pick|"):
+        idx = int(data.split("|", 1)[1])
+        pending = _pending_claude_picker.get(cq.message.id)
+        if not pending or idx >= len(pending["entries"]):
+            await cq.answer("Session expirée, relance /Relève.", show_alert=True)
+            return
+        entry = pending["entries"][idx]
+        pending["selected"] = entry
+        await cq.answer()
+        await cq.message.edit_text(
+            "🤖 <b>Confirmation</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<code>{entry.title}</code>\n\n"
+            "Lancer l'encodage (360p + 720p, style B) ?",
+            reply_markup=_claude_confirm_kb(),
+        )
+        return
+
+    if data == "claude_pick_cancel":
+        pending = _pending_claude_picker.get(cq.message.id)
+        if not pending:
+            await cq.answer("Session expirée, relance /Relève.", show_alert=True)
+            return
+        pending["selected"] = None
+        await cq.answer()
+        await cq.message.edit_text(
+            "🤖 <b>Claude est réveillé</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>{len(pending['entries'])} épisode(s)</b> détecté(s) dans les 15 dernières minutes.\n"
+            "Choisis lequel encoder (360p + 720p, style B) :",
+            reply_markup=_claude_picker_kb(pending["entries"]),
+        )
+        return
+
+    if data == "claude_pick_done":
+        pending = _pending_claude_picker.pop(cq.message.id, None)
+        entry = pending.get("selected") if pending else None
+        if not entry:
+            await cq.answer("Session expirée, relance /Relève.", show_alert=True)
+            return
+        if not BOT.Options.fc_api_keys:
+            await cq.answer("FreeConvert API key missing — use /addfc YOUR_KEY.", show_alert=True)
+            return
+
+        await cq.answer()
+        await cq.message.edit_text(
+            f"🤖 <b>Claude démarre l'encodage</b>\n\n"
+            f"<code>{entry.title}</code>\n"
+            "360p puis 720p, style B.\n\n"
+            "Tu recevras une notification à chaque étape."
+        )
+        get_event_loop().create_task(run_pipeline_for_entry(entry))
         return
 
     # ── Navigation du menu de lien (Download / Inspect / Process / Cloud) ──
