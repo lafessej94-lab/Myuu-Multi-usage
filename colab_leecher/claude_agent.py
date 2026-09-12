@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
+from email.utils import parsedate_to_datetime
 
 from colab_leecher import OWNER, colab_bot
 from colab_leecher.utility.variables import BOT, Paths
@@ -76,6 +78,12 @@ HARDSUB_QUALITIES: list[tuple[str, Optional[tuple[int, int]]]] = [
     ("720p", (1280, 720)),
 ]
 
+# Au tout premier démarrage (seen_ids vide), on ne veut pas traiter tout
+# l'historique Erai-raws d'un coup. On marque tout comme "déjà vu" — les
+# épisodes sortis juste avant /Relève sont proposés séparément via
+# get_recent_entries() (bouton de sélection), pas auto-encodés.
+RECENT_WINDOW_SECONDS = 15 * 60
+
 
 # --------------------------------------------------------------------------
 # État persistant : IDs nyaa.si déjà traités
@@ -108,21 +116,10 @@ class NyaaEntry:
     id: int
     title: str
     magnet: str
+    pub_date: Optional[float] = None  # timestamp Unix, None si non parsable
 
 
-def _parse_nyaa_rss(text: str, require_480p: bool = True) -> list[NyaaEntry]:
-    """
-    Parse le flux RSS nyaa.si.
-
-    require_480p=True  (poll auto) : ne garde QUE les releases taguées
-      "[480p" dans le titre — l'agent veut toujours partir du plus petit
-      fichier pour que Seedr aille vite.
-    require_480p=False (recherche manuelle) : garde TOUTES les résolutions.
-      Le hardsub FreeConvert redimensionne de toute façon la sortie
-      (360p/720p) quelle que soit la résolution d'entrée, donc filtrer ici
-      ne fait que rejeter des releases valides (720p/1080p only, tag
-      différent, etc.) sans aucun bénéfice.
-    """
+def _parse_nyaa_rss(text: str) -> list[NyaaEntry]:
     root = ET.fromstring(text)
     entries: list[NyaaEntry] = []
 
@@ -131,15 +128,25 @@ def _parse_nyaa_rss(text: str, require_480p: bool = True) -> list[NyaaEntry]:
         link = (item.findtext("link") or "").strip()
         guid = (item.findtext("guid") or "").strip()
         magnet = (item.findtext("{https://nyaa.si/xmlns/nyaa}magnetURI") or link).strip()
+        pub_date_raw = (item.findtext("pubDate") or "").strip()
 
-        if require_480p and not QUALITY_480P_RE.search(title):
+        if not QUALITY_480P_RE.search(title):
             continue
 
         id_match = NYAA_VIEW_ID_RE.search(guid or link)
         if not id_match or not magnet.startswith("magnet:"):
             continue
 
-        entries.append(NyaaEntry(id=int(id_match.group(1)), title=title, magnet=magnet))
+        pub_ts: Optional[float] = None
+        if pub_date_raw:
+            try:
+                pub_ts = parsedate_to_datetime(pub_date_raw).timestamp()
+            except Exception:
+                pub_ts = None
+
+        entries.append(NyaaEntry(
+            id=int(id_match.group(1)), title=title, magnet=magnet, pub_date=pub_ts,
+        ))
 
     return entries
 
@@ -149,16 +156,14 @@ async def fetch_nyaa_entries(session: aiohttp.ClientSession) -> list[NyaaEntry]:
     async with session.get(NYAA_RSS_URL, timeout=NYAA_TIMEOUT, headers=NYAA_HEADERS) as resp:
         resp.raise_for_status()
         text = await resp.text()
-    return _parse_nyaa_rss(text, require_480p=True)
+    return _parse_nyaa_rss(text)
 
 
 async def search_nyaa(query: str) -> Optional[NyaaEntry]:
     """
     Recherche manuelle (commande /search_claude) : filtre le flux Erai-raws
-    par mot-clé côté serveur nyaa.si, retourne la release la plus récente
-    qui correspond — TOUTES résolutions confondues (voir _parse_nyaa_rss).
-    On préfère quand même une release 480p si plusieurs correspondent,
-    pour rester rapide sur Seedr comme le flow auto.
+    par mot-clé côté serveur nyaa.si, ne garde que les 480p, retourne la
+    release la plus récente qui correspond.
 
     IMPORTANT : nyaa.si traite un "-" dans la query comme un opérateur
     D'EXCLUSION (ex: "Azur Lane - Ni - 10" est compris comme "Azur Lane"
@@ -171,15 +176,7 @@ async def search_nyaa(query: str) -> Optional[NyaaEntry]:
     """
     from urllib.parse import quote
 
-    # Retire d'abord tout bloc entre crochets ("[Erai-raws]", "[480p CR
-    # WEB-DL AVC AAC]", "[MultiSub]", "[B16775B9]", ...) — ce sont des tags
-    # de release group / qualité / hash, pas le titre de l'anime. Les
-    # laisser dans la query cassait la recherche côté nyaa.si quand
-    # l'utilisateur collait le titre brut complet d'une release au lieu de
-    # juste "Nom de l'anime - NN".
-    stripped = re.sub(r"\[[^\]]*\]", " ", query)
-
-    sanitized = re.sub(r"[:\-]", " ", stripped)
+    sanitized = re.sub(r"[:\-]", " ", query)
     sanitized = re.sub(r"\s+", " ", sanitized).strip()
 
     url = f"https://nyaa.si/?page=rss&u=Erai-raws&q={quote(sanitized)}"
@@ -188,25 +185,34 @@ async def search_nyaa(query: str) -> Optional[NyaaEntry]:
             resp.raise_for_status()
             text = await resp.text()
 
-    entries = _parse_nyaa_rss(text, require_480p=False)
+    entries = _parse_nyaa_rss(text)
 
     # Refiltrage local : chaque mot significatif (>=2 caractères) de la
-    # requête nettoyée (tags entre crochets déjà retirés) doit apparaître
-    # dans le titre, insensible à la casse.
-    query_words = [w.lower() for w in re.findall(r"\w+", stripped) if len(w) >= 2]
+    # requête d'origine doit apparaître dans le titre, insensible à la casse.
+    query_words = [w.lower() for w in re.findall(r"\w+", query) if len(w) >= 2]
     matching = [
         e for e in entries
         if all(w in e.title.lower() for w in query_words)
     ]
-    if not matching:
-        return None
 
-    # Préfère une release 480p si disponible parmi les correspondances,
-    # sinon prend la première (la plus récente, nyaa.si trie déjà par date).
-    for e in matching:
-        if QUALITY_480P_RE.search(e.title):
-            return e
-    return matching[0]
+    return matching[0] if matching else (entries[0] if entries else None)
+
+
+async def get_recent_entries() -> list[NyaaEntry]:
+    """
+    Appelé juste après /Relève : liste les releases Erai-raws 480p publiées
+    dans les RECENT_WINDOW_SECONDS dernières minutes, pour que l'OWNER
+    choisisse lui-même lesquelles encoder via des boutons — au lieu d'un
+    auto-encodage silencieux au démarrage.
+    """
+    async with aiohttp.ClientSession() as session:
+        entries = await fetch_nyaa_entries(session)
+
+    now = time.time()
+    return [
+        e for e in entries
+        if e.pub_date is not None and (now - e.pub_date) <= RECENT_WINDOW_SECONDS
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -291,6 +297,13 @@ async def _hardsub_and_upload_once(
         resize=resize,
         style_key=HARDSUB_STYLE_KEY,
     )
+    # IMPORTANT : upload_file() ne prend pas de chat_id en paramètre — elle
+    # lit BOT.TargetChat en interne (comme le fait chaque handler/callback du
+    # bot avant d'agir : "BOT.TargetChat = message.chat.id"). L'agent tourne
+    # en tâche de fond sans passer par un handler Telegram, donc sans cette
+    # ligne l'upload part vers un chat indéterminé (ou ne part pas). On force
+    # ici explicitement le contexte "comme si c'était l'OWNER qui agissait".
+    BOT.TargetChat = OWNER
     await upload_file(output_path, os.path.basename(output_path), is_last=True)
     await _notify_owner(f"✅ {quality_label} envoyé : <code>{os.path.basename(output_path)}</code>")
 
@@ -357,11 +370,17 @@ _state = AgentState()
 async def _watch_loop() -> None:
     seen_ids = _load_seen_ids()
     log.info("Agent Claude démarré - surveillance Erai-raws toutes les %ss", POLL_INTERVAL_SECONDS)
+    # Voir la note dans _hardsub_and_upload_once : l'agent tourne hors de tout
+    # handler Telegram, donc BOT.TargetChat doit être fixé explicitement pour
+    # que tout ce qu'il déclenche (uploads, etc.) parte bien vers l'OWNER.
+    BOT.TargetChat = OWNER
 
     async with aiohttp.ClientSession() as session:
         if not seen_ids:
-            # Premier démarrage : marque tout l'existant comme déjà vu pour
-            # éviter de traiter l'historique complet d'un coup.
+            # Premier démarrage : marque tout l'existant comme déjà vu.
+            # Les épisodes récents sont proposés séparément à l'OWNER via
+            # get_recent_entries() (bouton de sélection après /Relève),
+            # pas auto-encodés ici.
             initial_entries = await fetch_nyaa_entries(session)
             seen_ids = {e.id for e in initial_entries}
             _save_seen_ids(seen_ids)
