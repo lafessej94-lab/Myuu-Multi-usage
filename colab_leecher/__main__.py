@@ -141,6 +141,7 @@ def _style_kb(flow: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(f"🅰️ {STYLE_PRESET_LABELS.get('a', 'Style A')}", callback_data=f"hs_style|{flow}|a"),
         InlineKeyboardButton(f"🅱️ {STYLE_PRESET_LABELS.get('b', 'Style B')}", callback_data=f"hs_style|{flow}|b"),
+        InlineKeyboardButton(f"🅲️ {STYLE_PRESET_LABELS.get('c', 'Style C')}", callback_data=f"hs_style|{flow}|c"),
     ]])
 
 
@@ -1505,7 +1506,7 @@ async def callbacks(client, cq):
     # (lancement direct pour fc_magnet, prompt sous-titre pour fc_direct/cc_direct).
     if data.startswith("hs_style|"):
         _, flow, style_key = data.split("|", 2)
-        style_key = style_key if style_key in ("a", "b") else "a"
+        style_key = style_key if style_key in ("a", "b", "c") else "a"
 
         if flow == "cc_seedr":
             session = _cc_hardsub_session.get(cq.message.id)
