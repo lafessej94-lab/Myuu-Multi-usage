@@ -72,6 +72,17 @@ class AssStyle:
     margin_l: int = 20
     margin_r: int = 20
     margin_v: int = 20
+    # True (par défaut) : reproduit le hack historique (voir _ass_style_line)
+    # qui colle " Bold" au nom de police pour les moteurs qui ignorent le
+    # flag Bold et ne matchent que sur le nom exact (cas vérifié: Trebuchet MS
+    # via FreeConvert). False : laisse le nom de police tel quel et compte sur
+    # les flags Bold/Italic du style pour la résolution -- nécessaire pour une
+    # police EMBARQUÉE (section [Fonts]), where libass résout par
+    # (famille, poids, italique) et non par un nom complet inventé (vérifié
+    # avec Gandhi Sans : "Gandhi Sans Bold" en dur ne matche rien et fallback
+    # sur une police système, alors que "Gandhi Sans" + Bold=-1 résout bien
+    # sur GandhiSans-Bold.otf).
+    exact_bold_name: bool = True
 
 
 # ── Profils disponibles ──────────────────────────────────────────────────
@@ -85,12 +96,48 @@ STYLE_A = AssStyle(fontname="Trebuchet MS", fontsize=22, outline=1, shadow=1, al
 # pour les 7 noms standard Crunchyroll).
 STYLE_B = STYLE_A
 
-STYLE_PRESETS: dict[str, AssStyle] = {"a": STYLE_A, "b": STYLE_B}
+# Style C : profil uniforme façon Style A, mais avec la police Gandhi Sans
+# (rendu de référence : release Asakura, fichier .ass Slime S4, PlayRes
+# 1920x1080 fontsize 75 -> ramené à l'échelle 640x360 ci-dessous, soit /3).
+# Comme les sources réelles (Crunchyroll/Erai-Raws) n'utilisent jamais les
+# noms de style Asakura (Main/Ep_Title/General Title...), ce style suit le
+# même mécanisme générique que Style A (un seul rendu, alignment variable
+# selon le nom trouvé dans la source) et NON celui de Style B
+# (RAW_CR_STYLE_PROFILES, qui dépend de noms de style CR précis).
+#
+# Police non installée côté CloudConvert/FreeConvert -> embarquée directement
+# dans le script via la section [Fonts] (voir STYLE_FONT_FILES / FONTS_DIR /
+# _fonts_section_lines). exact_bold_name=False : la résolution se fait par
+# (famille "Gandhi Sans", poids, italique), PAS par un nom complet inventé
+# (voir commentaire sur AssStyle.exact_bold_name plus haut).
+STYLE_C = AssStyle(
+    fontname="Gandhi Sans", fontsize=25, outline=1.2, shadow=0.5,
+    alignment=2, margin_l=75, margin_r=75, margin_v=20,
+    bold=-1, exact_bold_name=False,
+)
+
+STYLE_PRESETS: dict[str, AssStyle] = {"a": STYLE_A, "b": STYLE_B, "c": STYLE_C}
 DEFAULT_STYLE_KEY = "a"
 
 STYLE_PRESET_LABELS: dict[str, str] = {
     "a": "Style A",
     "b": "Style B (CR)",
+    "c": "Style C (Asakura)",
+}
+
+# ── Polices embarquées (Style C) ──────────────────────────────────────────
+# Fichiers attendus dans colab_leecher/fonts/ (à côté de ce module) --
+# Gandhi Sans est distribuée gratuitement par Librerías Gandhi (licence
+# autorisant installation/distribution, cf. fontsquirrel.com/fonts/gandhi-sans).
+FONTS_DIR = ospath.join(ospath.dirname(ospath.abspath(__file__)), "fonts")
+
+STYLE_FONT_FILES: dict[str, list[str]] = {
+    "c": [
+        "GandhiSans-Regular.otf",
+        "GandhiSans-Bold.otf",
+        "GandhiSans-Italic.otf",
+        "GandhiSans-BoldItalic.otf",
+    ],
 }
 
 # ── Style B : reproduction fidèle d'un fichier ASS Crunchyroll de référence ──
@@ -349,7 +396,11 @@ def _ass_style_line(style: AssStyle, name: str = "Default") -> str:
     # Certains moteurs de burn-in "simplifiés" (dont FreeConvert) ignorent le
     # flag Bold du style et se contentent de chercher la police par son nom
     # exact. On ajoute donc "Bold" au nom de la police en plus du flag.
-    fontname = f"{style.fontname} Bold" if style.bold else style.fontname
+    fontname = (
+        f"{style.fontname} Bold"
+        if (style.bold and style.exact_bold_name)
+        else style.fontname
+    )
     fields = [
         name, fontname, str(style.fontsize),
         style.primary_colour, style.secondary_colour,
@@ -380,6 +431,73 @@ def _srt_to_ass(srt_path: str, ass_path: str) -> None:
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
     if result.returncode != 0 or not ospath.exists(ass_path):
         raise RuntimeError(f"Échec conversion srt->ass: {result.stderr.decode(errors='ignore')[:300]}")
+
+
+_ASS_FONT_LINE_WIDTH = 80
+
+
+def _encode_embedded_font(data: bytes) -> list[str]:
+    """
+    Encode les octets bruts d'une police au format d'incorporation ASS/SSA
+    (variante UUencode, offset 33, groupes de 3 octets -> 4 caractères
+    imprimables ; les groupes incomplets en fin de flux produisent 2 ou 3
+    caractères au lieu de 4, sans padding). Vérifié en conditions réelles :
+    libass (ffmpeg -vf ass=...) décode et résout correctement une police
+    ainsi embarquée, y compris ses 4 graisses (Regular/Bold/Italic/BoldItalic)
+    via le nom de famille + les flags Bold/Italic du style, sans avoir besoin
+    que la police soit installée sur la machine qui fait le rendu.
+    Retourne le texte encodé déjà découpé en lignes de 80 caractères (format
+    attendu par les lecteurs ASS/Aegisub).
+    """
+    out_chars: list[str] = []
+    n = len(data)
+    i = 0
+    while i < n:
+        chunk = data[i:i + 3]
+        b0 = chunk[0]
+        b1 = chunk[1] if len(chunk) > 1 else 0
+        b2 = chunk[2] if len(chunk) > 2 else 0
+        c0 = (b0 >> 2) & 0x3F
+        c1 = ((b0 & 0x3) << 4) | (b1 >> 4)
+        c2 = ((b1 & 0xF) << 2) | (b2 >> 6)
+        c3 = b2 & 0x3F
+        out_chars.append(chr(c0 + 33))
+        out_chars.append(chr(c1 + 33))
+        if len(chunk) > 1:
+            out_chars.append(chr(c2 + 33))
+        if len(chunk) > 2:
+            out_chars.append(chr(c3 + 33))
+        i += 3
+    encoded = "".join(out_chars)
+    return [
+        encoded[j:j + _ASS_FONT_LINE_WIDTH]
+        for j in range(0, len(encoded), _ASS_FONT_LINE_WIDTH)
+    ]
+
+
+def _fonts_section_lines(style_key: str) -> list[str]:
+    """
+    Construit la section [Fonts] (avec retours à la ligne) pour les polices
+    associées à `style_key` (voir STYLE_FONT_FILES), à ajouter telle quelle
+    à la fin du fichier .ass produit. Renvoie une liste vide si ce style n'a
+    aucune police à embarquer (cas de A/B, qui comptent sur Trebuchet MS déjà
+    présente côté moteurs de rendu). Une police manquante sur disque est
+    ignorée silencieusement (le style s'appliquera quand même, avec un
+    éventuel repli sur une police système côté moteur de rendu).
+    """
+    filenames = STYLE_FONT_FILES.get(style_key)
+    if not filenames:
+        return []
+    lines = ["[Fonts]\n"]
+    for filename in filenames:
+        font_path = ospath.join(FONTS_DIR, filename)
+        if not ospath.exists(font_path):
+            continue
+        with open(font_path, "rb") as fh:
+            data = fh.read()
+        lines.append(f"fontname: {filename}\n")
+        lines.extend(line + "\n" for line in _encode_embedded_font(data))
+    return lines
 
 
 def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = DEFAULT_STYLE_KEY) -> str:
@@ -488,6 +606,13 @@ def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = D
                 inserted = True
             final_lines.append(line)
         out_lines = final_lines
+
+    fonts_lines = _fonts_section_lines(normalized_key)
+    if fonts_lines:
+        if out_lines and not out_lines[-1].endswith("\n"):
+            out_lines[-1] += "\n"
+        out_lines.append("\n")
+        out_lines.extend(fonts_lines)
 
     with open(output_path, "w", encoding="utf-8") as fh:
         fh.writelines(out_lines)
