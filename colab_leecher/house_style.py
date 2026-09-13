@@ -47,16 +47,6 @@ l'utilisateur — ils produisent donc un rendu visuellement identique. Pour
 les différencier plus tard, il suffit de modifier la valeur de STYLE_B
 ci-dessous (ex: fontname="Arial") ; tout le reste du pipeline (menu, burn
 FC/CC) fonctionne déjà sans autre changement.
-
-MAJ 4 (watermark "Myuus-Raws") : quel que soit le preset choisi (a/b/c), une
-ligne de dialogue fixe "Myuus-Raws" est désormais injectée en haut à droite
-de l'écran (alignment ASS 9), affichée de 0:00:00.00 à 1:00:00.00 (couvre la
-quasi-totalité d'un épisode standard). Cette ligne a son propre style ASS
-(WATERMARK_STYLE_NAME / WATERMARK_BASE_STYLE, police Comic Sans MS gras,
-calquée sur une capture d'écran fournie par l'utilisateur) totalement
-indépendant des styles de dialogue/incrustations de la source ou du preset
-sélectionné : elle est ajoutée systématiquement dans [V4+ Styles] et
-[Events], en plus des styles habituels, jamais à leur place.
 """
 import os
 import re
@@ -209,31 +199,6 @@ RAW_CR_STYLE_PROFILES: dict[str, AssStyle] = {
         alignment=1, margin_l=20, margin_r=2, margin_v=25,
     ),
 }
-
-
-# ── Watermark "Myuus-Raws" (ligne fixe, injectée quel que soit le preset) ──
-# Style calqué sur une capture d'écran Aegisub fournie par l'utilisateur :
-# Comic Sans MS, gras, 22pt, contour noir 1.0, ombre 1.0, primaire blanc.
-# Alignment 9 = haut-droite (numpad ASS). Totalement indépendant des styles
-# de dialogue/incrustations de la source : ce style et cette ligne sont
-# ajoutés EN PLUS, jamais à la place des styles existants, et ce pour les
-# trois presets (a/b/c) sans exception (voir apply_hardsub_style).
-WATERMARK_STYLE_NAME = "MyuusRaws"
-WATERMARK_TEXT = "Myuus-Raws"
-WATERMARK_START = "0:00:00.00"
-WATERMARK_END = "1:00:00.00"
-
-WATERMARK_BASE_STYLE = AssStyle(
-    fontname="Comic Sans MS", fontsize=22,
-    primary_colour="&H00FFFFFF", secondary_colour="&H000000FF",
-    outline_colour="&H00000000", back_colour="&H00000000",
-    bold=-1, italic=0, border_style=1, outline=1, shadow=1,
-    alignment=9, margin_l=20, margin_r=20, margin_v=20,
-    # Comic Sans MS est une police système courante (non embarquée) : on
-    # garde le hack "nom exact + Bold" comme pour Trebuchet MS (Style A/B),
-    # utile pour les moteurs qui ignorent le flag Bold du style.
-    exact_bold_name=True,
-)
 
 
 def normalize_style_key(style_key: str | None) -> str:
@@ -460,59 +425,6 @@ _STYLE_FORMAT_HEADER = (
 )
 
 
-def _watermark_dialogue_line(style_name: str = WATERMARK_STYLE_NAME) -> str:
-    """Construit la ligne 'Dialogue:' du watermark (1h, haut-droite)."""
-    fields = [
-        "0",                    # Layer
-        WATERMARK_START,
-        WATERMARK_END,
-        style_name,
-        "",                     # Name (acteur)
-        "0", "0", "0",          # MarginL, MarginR, MarginV (on garde ceux du style)
-        "",                     # Effect
-        WATERMARK_TEXT,
-    ]
-    return "Dialogue: " + ",".join(fields)
-
-
-def _insert_watermark_dialogue(lines: list[str], style_name: str = WATERMARK_STYLE_NAME) -> list[str]:
-    """
-    Insère la ligne de dialogue watermark juste après la ligne 'Format:' de
-    la section [Events], quel que soit le format exact (srt->ass ou .ass
-    d'origine, dont l'ordre des champs Format n'est pas retouché ailleurs
-    dans ce module). Si la section [Events] ou sa ligne Format sont
-    introuvables (fichier source non conforme), la ligne est ajoutée à la
-    toute fin du fichier dans une section [Events] minimale plutôt que
-    silencieusement perdue.
-    """
-    out: list[str] = []
-    in_events = False
-    inserted = False
-    for line in lines:
-        out.append(line)
-        stripped = line.strip()
-        if stripped.lower() == "[events]":
-            in_events = True
-            continue
-        if in_events and not inserted and stripped.lower().startswith("format:"):
-            out.append(_watermark_dialogue_line(style_name) + "\n")
-            inserted = True
-        if in_events and stripped.startswith("[") and stripped.lower() != "[events]":
-            in_events = False
-
-    if not inserted:
-        if out and not out[-1].endswith("\n"):
-            out[-1] += "\n"
-        out.append("\n[Events]\n")
-        out.append(
-            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
-            "MarginV, Effect, Text\n"
-        )
-        out.append(_watermark_dialogue_line(style_name) + "\n")
-
-    return out
-
-
 def _srt_to_ass(srt_path: str, ass_path: str) -> None:
     """Convertit un .srt en .ass basique via ffmpeg (header par défaut, sera écrasé après)."""
     cmd = ["ffmpeg", "-y", "-i", srt_path, ass_path]
@@ -594,13 +506,9 @@ def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = D
     en .ass prêt à être envoyé au burn-in (FC, CC, ou FFmpeg local).
 
     `style_key` sélectionne le profil de rendu à appliquer parmi
-    STYLE_PRESETS ("a", "b" ou "c", voir en haut du fichier). Chaque nom de
-    style trouvé dans le fichier source reçoit ce même rendu visuel ; seul
+    STYLE_PRESETS ("a" ou "b", voir en haut du fichier). Chaque nom de style
+    trouvé dans le fichier source reçoit ce même rendu visuel ; seul
     l'alignment change selon le nom (voir _profile_for_style_name).
-
-    Quel que soit `style_key`, une ligne watermark fixe "Myuus-Raws" (voir
-    WATERMARK_*) est en plus injectée en haut à droite, avec son propre
-    style ASS, de 0:00:00.00 à 1:00:00.00.
 
     Retourne le chemin du fichier .ass stylé (= output_path).
     """
@@ -646,7 +554,6 @@ def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = D
 
     scale = _resolution_scale(source_play_res_y or PLAY_RES_Y)
     scaled_style = _scale_ass_style(base_style, scale)
-    watermark_profile = _scale_ass_style(WATERMARK_BASE_STYLE, scale)
     normalized_key = normalize_style_key(style_key)
 
     source_alignment, has_unanchored_pos, has_overlay_tags = _classify_style_names(lines)
@@ -674,7 +581,6 @@ def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = D
             for name in style_names:
                 profile = _resolve_profile(name)
                 out_lines.append(_ass_style_line(profile, name=name) + "\n")
-            out_lines.append(_ass_style_line(watermark_profile, name=WATERMARK_STYLE_NAME) + "\n")
             styles_written = True
             continue
 
@@ -696,13 +602,10 @@ def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = D
                 for name in style_names:
                     profile = _resolve_profile(name)
                     final_lines.append(_ass_style_line(profile, name=name) + "\n")
-                final_lines.append(_ass_style_line(watermark_profile, name=WATERMARK_STYLE_NAME) + "\n")
                 final_lines.append("\n")
                 inserted = True
             final_lines.append(line)
         out_lines = final_lines
-
-    out_lines = _insert_watermark_dialogue(out_lines, WATERMARK_STYLE_NAME)
 
     fonts_lines = _fonts_section_lines(normalized_key)
     if fonts_lines:
