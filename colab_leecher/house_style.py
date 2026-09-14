@@ -57,6 +57,17 @@ calquée sur une capture d'écran fournie par l'utilisateur) totalement
 indépendant des styles de dialogue/incrustations de la source ou du preset
 sélectionné : elle est ajoutée systématiquement dans [V4+ Styles] et
 [Events], en plus des styles habituels, jamais à leur place.
+
+MAJ 5 (révélation lettre par lettre) : le texte de la ligne watermark n'est
+plus statique. Chaque lettre de "Myuus-Raws" apparaît désormais l'une après
+l'autre (fondu alpha invisible -> visible, voir _build_watermark_karaoke_text)
+sur un total de WATERMARK_REVEAL_MS (~1 seconde), puis reste figée -- aucune
+boucle, aucune animation après la révélation complète. "Myuus" sort en rouge
+(WATERMARK_RED), "-Raws" en blanc (WATERMARK_WHITE), couleurs fixes une fois
+révélées. Techniquement ceci n'utilise pas le tag karaoké \k natif (qui ne
+fait que permuter Primary/Secondary colour en synchro et ne gère pas une
+couleur finale différente par lettre) mais un \t() par lettre, qui est la
+technique standard pour ce type d'effet de révélation en ASS.
 """
 import os
 import re
@@ -222,6 +233,16 @@ WATERMARK_STYLE_NAME = "MyuusRaws"
 WATERMARK_TEXT = "Myuus-Raws"
 WATERMARK_START = "0:00:00.00"
 WATERMARK_END = "1:00:00.00"
+
+# Révélation lettre par lettre (voir _build_watermark_karaoke_text) :
+# "Myuus" sort en rouge, "-Raws" (tiret inclus) en blanc, couleurs figées
+# une fois la lettre révélée. WATERMARK_SPLIT désigne la portion initiale du
+# texte qui doit être rouge ; tout ce qui suit (à partir du tiret) est blanc.
+WATERMARK_RED = "&H0000FF&"      # rouge pur, format ASS &HBBGGRR&
+WATERMARK_WHITE = "&HFFFFFF&"    # blanc pur
+WATERMARK_SPLIT = "Myuus"
+WATERMARK_REVEAL_MS = 1000       # durée totale de la révélation (~1s, "rapide")
+WATERMARK_FADE_MS = 40           # durée du "pop" (fondu) de chaque lettre
 
 WATERMARK_BASE_STYLE = AssStyle(
     fontname="Comic Sans MS", fontsize=22,
@@ -460,8 +481,49 @@ _STYLE_FORMAT_HEADER = (
 )
 
 
+def _build_watermark_karaoke_text() -> str:
+    """
+    Construit le texte ASS de la ligne watermark avec une révélation lettre
+    par lettre façon karaoké : chaque caractère apparaît (fondu alpha
+    FF -> 00, invisible -> visible) l'un après l'autre, étalés sur
+    WATERMARK_REVEAL_MS au total, puis reste figé (pas de boucle, pas
+    d'animation après la révélation complète). "Myuus" sort en rouge
+    (WATERMARK_RED), "-Raws" en blanc (WATERMARK_WHITE) -- couleur fixée dès
+    que la lettre apparaît, comme demandé.
+
+    Ceci n'utilise volontairement pas le tag karaoké \\k natif : celui-ci ne
+    fait que permuter Primary/Secondary colour en synchro avec la lecture et
+    ne permet pas nativement une couleur finale différente par lettre ni une
+    vraie apparition depuis l'invisible. Le \\t() par lettre est la
+    technique standard pour ce type d'effet de révélation en ASS et donne le
+    rendu "logo qui se dessine lettre par lettre" recherché.
+    """
+    text = WATERMARK_TEXT
+    n = len(text)
+    if n == 0:
+        return text
+
+    per_char_ms = WATERMARK_REVEAL_MS / n
+    fade_ms = max(1, min(WATERMARK_FADE_MS, int(per_char_ms) - 5 if per_char_ms > 5 else 1))
+    split_index = len(WATERMARK_SPLIT)  # index à partir duquel le texte passe en blanc
+
+    parts: list[str] = []
+    for i, ch in enumerate(text):
+        start = round(i * per_char_ms)
+        end = start + fade_ms
+        colour_tag = ""
+        if i == 0:
+            colour_tag = f"\\1c{WATERMARK_RED}"
+        elif i == split_index:
+            colour_tag = f"\\1c{WATERMARK_WHITE}"
+        parts.append(f"{{{colour_tag}\\alpha&HFF&\\t({start},{end},\\alpha&H00&)}}{ch}")
+
+    return "".join(parts)
+
+
 def _watermark_dialogue_line(style_name: str = WATERMARK_STYLE_NAME) -> str:
-    """Construit la ligne 'Dialogue:' du watermark (1h, haut-droite)."""
+    """Construit la ligne 'Dialogue:' du watermark (1h, haut-droite,
+    révélation lettre par lettre -- voir _build_watermark_karaoke_text)."""
     fields = [
         "0",                    # Layer
         WATERMARK_START,
@@ -470,7 +532,7 @@ def _watermark_dialogue_line(style_name: str = WATERMARK_STYLE_NAME) -> str:
         "",                     # Name (acteur)
         "0", "0", "0",          # MarginL, MarginR, MarginV (on garde ceux du style)
         "",                     # Effect
-        WATERMARK_TEXT,
+        _build_watermark_karaoke_text(),
     ]
     return "Dialogue: " + ",".join(fields)
 
