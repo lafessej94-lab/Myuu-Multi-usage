@@ -232,7 +232,13 @@ RAW_CR_STYLE_PROFILES: dict[str, AssStyle] = {
 WATERMARK_STYLE_NAME = "MyuusRaws"
 WATERMARK_TEXT = "Myuus-Raws"
 WATERMARK_START = "0:00:00.00"
-WATERMARK_END = "1:00:00.00"
+
+# Durée de repli de la ligne watermark quand la durée réelle de la vidéo
+# n'est pas connue à l'appel (voir apply_hardsub_style: video_path /
+# video_duration_s). Comportement historique conservé pour ne pas casser
+# les appelants existants qui n'ont pas encore cette info.
+WATERMARK_FALLBACK_END = "1:00:00.00"
+WATERMARK_FALLBACK_DURATION_S = 3600.0
 
 # Révélation lettre par lettre (voir _build_watermark_karaoke_text) :
 # "Myuus" sort en rouge, "-Raws" (tiret inclus) en blanc, couleurs figées
@@ -241,8 +247,18 @@ WATERMARK_END = "1:00:00.00"
 WATERMARK_RED = "&H0000FF&"      # rouge pur, format ASS &HBBGGRR&
 WATERMARK_WHITE = "&HFFFFFF&"    # blanc pur
 WATERMARK_SPLIT = "Myuus"
-WATERMARK_REVEAL_MS = 1000       # durée totale de la révélation (~1s, "rapide")
-WATERMARK_FADE_MS = 40           # durée du "pop" (fondu) de chaque lettre
+WATERMARK_REVEAL_MS = 5000       # durée totale de la révélation (~5s)
+WATERMARK_FADE_MS = 150          # durée du "pop" (fondu) de chaque lettre
+
+# Ré-animation de sortie (disparition), voir _build_watermark_karaoke_text :
+# se déclenche WATERMARK_OUTRO_LEAD_MS avant la fin de la ligne (= fin de la
+# vidéo si video_path/video_duration_s est fourni) et dure elle aussi
+# WATERMARK_REVEAL_MS, mais à l'envers -- la DERNIÈRE lettre apparue ("s" de
+# "Raws") disparaît en premier, la PREMIÈRE lettre apparue ("M" de "Myuus")
+# disparaît en dernier, donc "Raws" s'efface avant "Myuus" comme demandé.
+# Désactivée automatiquement si la durée totale est inconnue ou trop courte
+# pour laisser la place aux deux animations sans qu'elles se chevauchent.
+WATERMARK_OUTRO_LEAD_MS = 10000
 
 WATERMARK_BASE_STYLE = AssStyle(
     fontname="Comic Sans MS", fontsize=22,
@@ -481,22 +497,56 @@ _STYLE_FORMAT_HEADER = (
 )
 
 
-def _build_watermark_karaoke_text() -> str:
+def _format_ass_time(total_seconds: float) -> str:
+    """Formate une durée en secondes au format de timestamp ASS H:MM:SS.CC."""
+    total_seconds = max(0.0, total_seconds)
+    centiseconds = round(total_seconds * 100)
+    hours, rem = divmod(centiseconds, 360000)
+    minutes, rem = divmod(rem, 6000)
+    seconds, cs = divmod(rem, 100)
+    return f"{hours}:{minutes:02d}:{seconds:02d}.{cs:02d}"
+
+
+def _probe_video_duration_seconds(video_path: str) -> float | None:
+    """Sonde la durée d'une vidéo via ffprobe. Retourne None en cas d'échec
+    (fichier introuvable, ffprobe absent, sortie non parsable...) plutôt que
+    de lever une exception -- la ligne watermark retombe alors sur son
+    comportement de repli (1h fixe, pas d'animation de sortie)."""
+    if not video_path or not ospath.exists(video_path):
+        return None
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", video_path,
+    ]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        return float(result.stdout.decode(errors="ignore").strip())
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return None
+
+
+def _build_watermark_karaoke_text(line_duration_ms: float | None = None) -> str:
     """
     Construit le texte ASS de la ligne watermark avec une révélation lettre
     par lettre façon karaoké : chaque caractère apparaît (fondu alpha
     FF -> 00, invisible -> visible) l'un après l'autre, étalés sur
-    WATERMARK_REVEAL_MS au total, puis reste figé (pas de boucle, pas
-    d'animation après la révélation complète). "Myuus" sort en rouge
+    WATERMARK_REVEAL_MS au total, puis reste figé. "Myuus" sort en rouge
     (WATERMARK_RED), "-Raws" en blanc (WATERMARK_WHITE) -- couleur fixée dès
-    que la lettre apparaît, comme demandé.
+    que la lettre apparaît.
+
+    Si `line_duration_ms` est fourni (= durée de la ligne, généralement la
+    durée de la vidéo) et assez long pour ne pas chevaucher la révélation
+    d'entrée, une seconde animation -- la disparition -- est ajoutée
+    WATERMARK_OUTRO_LEAD_MS avant la fin : même durée que l'entrée, mais à
+    l'envers (la dernière lettre apparue disparaît en premier, donc "Raws"
+    s'efface avant "Myuus"). Sans `line_duration_ms`, seule la révélation
+    d'entrée est présente (comportement de repli).
 
     Ceci n'utilise volontairement pas le tag karaoké \\k natif : celui-ci ne
     fait que permuter Primary/Secondary colour en synchro avec la lecture et
     ne permet pas nativement une couleur finale différente par lettre ni une
-    vraie apparition depuis l'invisible. Le \\t() par lettre est la
-    technique standard pour ce type d'effet de révélation en ASS et donne le
-    rendu "logo qui se dessine lettre par lettre" recherché.
+    vraie apparition/disparition depuis l'invisible. Le \\t() par lettre est
+    la technique standard pour ce type d'effet en ASS.
     """
     text = WATERMARK_TEXT
     n = len(text)
@@ -507,37 +557,74 @@ def _build_watermark_karaoke_text() -> str:
     fade_ms = max(1, min(WATERMARK_FADE_MS, int(per_char_ms) - 5 if per_char_ms > 5 else 1))
     split_index = len(WATERMARK_SPLIT)  # index à partir duquel le texte passe en blanc
 
+    reveal_end_last = round((n - 1) * per_char_ms) + fade_ms
+    outro_start_base = None
+    if line_duration_ms is not None:
+        candidate = line_duration_ms - WATERMARK_OUTRO_LEAD_MS
+        # N'active l'outro que si elle démarre bien après la fin de la
+        # révélation d'entrée (pas de chevauchement) et se termine avant la
+        # fin de la ligne.
+        if candidate > reveal_end_last and candidate + (n - 1) * per_char_ms + fade_ms <= line_duration_ms:
+            outro_start_base = candidate
+
     parts: list[str] = []
     for i, ch in enumerate(text):
-        start = round(i * per_char_ms)
-        end = start + fade_ms
+        reveal_start = round(i * per_char_ms)
+        reveal_end = reveal_start + fade_ms
         colour_tag = ""
         if i == 0:
             colour_tag = f"\\1c{WATERMARK_RED}"
         elif i == split_index:
             colour_tag = f"\\1c{WATERMARK_WHITE}"
-        parts.append(f"{{{colour_tag}\\alpha&HFF&\\t({start},{end},\\alpha&H00&)}}{ch}")
+
+        outro_tag = ""
+        if outro_start_base is not None:
+            reverse_rank = (n - 1) - i  # dernière lettre apparue (droite) = rang 0 -> disparaît en premier
+            out_start = round(outro_start_base + reverse_rank * per_char_ms)
+            out_end = out_start + fade_ms
+            outro_tag = f"\\t({out_start},{out_end},\\alpha&HFF&)"
+
+        parts.append(
+            f"{{{colour_tag}\\alpha&HFF&\\t({reveal_start},{reveal_end},\\alpha&H00&){outro_tag}}}{ch}"
+        )
 
     return "".join(parts)
 
 
-def _watermark_dialogue_line(style_name: str = WATERMARK_STYLE_NAME) -> str:
-    """Construit la ligne 'Dialogue:' du watermark (1h, haut-droite,
-    révélation lettre par lettre -- voir _build_watermark_karaoke_text)."""
+def _watermark_dialogue_line(
+    style_name: str = WATERMARK_STYLE_NAME,
+    duration_s: float | None = None,
+) -> str:
+    """Construit la ligne 'Dialogue:' du watermark (haut-droite, révélation
+    lettre par lettre puis, si `duration_s` est connu, disparition inversée
+    avant la fin -- voir _build_watermark_karaoke_text). `duration_s`
+    détermine aussi la fin de la ligne (= durée vidéo si connue, sinon repli
+    WATERMARK_FALLBACK_END/WATERMARK_FALLBACK_DURATION_S)."""
+    if duration_s is not None and duration_s > 0:
+        end_time = _format_ass_time(duration_s)
+        line_duration_ms = duration_s * 1000
+    else:
+        end_time = WATERMARK_FALLBACK_END
+        line_duration_ms = None
+
     fields = [
         "0",                    # Layer
         WATERMARK_START,
-        WATERMARK_END,
+        end_time,
         style_name,
         "",                     # Name (acteur)
         "0", "0", "0",          # MarginL, MarginR, MarginV (on garde ceux du style)
         "",                     # Effect
-        _build_watermark_karaoke_text(),
+        _build_watermark_karaoke_text(line_duration_ms),
     ]
     return "Dialogue: " + ",".join(fields)
 
 
-def _insert_watermark_dialogue(lines: list[str], style_name: str = WATERMARK_STYLE_NAME) -> list[str]:
+def _insert_watermark_dialogue(
+    lines: list[str],
+    style_name: str = WATERMARK_STYLE_NAME,
+    duration_s: float | None = None,
+) -> list[str]:
     """
     Insère la ligne de dialogue watermark juste après la ligne 'Format:' de
     la section [Events], quel que soit le format exact (srt->ass ou .ass
@@ -557,7 +644,7 @@ def _insert_watermark_dialogue(lines: list[str], style_name: str = WATERMARK_STY
             in_events = True
             continue
         if in_events and not inserted and stripped.lower().startswith("format:"):
-            out.append(_watermark_dialogue_line(style_name) + "\n")
+            out.append(_watermark_dialogue_line(style_name, duration_s=duration_s) + "\n")
             inserted = True
         if in_events and stripped.startswith("[") and stripped.lower() != "[events]":
             in_events = False
@@ -570,7 +657,7 @@ def _insert_watermark_dialogue(lines: list[str], style_name: str = WATERMARK_STY
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
             "MarginV, Effect, Text\n"
         )
-        out.append(_watermark_dialogue_line(style_name) + "\n")
+        out.append(_watermark_dialogue_line(style_name, duration_s=duration_s) + "\n")
 
     return out
 
@@ -650,7 +737,13 @@ def _fonts_section_lines(style_key: str) -> list[str]:
     return lines
 
 
-def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = DEFAULT_STYLE_KEY) -> str:
+def apply_hardsub_style(
+    subtitle_path: str,
+    output_path: str,
+    style_key: str = DEFAULT_STYLE_KEY,
+    video_path: str | None = None,
+    video_duration_s: float | None = None,
+) -> str:
     """
     Force le style de rendu d'un sous-titre (.srt ou .ass) et écrit le résultat
     en .ass prêt à être envoyé au burn-in (FC, CC, ou FFmpeg local).
@@ -660,13 +753,24 @@ def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = D
     style trouvé dans le fichier source reçoit ce même rendu visuel ; seul
     l'alignment change selon le nom (voir _profile_for_style_name).
 
-    Quel que soit `style_key`, une ligne watermark fixe "Myuus-Raws" (voir
+    Quel que soit `style_key`, une ligne watermark "Myuus-Raws" (voir
     WATERMARK_*) est en plus injectée en haut à droite, avec son propre
-    style ASS, de 0:00:00.00 à 1:00:00.00.
+    style ASS : révélation lettre par lettre en entrée, puis -- si la durée
+    de la vidéo est connue -- disparition inversée 10s avant la fin, et la
+    ligne dure exactement la durée de la vidéo au lieu d'1h fixe.
+
+    `video_duration_s` (prioritaire) ou `video_path` (sondé via ffprobe)
+    permettent de fournir cette durée. Sans aucun des deux, la ligne retombe
+    sur son comportement de repli (1h fixe, pas d'animation de sortie) --
+    utile pour les appelants existants qui n'ont pas encore cette info.
 
     Retourne le chemin du fichier .ass stylé (= output_path).
     """
     base_style = STYLE_PRESETS[normalize_style_key(style_key)]
+
+    duration_s = video_duration_s
+    if duration_s is None and video_path:
+        duration_s = _probe_video_duration_seconds(video_path)
 
     ext = ospath.splitext(subtitle_path)[1].lower()
     work_path = subtitle_path
@@ -764,7 +868,7 @@ def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = D
             final_lines.append(line)
         out_lines = final_lines
 
-    out_lines = _insert_watermark_dialogue(out_lines, WATERMARK_STYLE_NAME)
+    out_lines = _insert_watermark_dialogue(out_lines, WATERMARK_STYLE_NAME, duration_s=duration_s)
 
     fonts_lines = _fonts_section_lines(normalized_key)
     if fonts_lines:
@@ -792,10 +896,19 @@ def apply_hardsub_style(subtitle_path: str, output_path: str, style_key: str = D
 # existants qui n'ont pas encore de sélection de style (ils utilisent alors
 # le style par défaut "a"), en le faisant passer par la nouvelle logique
 # apply_hardsub_style() ci-dessus.
-async def apply_house_style(sub_path: str, tmp_dir: str, style_key: str = DEFAULT_STYLE_KEY) -> str:
+async def apply_house_style(
+    sub_path: str,
+    tmp_dir: str,
+    style_key: str = DEFAULT_STYLE_KEY,
+    video_path: str | None = None,
+    video_duration_s: float | None = None,
+) -> str:
     out_path = os.path.join(tmp_dir, "hs_house_styled.ass")
     try:
-        return apply_hardsub_style(sub_path, out_path, style_key=style_key)
+        return apply_hardsub_style(
+            sub_path, out_path, style_key=style_key,
+            video_path=video_path, video_duration_s=video_duration_s,
+        )
     except Exception:
         # Fallback silencieux comme l'ancien module : le job continue avec
         # le sous-titre original plutôt que de planter.
