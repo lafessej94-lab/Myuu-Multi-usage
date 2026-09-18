@@ -125,7 +125,7 @@ query ($id: Int) {
     season
     seasonYear
     genres
-    tags(sort: RANK_DESC) { name isMediaSpoiler }
+    tags { name isMediaSpoiler rank }
     studios { edges { isMain node { name } } }
     externalLinks { site url }
     description(asHtml: false)
@@ -207,10 +207,12 @@ async def _get_anime_details(anilist_id: int) -> dict | None:
     status = _STATUS_LABELS.get(item.get("status"), item.get("status") or "Inconnu")
 
     genres = item.get("genres") or []
-    themes = [
-        t["name"] for t in (item.get("tags") or [])
-        if not t.get("isMediaSpoiler")
-    ][:5]
+    non_spoiler_tags = sorted(
+        (t for t in (item.get("tags") or []) if not t.get("isMediaSpoiler")),
+        key=lambda t: t.get("rank") or 0,
+        reverse=True,
+    )
+    themes = [t["name"] for t in non_spoiler_tags][:5]
 
     studio_edges = (item.get("studios") or {}).get("edges", [])
     studio = ", ".join(e["node"]["name"] for e in studio_edges if e.get("isMain")) or "?"
@@ -318,7 +320,7 @@ async def anime_command(client, message: Message):
     if not _can_use(message):
         return
     if len(message.command) < 2:
-        await message.reply_text("Utilisation : `/anime <nom de l'anime>`")
+        await message.reply_text("Utilisation : /anime <nom de l'anime>")
         return
 
     query = " ".join(message.command[1:])
