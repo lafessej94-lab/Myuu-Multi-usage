@@ -194,6 +194,7 @@ async def help_cmd(client, message):
         "  /Relève    — réveille Claude (agent auto, owner uniquement)\n"
         "  /Arise     — rendort Claude\n"
         "  /search_claude <anime> — recherche + hardsub manuel (Claude réveillé)\n\n"
+        "  /anime <nom> — recherche AniList
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📡 <b>Nyaa Anime Search</b>\n"
         "  /nyaa_search <query> — search Nyaa.si\n"
