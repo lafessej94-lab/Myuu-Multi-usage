@@ -313,10 +313,8 @@ def _format_caption(data: dict) -> str:
     return "\n".join(lines)
 
 
-@colab_bot.on_message(filters.command("anime") & filters.private)
+@colab_bot.on_message(filters.command("anime") & filters.private, group=-1)
 async def anime_command(client, message: Message):
-    from colab_leecher import OWNER
-    await message.reply_text(f"DEBUG chat_id={message.chat.id} OWNER={OWNER} can_use={_can_use(message)}")
     if not _can_use(message):
         return
     if len(message.command) < 2:
