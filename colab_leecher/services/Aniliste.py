@@ -284,13 +284,14 @@ def _clean_description(raw: str | None) -> str | None:
 #  Formatage / commande / menu / callback
 # ══════════════════════════════════════════════
 
-def _format_caption(data: dict) -> str:
+def _format_caption(data: dict, max_len: int = 1024) -> str:
     """Construit la caption façon 'Visuel Animes' à partir du dict normalisé
-    renvoyé par _get_anime_details."""
+    renvoyé par _get_anime_details. Tronque le synopsis si besoin pour
+    respecter la limite Telegram de 1024 caractères sur une caption photo."""
     genres = ", ".join(data["genres"]) if data["genres"] else "?"
     themes = ", ".join(data["themes"]) if data["themes"] else "?"
 
-    lines = [
+    header_lines = [
         f"**{data['title_original']}**",
         "",
         f"Titre original : {data['title_original']}",
@@ -301,18 +302,28 @@ def _format_caption(data: dict) -> str:
         f"Thèmes : {themes}",
         f"Studio d'animation : {data['studio']}",
     ]
-
     if data.get("official_site"):
-        lines.append(f"Site web officiel : {data['official_site']}")
+        header_lines.append(f"Site web officiel : {data['official_site']}")
+    header_lines.append(f"Groupe : {data['producers']}")
+    header_lines.append("")
+    header_lines.append("Synopsis")
 
-    lines.append(f"Groupe : {data['producers']}")
-    lines.append("")
-    lines.append("Synopsis")
-    lines.append(data["synopsis"])
-    lines.append("")
-    lines.append(f"Source : AniList — {data['source_url']}")
+    footer_lines = ["", f"Source : AniList — {data['source_url']}"]
 
-    return "\n".join(lines)
+    header = "\n".join(header_lines)
+    footer = "\n".join(footer_lines)
+
+    # Budget restant pour le synopsis : total - header - footer - le \n qui
+    # relie le synopsis au reste (2 \n : header→synopsis, synopsis→footer)
+    budget = max_len - len(header) - len(footer) - 2
+    synopsis = data["synopsis"]
+    if budget < 20:
+        # Pas assez de place même pour un synopsis minimal : on le saute
+        synopsis = ""
+    elif len(synopsis) > budget:
+        synopsis = synopsis[: budget - 1].rstrip() + "…"
+
+    return f"{header}\n{synopsis}\n{footer}" if synopsis else f"{header}\n{footer}"
 
 
 @colab_bot.on_message(filters.command("anime") & filters.private, group=-1)
