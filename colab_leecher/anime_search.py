@@ -188,7 +188,7 @@ async def anime_selection_callback(client, callback: CallbackQuery):
         source_label = "Nautiljon"
     else:
         data = await my_anime_liste.get_anime_details(selected["id"])
-        source_label = "MyAnimeList"
+        source_label = "AniList"
 
     if data is None:
         await callback.message.edit_text("❌ Impossible de récupérer cette fiche, réessaie plus tard.")
