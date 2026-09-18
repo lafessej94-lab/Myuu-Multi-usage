@@ -741,8 +741,8 @@ except Exception as e:
     logging.warning(f"Nyaa tracker not loaded: {e}")
 
 try:
-    import colab_leecher.anime_search
-    logging.info("🔎 Anime search (Nautiljon/MAL) loaded")
+    import colab_leecher.services.Aniliste
+    logging.info("🔎 Anime search (AniList) loaded")
 except Exception as e:
     logging.warning(f"Anime search not loaded: {e}")
 
