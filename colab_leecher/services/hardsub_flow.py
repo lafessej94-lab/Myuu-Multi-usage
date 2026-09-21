@@ -69,6 +69,17 @@ CC_SPEED_LABELS: dict[str, str] = {
     "fast": "🏃 Fast",
 }
 
+# Styles proposés dans le menu (ordre d'affichage = ordre de ce dict) et
+# clés acceptées par handle_hs_style(). Pour ajouter un futur Style E :
+# l'ajouter ici + dans STYLE_PRESETS / STYLE_PRESET_LABELS (house_style.py).
+_STYLE_BUTTON_EMOJIS: dict[str, str] = {
+    "a": "🅰️",
+    "b": "🅱️",
+    "c": "🅲️",
+    "d": "🅳️",
+}
+_VALID_STYLE_KEYS: tuple[str, ...] = tuple(_STYLE_BUTTON_EMOJIS)
+
 # ── État en mémoire ──────────────────────────────────────────────────────
 # _cc_direct_sessions : token (8 hex chars, embedded dans callback_data) ->
 # url. Volontairement PAS indexé par message_id (contrairement à
@@ -95,12 +106,28 @@ _pending_style_choice: dict[int, dict] = {}
 _cc_hardsub_session: dict[int, dict] = {}
 
 
+def _style_rows(callback_for) -> list[list[InlineKeyboardButton]]:
+    # Une ligne par style (liste verticale) : plus lisible et le label
+    # complet ("Style C (Asakura)"...) n'est plus tronqué. `callback_for`
+    # reçoit la clé du style ("a".."d") et renvoie le callback_data.
+    return [
+        [InlineKeyboardButton(
+            f"{_STYLE_BUTTON_EMOJIS[key]} {STYLE_PRESET_LABELS.get(key, f'Style {key.upper()}')}",
+            callback_data=callback_for(key),
+        )]
+        for key in _VALID_STYLE_KEYS
+    ]
+
+
 def _style_kb(flow: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"🅰️ {STYLE_PRESET_LABELS.get('a', 'Style A')}", callback_data=f"hs_style|{flow}|a"),
-        InlineKeyboardButton(f"🅱️ {STYLE_PRESET_LABELS.get('b', 'Style B')}", callback_data=f"hs_style|{flow}|b"),
-        InlineKeyboardButton(f"🅲️ {STYLE_PRESET_LABELS.get('c', 'Style C')}", callback_data=f"hs_style|{flow}|c"),
-    ]])
+    return InlineKeyboardMarkup(_style_rows(lambda key: f"hs_style|{flow}|{key}"))
+
+
+def _style_sub_kb() -> InlineKeyboardMarkup:
+    # Add Style Sub : les 4 styles + une sortie "garder tel quel".
+    rows = _style_rows(lambda key: f"style_apply|{key}")
+    rows.append([InlineKeyboardButton("❌ Non, garder tel quel", callback_data="style_no")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _fc_quality_kb(flow: str) -> InlineKeyboardMarkup:
@@ -219,16 +246,16 @@ async def handle_cc_res(client, cq, data):
     )
 
 
-# ── Choix du style (Style A / B / C) — inséré après le choix de résolution
-# sur les 4 flows hardsub. "cc_seedr" stocke directement le choix dans
-# _cc_hardsub_session (déjà keyé par message_id) puis affiche le clavier de
-# vitesse ; les 3 autres flows utilisent _pending_style_choice et reprennent
+# ── Choix du style (Style A / B / C / D) — inséré après le choix de
+# résolution sur les 4 flows hardsub. "cc_seedr" stocke directement le choix
+# dans _cc_hardsub_session (déjà keyé par message_id) puis affiche le clavier
+# de vitesse ; les 3 autres flows utilisent _pending_style_choice et reprennent
 # l'étape qui suivait la résolution (lancement direct pour fc_magnet, prompt
 # sous-titre pour fc_direct/cc_direct).
 @on_prefix("hs_style|")
 async def handle_hs_style(client, cq, data):
     _, flow, style_key = data.split("|", 2)
-    style_key = style_key if style_key in ("a", "b", "c") else "a"
+    style_key = style_key if style_key in _VALID_STYLE_KEYS else "a"
 
     if flow == "cc_seedr":
         session = _cc_hardsub_session.get(cq.message.id)
@@ -495,24 +522,45 @@ async def handle_fc_hardsub_cancel(client, cq, data):
 #  Add Style Sub — flow indépendant, sous-titre envoyé "à froid"
 # ══════════════════════════════════════════════
 
-@on_exact("style_yes", "style_no")
-async def handle_style_choice(client, cq, data):
+@on_prefix("style_apply|")
+async def handle_style_apply(client, cq, data):
+    style_key = data.split("|", 1)[1]
+    style_key = style_key if style_key in _VALID_STYLE_KEYS else "a"
+    await _finish_style_sub(cq, style_key)
+
+
+@on_exact("style_no")
+async def handle_style_no(client, cq, data):
+    await _finish_style_sub(cq, None)
+
+
+async def _finish_style_sub(cq, style_key: str | None) -> None:
+    """Termine le flow Add Style Sub : applique le style `style_key`
+    (a/b/c/d) et renvoie le fichier, ou le renvoie tel quel si None."""
     pending = _pending_style_sub.pop(cq.message.id, None)
     if not pending:
         await cq.answer("Session expirée.", show_alert=True)
         return
     path, name = pending["path"], pending["name"]
     try:
-        if data == "style_yes":
-            await cq.answer("🎨 Application du style...")
-            styled = await apply_house_style(path, Paths.WORK_PATH)
+        if style_key is not None:
+            style_label = STYLE_PRESET_LABELS.get(style_key, style_key)
+            await cq.answer(f"🎨 Application du {style_label}...")
+            styled = await apply_house_style(path, Paths.WORK_PATH, style_key=style_key)
+            if styled == path:
+                # apply_house_style() renvoie le fichier d'origine en cas
+                # d'erreur interne (fallback silencieux) : on ne veut pas
+                # annoncer "style appliqué" dans ce cas.
+                raise RuntimeError("Le style n'a pas pu être appliqué à ce fichier.")
             out_name = os.path.splitext(name)[0] + ".styled.ass"
             await colab_bot.send_document(
                 chat_id=BOT.TargetChat, document=styled,
-                caption=f"✅ Style maison appliqué (Trebuchet MS 22)\n<code>{out_name}</code>",
+                caption=f"✅ {style_label} appliqué\n<code>{out_name}</code>",
                 file_name=out_name,
             )
-            await cq.message.edit_text(f"✅ Style appliqué et renvoyé : <code>{out_name}</code>")
+            await cq.message.edit_text(
+                f"✅ {style_label} appliqué et renvoyé : <code>{out_name}</code>"
+            )
             if os.path.exists(styled) and styled != path:
                 os.remove(styled)
         else:
@@ -587,12 +635,9 @@ async def handle_subtitle_document(client, message):
             chat_id=BOT.TargetChat,
             text=(
                 f"🎨 <code>{file_name}</code>\n\n"
-                "Appliquer le <b>house style</b> (Trebuchet MS 22) sur ce sous-titre ?"
+                "Choisis le <b>style</b> à appliquer sur ce sous-titre :"
             ),
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Oui", callback_data="style_yes"),
-                InlineKeyboardButton("❌ Non", callback_data="style_no"),
-            ]]),
+            reply_markup=_style_sub_kb(),
         )
         _pending_style_sub[prompt.id] = {"path": subtitle_path, "name": file_name}
         return
