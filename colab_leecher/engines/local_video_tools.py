@@ -3,7 +3,7 @@ Outils vidéo LOCAUX supplémentaires (ffmpeg sur le CPU de Colab), dans le
 même esprit que local_convert.py : pas d'appel à une API cloud, mêmes
 conventions (progress_cb, parsing du temps ffmpeg).
 
-Complète le menu par-vidéo de __main__.py (_video_tools_kb) avec :
+Complète le menu par-vidéo (_video_tools_kb) avec :
   - Thumb (aléatoire)     -> extract_random_thumbnail
   - Screenshots           -> take_screenshots
   - Trim                  -> trim_video
@@ -18,17 +18,12 @@ import os
 import random
 from typing import Awaitable, Callable, Optional
 
-from colab_leecher.local_convert import _parse_ffmpeg_time, _probe_duration
+from colab_leecher.engines.local_convert import _parse_ffmpeg_time, _probe_duration
 
 ProgressCB = Optional[Callable[[float, str], Awaitable[None]]]
 
 
 # ── Thumbnail aléatoire ──────────────────────────────────────────────
-# Même correctif que sur myuu (services/smart_thumbnail.py) et déjà en
-# place ailleurs sur zilong (colab_leecher/utility/helper.py) : on tire
-# le timestamp au hasard dans la fenêtre 10%-90% de la vidéo au lieu
-# d'un point fixe, pour que deux vidéos ne donnent jamais un thumb pris
-# au même endroit relatif.
 async def extract_random_thumbnail(input_path: str, output_path: str) -> str:
     duration = await _probe_duration(input_path)
     if duration > 4:
@@ -61,9 +56,6 @@ async def take_screenshots(input_path: str, out_dir: str, count: int = 5) -> lis
     if duration <= 1:
         timestamps = [0.0]
     else:
-        # Un point par tranche égale de la vidéo, avec un peu de jitter
-        # aléatoire à l'intérieur de chaque tranche pour éviter que les
-        # shots tombent toujours pile sur les mêmes fractions (0%, 20%...).
         step = duration / count
         timestamps = []
         for i in range(count):
@@ -102,9 +94,6 @@ async def trim_video(
     end: str,
     progress_cb: ProgressCB = None,
 ) -> str:
-    """start/end au format HH:MM:SS (ou secondes). -c copy = pas de
-    ré-encodage (rapide), la coupe peut être décalée de quelques frames
-    sur certains conteneurs — acceptable pour un trim rapide."""
     duration = await _probe_duration(input_path)
 
     cmd = [
@@ -177,12 +166,6 @@ async def compress_video(
 
 # ── Mux subs (soft — piste ajoutée, pas de ré-encodage vidéo) ─────────
 async def mux_subtitles(video_path: str, sub_path: str, output_path: str, title: str | None = None) -> str:
-    """
-    title : si fourni, écrase TOUTES les métadonnées globales du fichier
-    source (donc le vrai nom éventuellement embarqué dans le tag "title"
-    d'origine) et les remplace par ce titre propre — sinon ffmpeg copie par
-    défaut les métadonnées du premier input telles quelles.
-    """
     is_mkv = output_path.lower().endswith(".mkv")
     sub_codec = "copy" if is_mkv else "mov_text"
 
@@ -214,16 +197,8 @@ async def burn_subtitles(
     progress_cb: ProgressCB = None,
     title: str | None = None,
 ) -> str:
-    """
-    title : si fourni, écrase TOUTES les métadonnées globales du fichier
-    source (donc le vrai nom éventuellement embarqué dans le tag "title"
-    d'origine) et les remplace par ce titre propre — sinon ffmpeg copie par
-    défaut les métadonnées du premier input telles quelles.
-    """
     duration = await _probe_duration(video_path)
 
-    # ffmpeg veut un chemin échappé pour le filtre subtitles= (les ':' et
-    # "'" cassent le parsing du filtre sinon).
     escaped_sub = sub_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
     cmd = [
@@ -260,7 +235,6 @@ async def burn_subtitles(
 
 # ── Manual shot — capture à un timestamp précis fourni par l'utilisateur ──
 async def screenshot_at(input_path: str, output_path: str, timestamp: str) -> str:
-    """timestamp au format HH:MM:SS, MM:SS ou secondes (ex: '90')."""
     cmd = [
         "ffmpeg", "-y",
         "-ss", timestamp,
@@ -434,8 +408,7 @@ async def probe_media_info_text(path: str) -> str:
     return "\n".join(lines[:14])
 
 
-# ── Burn prefix/suffix — texte incrusté en dur dans l'image (pas juste ──
-# ── dans le nom de fichier/caption, ré-encodage vidéo) ─────────────────
+# ── Burn prefix/suffix — texte incrusté en dur dans l'image ────────────
 _FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -450,11 +423,10 @@ def _drawtext_font() -> str | None:
 
 
 def _drawtext_escape(text: str) -> str:
-    # Échappe les caractères qui cassent le parsing du filtre drawtext.
     return (
         text.replace("\\", "\\\\\\\\")
         .replace(":", "\\:")
-        .replace("'", "\u2019")  # apostrophe typographique, évite de casser le quoting
+        .replace("'", "\u2019")
         .replace("%", "\\%")
     )
 
@@ -466,9 +438,6 @@ async def burn_text_overlay(
     suffix: str = "",
     progress_cb: ProgressCB = None,
 ) -> str:
-    """Grave prefix (haut-gauche) et/ou suffix (bas-droite) directement
-    dans l'image vidéo. Appelé uniquement si prefix/suffix non vides —
-    sinon rien à graver, autant garder le fichier tel quel (voir handler.py)."""
     prefix = (prefix or "").strip()
     suffix = (suffix or "").strip()
     if not prefix and not suffix:
