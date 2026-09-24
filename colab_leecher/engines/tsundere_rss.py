@@ -37,7 +37,7 @@ RSS_URL = (
     "&provider=transfer.it"
 )
 
-CHECK_INTERVAL = 120
+CHECK_INTERVAL = 30
 
 # Marge de sécurité sous la limite d'upload Pyrofork (2 Go standard,
 # 4 Go en compte premium) — 1.95 Go pour ne jamais frôler le seuil réel.
