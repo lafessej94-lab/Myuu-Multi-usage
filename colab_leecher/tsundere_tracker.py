@@ -13,16 +13,27 @@ l'historique, et l'upload via le pipeline existant (Leech — renommage
 smart_rename + forward automatique vers les dumps configurés via /add,
 exactement comme n'importe quel autre leech du bot).
 
+Filtre HARDSUB uniquement : le flux RSS (RSS_URL dans engines/tsundere_rss.py)
+filtre déjà par langue (FRENCH / SUBFRENCH / MULTI) mais renvoie aussi bien
+du softsub (piste de sous-titres séparée) que du hardsub (sous-titres
+incrustés). Le tracker ignore toute release dont le titre ne contient pas
+"HARDSUB" — elle est marquée "seen" (pour ne pas être réévaluée à chaque
+poll) mais jamais traitée/envoyée. Si la version hardsub du même épisode
+sort ensuite (guid différent), elle sera traitée normalement au poll
+suivant. Ça évite d'envoyer la version softsub en premier, puis un doublon
+quand le hardsub arrive.
+
 Historique JSON (data/tsundere_processed.json) à deux clés :
   - "processed" : guid -> {title, url, at} — épisode réellement envoyé.
   - "seen"      : guid -> timestamp — guid déjà rencontré dans le flux,
-    qu'il ait été traité avec succès ou non. Sert à ne JAMAIS retraiter un
-    guid déjà vu, y compris après un redémarrage du bot — contrairement au
-    script d'origine, dont le "premier passage" ignorait en bloc tout ce
-    qui se trouvait dans le flux à CHAQUE démarrage (pas seulement le tout
-    premier), ce qui pouvait faire perdre silencieusement un épisode sorti
-    pile au moment d'un redémarrage. Ici, le flag "premier passage" ne se
-    déclenche que si l'historique est totalement vide (aucun guid jamais vu).
+    qu'il ait été traité avec succès, ignoré (softsub) ou échoué. Sert à
+    ne JAMAIS retraiter un guid déjà vu, y compris après un redémarrage du
+    bot — contrairement au script d'origine, dont le "premier passage"
+    ignorait en bloc tout ce qui se trouvait dans le flux à CHAQUE
+    démarrage (pas seulement le tout premier), ce qui pouvait faire perdre
+    silencieusement un épisode sorti pile au moment d'un redémarrage. Ici,
+    le flag "premier passage" ne se déclenche que si l'historique est
+    totalement vide (aucun guid jamais vu).
 """
 from __future__ import annotations
 
@@ -44,6 +55,7 @@ from colab_leecher.engines.tsundere_rss import (
     extract_video_url,
     fetch_feed,
     get_title,
+    is_hardsub,
     prepare_file,
     source_priority,
 )
@@ -175,7 +187,9 @@ async def _process_entry(guid: str, entry, store: dict) -> None:
 
 async def _try_alternative_source(title: str, guid: str, store: dict) -> bool:
     """Recherche, dans le flux courant, une autre publication du même
-    épisode (même episode_key) dont la source n'a pas déjà été essayée."""
+    épisode (même episode_key) dont la source n'a pas déjà été essayée.
+    Ne considère que des candidates HARDSUB, pour rester cohérent avec le
+    filtre appliqué en amont dans _poll_loop()."""
     try:
         feed = await fetch_feed()
         current_key = episode_key(title)
@@ -184,6 +198,8 @@ async def _try_alternative_source(title: str, guid: str, store: dict) -> bool:
         for other in getattr(feed, "entries", []) or []:
             other_title = get_title(other)
             if episode_key(other_title) != current_key:
+                continue
+            if not is_hardsub(other_title):
                 continue
             other_guid = _entry_guid(other) or other_title
             if other_guid == guid or _is_known(store, other_guid):
@@ -250,8 +266,25 @@ async def _poll_loop() -> None:
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            groups: dict[str, list] = {}
+            # Filtre HARDSUB uniquement : les releases softsub (sans
+            # "hardsub" dans le titre) sont marquées vues mais jamais
+            # traitées — voir docstring en tête de fichier.
+            hardsub_entries = []
             for guid, entry in new_entries:
+                title = get_title(entry)
+                if is_hardsub(title):
+                    hardsub_entries.append((guid, entry))
+                else:
+                    log.info("⏭️ Softsub ignoré (attente HARDSUB) : %s", title)
+                    _mark_seen(store, guid)
+            _save_store(store)
+
+            if not hardsub_entries:
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            groups: dict[str, list] = {}
+            for guid, entry in hardsub_entries:
                 key = episode_key(get_title(entry))
                 groups.setdefault(key, []).append((guid, entry))
 
