@@ -46,6 +46,7 @@ import uuid
 from pathlib import Path
 
 from pyrogram import filters
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from colab_leecher import OWNER, colab_bot
 from colab_leecher.engines.tsundere_rss import (
@@ -114,6 +115,162 @@ def _entry_guid(entry) -> str:
     ).strip()
 
 
+def _pick_untested_hardsub_entry(entries, store: dict):
+    """Sélectionne, dans les entrées du flux (ordre brut, plus récent en
+    premier), la première release HARDSUB pas encore connue (ni "seen" ni
+    "processed"). Utilisée par /tsundere_test pour ne JAMAIS tomber sur une
+    version softsub que le tracker automatique ignorerait de toute façon —
+    c'est cette divergence qui causait le double téléchargement : le test
+    prenait entries[0] à l'aveugle (parfois softsub), pendant que le
+    tracker traitait en parallèle la vraie version hardsub avec un guid
+    différent, sous un autre nom de fichier."""
+    for entry in entries:
+        guid = _entry_guid(entry) or get_title(entry)
+        if _is_known(store, guid):
+            continue
+        if not is_hardsub(get_title(entry)):
+            continue
+        return guid, entry
+    return None, None
+
+
+# ═════════════════════════════════════════════════════════════
+# Verrou anti-doublon par épisode
+# ═════════════════════════════════════════════════════════════
+#
+# Empêche de traiter deux fois le MÊME épisode en parallèle (softsub et
+# hardsub d'un même épisode ont des guids différents mais la même
+# episode_key). Ce cas-là n'a pas besoin de demander à l'owner : le
+# hardsub gagne toujours, silencieusement, comme le fait déjà le tri par
+# source_priority. Skip silencieux, pas de bouton.
+
+_processing_keys: set[str] = set()
+
+
+# ═════════════════════════════════════════════════════════════
+# File d'attente des téléchargements + choix de priorité par boutons
+# ═════════════════════════════════════════════════════════════
+#
+# Un seul téléchargement/upload à la fois (bande passante et disque
+# partagés sur Colab). Si une deuxième tâche (test manuel OU poll
+# automatique) arrive alors qu'une autre tourne déjà — ou qu'une autre
+# attend déjà — au lieu de la lancer en parallèle ou de choisir un ordre
+# silencieusement, on envoie à l'owner une liste avec un bouton par
+# épisode en attente ("Anime 1", "Anime 2", ...) pour qu'il choisisse
+# lequel passer en premier une fois le slot libéré. Sans réponse, l'ordre
+# d'arrivée (FIFO) s'applique par défaut.
+#
+# Dans le cas courant (un seul épisode à la fois, ce qui est la quasi
+# totalité du temps), aucun message n'est envoyé : le slot est libre, la
+# tâche démarre immédiatement, exactement comme avant.
+
+_active_title: str | None = None
+_waiting_jobs: dict[str, "_WaitingJob"] = {}
+
+
+class _WaitingJob:
+    __slots__ = ("token", "title", "event", "priority")
+
+    def __init__(self, title: str):
+        self.token = uuid.uuid4().hex[:8]
+        self.title = title
+        self.event = asyncio.Event()
+        self.priority = False  # True une fois choisi par l'owner via bouton
+
+
+async def _acquire_download_slot(title: str) -> "_WaitingJob | None":
+    """Bloque jusqu'à ce que ce soit le tour de `title`. Retourne le
+    _WaitingJob créé (à repasser à _release_download_slot), ou None si le
+    slot était libre immédiatement — cas normal, pas de file à gérer."""
+    global _active_title
+
+    if _active_title is None and not _waiting_jobs:
+        _active_title = title
+        return None
+
+    job = _WaitingJob(title)
+    _waiting_jobs[job.token] = job
+    log.info("⏸️ Mis en attente (slot occupé par « %s ») : %s", _active_title, title)
+    await _ask_priority()
+
+    await job.event.wait()
+    _active_title = title
+    return job
+
+
+def _release_download_slot(job: "_WaitingJob | None") -> None:
+    """À appeler dans le `finally` du téléchargement/upload. Libère le
+    slot et réveille le prochain job en attente : celui marqué priority
+    (choisi via bouton) en premier, sinon le plus ancien arrivé (FIFO)."""
+    global _active_title
+    _active_title = None
+
+    if job is not None:
+        _waiting_jobs.pop(job.token, None)
+
+    if not _waiting_jobs:
+        return
+
+    next_job = min(
+        _waiting_jobs.values(),
+        key=lambda j: (0 if j.priority else 1, j.token),
+    )
+    next_job.event.set()
+
+
+async def _ask_priority() -> None:
+    """Envoie un message avec un bouton par épisode actuellement en
+    attente, pour que l'owner choisisse lequel traiter en priorité dès que
+    le téléchargement en cours se termine. N'est appelé que lors d'une
+    vraie collision (voir _acquire_download_slot)."""
+    jobs = list(_waiting_jobs.values())
+    if not jobs:
+        return
+
+    lines = ["⏸️ <b>Plusieurs épisodes prêts en même temps.</b>"]
+    if _active_title:
+        lines.append(f"▶️ En cours : <code>{_active_title}</code>")
+    lines.append("")
+    lines.append("Choisis lequel traiter en priorité ensuite (sinon, ordre d'arrivée) :")
+
+    buttons = []
+    for i, job in enumerate(jobs, start=1):
+        lines.append(f"{i}️⃣ <code>{job.title}</code>")
+        buttons.append([InlineKeyboardButton(f"Anime {i}", callback_data=f"tsundere_pick:{job.token}")])
+
+    try:
+        await colab_bot.send_message(
+            chat_id=OWNER,
+            text="\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    except Exception:
+        log.exception("❌ Impossible d'envoyer le choix de priorité")
+
+
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_pick:"))
+async def cb_tsundere_pick(client, callback_query):
+    if callback_query.from_user.id != OWNER:
+        await callback_query.answer("Pas autorisé.", show_alert=True)
+        return
+
+    token = callback_query.data.split(":", 1)[1]
+    job = _waiting_jobs.get(token)
+    if job is None:
+        await callback_query.answer("Cet épisode n'est plus en attente.", show_alert=True)
+        return
+
+    job.priority = True
+    await callback_query.answer(f"✅ Priorité donnée : {job.title}"[:200])
+    try:
+        await callback_query.message.edit_text(
+            f"✅ <b>Priorité donnée</b>\n\n<code>{job.title}</code>\n\n"
+            "Sera traité juste après le téléchargement en cours."
+        )
+    except Exception:
+        pass
+
+
 # ═════════════════════════════════════════════════════════════
 # Traitement d'une publication
 # ═════════════════════════════════════════════════════════════
@@ -130,59 +287,85 @@ async def _notify(text: str, msg=None):
         return msg
 
 
-async def _process_entry(guid: str, entry, store: dict) -> None:
+async def _process_entry(guid: str, entry, store: dict, *, _lock: bool = True) -> None:
+    """_lock=False : utilisé uniquement par _try_alternative_source(), qui
+    est déjà appelée depuis un contexte où la clé de l'épisode est verrouillée
+    (elle réessaie une autre source pour le MÊME épisode) — reposer le
+    verrou ici la ferait échouer à tort (elle se verrait déjà "prise")."""
     title = get_title(entry)
-    video_url = extract_video_url(entry)
+    key = episode_key(title)
 
-    if not video_url or "1fichier.com" in video_url.lower():
-        if video_url:
-            log.info("⏭️ 1fichier ignoré : %s", video_url)
-        else:
-            log.warning("⚠️ Aucune URL exploitable pour : %s", title)
-        if await _try_alternative_source(title, guid, store):
+    if _lock:
+        if key in _processing_keys:
+            log.info("⏭️ Épisode déjà en cours de traitement ailleurs, skip : %s", title)
             return
-        _mark_seen(store, guid)
-        _save_store(store)
-        return
-
-    log.info("🔗 URL trouvée : %s", video_url)
-    status_msg = await _notify(f"🍥 <b>Nouvel épisode détecté</b>\n\n<code>{title}</code>\n\n⏳ Téléchargement...")
-
-    job_id = uuid.uuid4().hex[:8]
-    job_dir = Path(f"{Paths.temp_cc_path}_tsundere_{job_id}")
+        _processing_keys.add(key)
 
     try:
-        file_path = await asyncio.to_thread(_download_video, video_url, job_dir)
-        log.info("📥 Téléchargement terminé : %s", file_path.name)
+        video_url = extract_video_url(entry)
 
-        if not check_file_size(file_path):
-            raise RuntimeError("Fichier trop volumineux ou invalide.")
-
-        prepared = await asyncio.to_thread(prepare_file, file_path)
-
-        await _notify(f"🍥 <b>{title}</b>\n\n📤 Envoi vers Telegram...", status_msg)
-        await Leech(str(job_dir), True, convert_videos=False, status_msg=status_msg)
-
-        _mark_processed(store, guid, title, video_url)
-        _save_store(store)
-        log.info("✅ Publication traitée : %s", title)
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
-    except Exception as exc:
-        log.exception("❌ Erreur pendant le traitement : %s", title)
-        await _notify(f"❌ <b>{title}</b>\n\n<code>{exc}</code>", status_msg)
-        # Pas de mark_processed : le guid reste hors de "processed", mais
-        # une source alternative peut encore être tentée juste en dessous.
-        if not await _try_alternative_source(title, guid, store):
+        if not video_url or "1fichier.com" in video_url.lower():
+            if video_url:
+                log.info("⏭️ 1fichier ignoré : %s", video_url)
+            else:
+                log.warning("⚠️ Aucune URL exploitable pour : %s", title)
+            if await _try_alternative_source(title, guid, store):
+                return
             _mark_seen(store, guid)
             _save_store(store)
+            return
+
+        log.info("🔗 URL trouvée : %s", video_url)
+
+        # File d'attente : bloque ici si un autre téléchargement tourne
+        # déjà. En cas de collision (autre chose déjà en attente en même
+        # temps), _acquire_download_slot envoie les boutons de choix à
+        # l'owner. Cas normal (rien d'autre en attente) : retour immédiat.
+        slot_job = await _acquire_download_slot(title)
+        if slot_job is not None:
+            log.info("▶️ Tour de : %s", title)
+
+        status_msg = await _notify(f"🍥 <b>Nouvel épisode détecté</b>\n\n<code>{title}</code>\n\n⏳ Téléchargement...")
+
+        job_id = uuid.uuid4().hex[:8]
+        job_dir = Path(f"{Paths.temp_cc_path}_tsundere_{job_id}")
+
+        try:
+            file_path = await asyncio.to_thread(_download_video, video_url, job_dir)
+            log.info("📥 Téléchargement terminé : %s", file_path.name)
+
+            if not check_file_size(file_path):
+                raise RuntimeError("Fichier trop volumineux ou invalide.")
+
+            prepared = await asyncio.to_thread(prepare_file, file_path)
+
+            await _notify(f"🍥 <b>{title}</b>\n\n📤 Envoi vers Telegram...", status_msg)
+            await Leech(str(job_dir), True, convert_videos=False, status_msg=status_msg)
+
+            _mark_processed(store, guid, title, video_url)
+            _save_store(store)
+            log.info("✅ Publication traitée : %s", title)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+        except Exception as exc:
+            log.exception("❌ Erreur pendant le traitement : %s", title)
+            await _notify(f"❌ <b>{title}</b>\n\n<code>{exc}</code>", status_msg)
+            # Pas de mark_processed : le guid reste hors de "processed", mais
+            # une source alternative peut encore être tentée juste en dessous.
+            if not await _try_alternative_source(title, guid, store):
+                _mark_seen(store, guid)
+                _save_store(store)
+        finally:
+            if job_dir.exists():
+                import shutil
+                shutil.rmtree(job_dir, ignore_errors=True)
+            _release_download_slot(slot_job)
     finally:
-        if job_dir.exists():
-            import shutil
-            shutil.rmtree(job_dir, ignore_errors=True)
+        if _lock:
+            _processing_keys.discard(key)
 
 
 async def _try_alternative_source(title: str, guid: str, store: dict) -> bool:
@@ -221,7 +404,7 @@ async def _try_alternative_source(title: str, guid: str, store: dict) -> bool:
         candidates.sort(key=lambda x: x[0])
         _, selected_entry, selected_guid = candidates[0]
         log.info("🎯 Source alternative trouvée pour %s", title)
-        await _process_entry(selected_guid, selected_entry, store)
+        await _process_entry(selected_guid, selected_entry, store, _lock=False)
         return True
 
     except Exception:
@@ -349,15 +532,30 @@ async def cmd_tsundere_test(client, message):
         if not entries:
             await message.reply_text("❌ Aucun élément trouvé dans le flux.")
             return
-        entry = entries[0]
+
+        store = _load_store()
+
+        # ⚠️ Avant : `entry = entries[0]` sans filtre HARDSUB ni check
+        # _is_known -> pouvait tomber sur une release softsub que le
+        # tracker automatique ignore de son côté, pendant que celui-ci
+        # traitait en parallèle la vraie version hardsub (guid différent,
+        # même épisode) -> téléchargement en double.
+        # Maintenant : même logique de sélection que le tracker (HARDSUB
+        # uniquement, jamais un guid déjà connu).
+        guid, entry = _pick_untested_hardsub_entry(entries, store)
+        if entry is None:
+            await message.reply_text(
+                "❌ Aucun épisode HARDSUB non traité trouvé dans le flux "
+                "(soit tout est déjà connu, soit rien n'est encore hardsub)."
+            )
+            return
+
         title = get_title(entry)
         video_url = extract_video_url(entry)
         if not video_url:
             await message.reply_text(f"❌ Vidéo introuvable.\n\n📺 {title}")
             return
         await message.reply_text(f"✅ Trouvé : {title}\n\n🔗 {video_url}\n\n📥 Traitement...")
-        store = _load_store()
-        guid = _entry_guid(entry) or title
         await _process_entry(guid, entry, store)
         await message.reply_text("✅ Test terminé.")
     except Exception as exc:
