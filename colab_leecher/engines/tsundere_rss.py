@@ -43,6 +43,8 @@ CHECK_INTERVAL = 120
 # 4 Go en compte premium) — 1.95 Go pour ne jamais frôler le seuil réel.
 MAX_FILE_SIZE = 1_950 * 1024 * 1024
 
+_HARDSUB_RE = re.compile(r"\bhardsub\b", re.IGNORECASE)
+
 
 # ============================================================
 # UTILITAIRES TEXTE
@@ -84,6 +86,22 @@ def is_video_url(url: str) -> bool:
         ".m3u8?", "/video/", "/stream/", "/download/", "master.m3u8", "playlist.m3u8",
     )
     return any(x in lower for x in video_keywords)
+
+
+def is_hardsub(title: str) -> bool:
+    """
+    True si le titre indique une release HARDSUB (sous-titres incrustés
+    dans l'image). Le flux RSS filtre déjà la langue (FRENCH / SUBFRENCH /
+    MULTI via RSS_URL) mais renvoie aussi bien du softsub (piste de
+    sous-titres à part, .ass/.srt en dehors de la vidéo) que du hardsub.
+
+    Le tracker n'utilise cette fonction que pour DÉCIDER quelle release
+    traiter : les releases softsub (sans "hardsub" dans le titre) sont
+    ignorées tant qu'une version hardsub du même épisode n'est pas sortie,
+    pour ne jamais envoyer la version softsub en premier puis renvoyer un
+    doublon quand le hardsub arrive ensuite.
+    """
+    return bool(_HARDSUB_RE.search(str(title or "")))
 
 
 # ============================================================
