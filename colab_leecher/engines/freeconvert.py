@@ -318,11 +318,6 @@ def _create_hardsub_payload(
                 "input": "import-video",
                 "input_format": input_format,
                 "output_format": output_format,
-                # Sans ça, FreeConvert nomme le fichier exporté d'après le
-                # nom d'origine de la vidéo source (repris de video_url) au
-                # lieu du nom déjà reconstruit par smart_rename.py -- résultat :
-                # le lien de secours (safety-net) affiché à l'utilisateur en
-                # cas de plantage pointait vers l'ancien nom, pas le nouveau.
                 "filename": os.path.basename(output_filename),
                 "options": options,
             },
@@ -354,51 +349,27 @@ async def hardsub_remote_url(
     tel quel le style écrit dans le fichier sous-titre reçu.
 
     `style_key` sélectionne le preset de rendu ("a" ou "b", voir
-    house_style.STYLE_PRESETS) — choisi par l'utilisateur juste après la
-    résolution, avant l'envoi du sous-titre. Chaque nom de style trouvé dans
-    le fichier source (TopLeft, TopCenter, ..., BottomCenter, Default, ou un
-    nom tiers inconnu) reçoit automatiquement le bon alignment pour ce
-    preset — voir house_style.apply_hardsub_style.
+    house_style.STYLE_PRESETS).
 
-    resize : optionnel — (largeur, hauteur) cible, ex (854, 480) pour du
-    480p. Réduit le temps de traitement FreeConvert ET le poids du fichier
-    final. None = garde la résolution d'origine.
+    resize : optionnel — (largeur, hauteur) cible.
 
     url_cb : optionnel — appelé avec le lien de téléchargement direct dès
     que FreeConvert a fini son job, AVANT qu'on commence à télécharger le
-    résultat. Sert de filet de sécurité : si le download/upload plante
-    ensuite, l'utilisateur a déjà le lien pour récupérer le fichier lui-même.
+    résultat.
     """
     keys = parse_api_keys(api_keys)
     api_key = await pick_working_key(keys)
     cfg = QUALITY_PROFILES[normalize_quality_profile(quality_profile)]
 
-    # source_name arrive parfois encore URL-encodé (ex: "%20" au lieu
-    # d'espace) quand il provient d'une URL ou d'un nom de fichier extrait
-    # d'un lien. On le décode AVANT de construire le nom final, sinon la
-    # vidéo (et le sous-titre, voir plus bas) ressortent avec des "%20"
-    # littéraux dans leur nom une fois envoyés sur Telegram.
     clean_source_name = unquote(source_name)
 
     base = os.path.splitext(os.path.basename(clean_source_name))[0]
     input_format = os.path.splitext(clean_source_name)[1].lstrip(".").lower() or "mkv"
 
-    # Nom final : reprend le vrai nom (titre/saison-épisode/qualité/plateforme)
-    # du fichier source, langue normalisée en VOSTFR et tag de fin remplacé
-    # par Myuus-Raws (voir smart_rename.py). La qualité annoncée suit le
-    # resize choisi (ex: 480p) plutôt que la qualité d'origine du fichier,
-    # pour ne pas induire en erreur sur ce qui est réellement livré.
     quality_override = resolution_label(resize[1]) if resize else None
     output_name = build_final_name(clean_source_name, override_quality=quality_override, output_ext="mp4")
     output_path = os.path.join(dest_dir, output_name)
 
-    # Pré-stylage : force le rendu choisi (style_key), indépendamment de ce
-    # que contenait le fichier source. Ce fichier stylé n'est utilisé QUE
-    # pour construire le payload envoyé à FreeConvert (encodage base64
-    # ci-dessous) -- il n'est plus destiné à être uploadé sur Telegram. On
-    # le supprime juste après l'avoir encodé : le laisser dans dest_dir
-    # (job_dir) le ferait ramasser par Leech() comme un fichier à envoyer en
-    # plus de la vidéo.
     styled_sub_path = os.path.join(dest_dir, f"{base}.VOSTFR.ass")
     apply_hardsub_style(subtitle_path, styled_sub_path, style_key=style_key)
     try:
