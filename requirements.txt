@@ -21,4 +21,4 @@ yt_dlp
 pymegatools
 ffmpeg
 feedparser
-transferit
+transferit-py
