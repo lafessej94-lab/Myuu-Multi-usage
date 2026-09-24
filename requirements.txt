@@ -20,3 +20,5 @@ uvloop
 yt_dlp
 pymegatools
 ffmpeg
+feedparser
+transferit
