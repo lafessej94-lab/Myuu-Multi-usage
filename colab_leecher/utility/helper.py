@@ -15,7 +15,7 @@ from pyrogram.errors import BadRequest
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 
 from colab_leecher import SEEDR_PASSWORD, SEEDR_USERNAME, colab_bot
-from colab_leecher.cloudconvert import cc_mode_label, quality_label, resize_label
+from colab_leecher.engines.cloudconvert import cc_mode_label, quality_label, resize_label
 from colab_leecher.utility.variables import BOT, MSG, BotTimes, Messages, Paths
 
 
