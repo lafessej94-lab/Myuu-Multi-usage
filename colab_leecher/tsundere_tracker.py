@@ -289,8 +289,23 @@ def _ensure_tracker():
 # ═════════════════════════════════════════════════════════════
 # Commande de debug (owner only)
 # ═════════════════════════════════════════════════════════════
+#
+# IMPORTANT — group=-1 :
+# nyaa_tracker.py enregistre un handler catch-all sur TOUT message texte
+# privé (filters.text & filters.private & ~filters.command([...liste...])),
+# utilisé pour capter la saisie de date/heure du mode "snipe". "tsundere_test"
+# n'y figure pas. Sans group=-1, ce handler et cmd_tsundere_test seraient
+# tous les deux dans le groupe Pyrogram par défaut (0), où UN SEUL handler
+# par groupe traite chaque update (le premier dont le filtre matche, dans
+# l'ordre d'enregistrement = ordre d'import des modules). Si nyaa_tracker
+# est importé avant tsundere_tracker, son catch-all "avale" silencieusement
+# /tsundere_test (pas de snipe en attente -> retourne sans rien faire) et
+# cmd_tsundere_test n'est jamais atteint. group=-1 place ce handler dans un
+# groupe traité avant le groupe 0, donc il répond quel que soit l'ordre
+# d'import. Même classe de bug que celui déjà rencontré sur la commande
+# Anilist, réglé à l'époque de la même façon.
 
-@colab_bot.on_message(filters.command("tsundere_test") & filters.private)
+@colab_bot.on_message(filters.command("tsundere_test") & filters.private, group=-1)
 async def cmd_tsundere_test(client, message):
     if message.chat.id != OWNER:
         return
