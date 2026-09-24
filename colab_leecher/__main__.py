@@ -202,6 +202,9 @@ async def help_cmd(client, message):
         "  /nyaa_list           — watchlist\n"
         "  /nyaa_check          — poll now\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🍥 <b>Tsundere.to Tracker</b>\n"
+        "  /tsundere_test — force une vérification manuelle\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🎛 <b>Options (after link)</b>\n"
         "  <code>[name.ext]</code>  — custom filename\n"
         "  <code>{pass}</code>     — zip password\n"
@@ -732,7 +735,7 @@ async def handle_photo(client, message):
 
 
 # ══════════════════════════════════════════════
-#  Import nyaa_tracker (registers its handlers)
+#  Import nyaa_tracker / tsundere_tracker (registers their handlers)
 # ══════════════════════════════════════════════
 
 try:
@@ -740,6 +743,12 @@ try:
     logging.info("📡 Nyaa tracker loaded")
 except Exception as e:
     logging.warning(f"Nyaa tracker not loaded: {e}")
+
+try:
+    import colab_leecher.tsundere_tracker
+    logging.info("🍥 Tsundere RSS tracker loaded")
+except Exception as e:
+    logging.warning(f"Tsundere RSS tracker not loaded: {e}")
 
 try:
     import colab_leecher.services.Aniliste
