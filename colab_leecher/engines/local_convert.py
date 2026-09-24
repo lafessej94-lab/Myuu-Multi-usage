@@ -11,9 +11,6 @@ from typing import Awaitable, Callable, Optional
 
 ProgressCB = Optional[Callable[[float, str], Awaitable[None]]]
 
-# Hauteur cible en pixels — la largeur est calculée automatiquement pour
-# garder le ratio d'origine (scale=-2:H, le -2 garantit une largeur paire,
-# requise par le codec libx264).
 RESOLUTIONS: dict[str, int] = {
     "480": 480,
     "720": 720,
@@ -54,8 +51,7 @@ async def convert_resolution(
 ) -> str:
     """
     Convertit une vidéo à la résolution cible (hauteur en pixels) via ffmpeg
-    local. Preset "veryfast" par défaut — le CPU partagé de Colab n'a pas la
-    puissance d'un serveur cloud dédié, donc on privilégie la vitesse.
+    local. Preset "veryfast" par défaut.
     """
     duration = await _probe_duration(input_path)
 
@@ -103,9 +99,7 @@ async def merge_audio_video(
 ) -> str:
     """
     Fusionne une vidéo et un fichier audio séparé. La piste vidéo n'est PAS
-    ré-encodée (copy — rapide, aucune perte de qualité), seule la piste
-    audio est (ré)encodée en AAC. Le résultat dure aussi longtemps que la
-    plus courte des deux pistes (-shortest).
+    ré-encodée (copy), seule la piste audio est (ré)encodée en AAC.
     """
     duration = await _probe_duration(video_path)
 
