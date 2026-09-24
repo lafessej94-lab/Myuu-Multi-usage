@@ -19,7 +19,7 @@ Réutilise les briques déjà existantes du repo plutôt que de les
 réimplémenter : fetch_urls_via_seedr (colab_leecher.engines.seedr),
 probe_remote_video / pick_french_text_subtitle / extract_subtitle_from_url
 (colab_leecher.services.subtitle_probe), hardsub_remote_url
-(colab_leecher.freeconvert), upload_file (colab_leecher.uploader.telegram).
+(colab_leecher.engines.freeconvert), upload_file (colab_leecher.uploader.telegram).
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from colab_leecher.services.subtitle_probe import (
     pick_french_text_subtitle,
     probe_remote_video,
 )
-from colab_leecher.freeconvert import hardsub_remote_url as fc_hardsub_remote_url
+from colab_leecher.engines.freeconvert import hardsub_remote_url as fc_hardsub_remote_url
 from colab_leecher.uploader.telegram import upload_file
 from colab_leecher.utility.helper import fileType
 
