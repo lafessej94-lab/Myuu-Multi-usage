@@ -16,7 +16,7 @@ Workflow automatisé une fois l'agent actif :
   7. Chaque résultat est uploadé sur Telegram (chat de l'OWNER)
 
 Réutilise les briques déjà existantes du repo plutôt que de les
-réimplémenter : fetch_urls_via_seedr (colab_leecher.seedr),
+réimplémenter : fetch_urls_via_seedr (colab_leecher.engines.seedr),
 probe_remote_video / pick_french_text_subtitle / extract_subtitle_from_url
 (colab_leecher.services.subtitle_probe), hardsub_remote_url
 (colab_leecher.freeconvert), upload_file (colab_leecher.uploader.telegram).
@@ -42,7 +42,7 @@ from email.utils import parsedate_to_datetime
 
 from colab_leecher import OWNER, colab_bot
 from colab_leecher.utility.variables import BOT, Paths
-from colab_leecher.seedr import SeedrError, _del_folder, fetch_urls_via_seedr
+from colab_leecher.engines.seedr import SeedrError, _del_folder, fetch_urls_via_seedr
 from colab_leecher.services.subtitle_probe import (
     extract_subtitle_from_url,
     pick_french_text_subtitle,
