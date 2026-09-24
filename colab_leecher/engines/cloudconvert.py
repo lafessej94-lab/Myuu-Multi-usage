@@ -327,10 +327,8 @@ async def _wait_for_job(
 async def _download_file(url: str, dest_path: str, progress_cb: ProgressCB = None) -> str:
     """
     Télécharge le résultat CloudConvert via aria2c — même approche que
-    FreeConvert (voir freeconvert.py::_download_file) : une seule connexion
-    (-x1 -s1) par sécurité si le lien d'export ne supporte pas le
-    multi-range, avec retries et timeout pour ne jamais rester bloqué.
-    Fallback aiohttp mono-connexion si aria2c est indisponible.
+    FreeConvert : une seule connexion (-x1 -s1) par sécurité, avec retries
+    et timeout. Fallback aiohttp mono-connexion si aria2c est indisponible.
     """
     dest_dir = os.path.dirname(dest_path) or "."
     dest_name = os.path.basename(dest_path)
@@ -371,9 +369,6 @@ async def _download_file(url: str, dest_path: str, progress_cb: ProgressCB = Non
         if code != 0 or not os.path.exists(dest_path):
             raise RuntimeError(f"aria2c download failed (code {code})")
     except Exception:
-        # Filet de sécurité : si aria2c plante pour une raison quelconque,
-        # on retombe sur le téléchargement mono-connexion classique plutôt
-        # que de perdre le job entier.
         return await _download_file_aiohttp_fallback(url, dest_path, progress_cb)
 
     if progress_cb:
@@ -546,12 +541,6 @@ async def _create_hardsub_job(
     s_safe = _arg_safe(subtitle_filename)
     o_safe = _arg_safe(output_filename)
 
-    # Force le preset de style choisi (police/gras/contour/ombre, alignment
-    # par position) avant l'envoi, comme pour FreeConvert — sinon ffmpeg
-    # utiliserait le style brut du fichier source, qui varie selon d'où
-    # vient le sous-titre. apply_hardsub_style() choisit le profil tout
-    # seul par nom de style (BottomCenter/TopCenter/...) pour le preset
-    # sélectionné (style_key).
     styled_sub_path = subtitle_path + ".styled.ass"
     apply_hardsub_style(subtitle_path, styled_sub_path, style_key=style_key)
     with open(styled_sub_path, "rb") as fh:
@@ -565,8 +554,6 @@ async def _create_hardsub_job(
     escaped = sub_path_in_cc.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
     ext = os.path.splitext(subtitle_filename)[1].lower()
     filter_name = "ass" if ext in {".ass", ".ssa"} else "subtitles"
-    # Le hardsub (burn des subs) doit passer AVANT le scale dans la chaîne -vf,
-    # sinon le style ASS (contour/police) est calculé sur la mauvaise résolution.
     vf = f"{filter_name}='{escaped}'"
     if scale_height > 0:
         vf += f",scale=-2:{scale_height}"
@@ -788,14 +775,11 @@ async def hardsub_remote_url(
 ) -> str:
     """
     `style_key` sélectionne le preset de rendu ("a" ou "b", voir
-    house_style.STYLE_PRESETS) — choisi par l'utilisateur juste après la
-    résolution.
+    house_style.STYLE_PRESETS).
 
     url_cb : optionnel — appelé avec le lien de téléchargement direct dès
     que CloudConvert a fini son job, AVANT qu'on commence à télécharger le
-    résultat. Filet de sécurité : si le download/upload plante ensuite,
-    l'utilisateur a déjà le lien pour récupérer le fichier lui-même
-    (même principe que freeconvert.py::hardsub_remote_url).
+    résultat.
     """
     keys = parse_api_keys(api_keys)
     api_key, _ = await pick_best_key(keys)
@@ -803,11 +787,6 @@ async def hardsub_remote_url(
     preset = _encode_speed_to_preset(encode_speed, base_preset)
     scale_height = _resolution_to_height(resolution)
 
-    # Nom final : reprend le vrai nom (titre/saison-épisode/qualité/plateforme)
-    # du fichier source, langue normalisée en VOSTFR et tag de fin remplacé
-    # par Myuus-Raws (voir smart_rename.py). La qualité annoncée suit la
-    # résolution choisie plutôt que celle d'origine, pour ne pas induire en
-    # erreur sur ce qui est réellement livré.
     quality_override = resolution_label(scale_height) if scale_height > 0 else None
     output_name = build_final_name(source_name, override_quality=quality_override, output_ext="mp4")
     output_path = os.path.join(dest_dir, output_name)
