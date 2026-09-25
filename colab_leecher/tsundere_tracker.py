@@ -1,39 +1,41 @@
 """
 colab_leecher/tsundere_tracker.py
 
-Surveillance automatique du flux RSS tsundere.to pour myuu — même esprit
-que nyaa_tracker.py : module auto-enregistré (importé une fois dans
-__main__.py, s'abonne lui-même à colab_bot), toujours actif en fond dès le
-démarrage du bot, aucune commande requise pour l'activer.
+Surveillance du flux RSS tsundere.to pour myuu.
+
+Contrairement à la version d'origine, ce module NE démarre PLUS tout seul
+à l'import (plus de boucle de fond continue par défaut). Il ne fait
+quelque chose que sur commande explicite :
+
+  /online_tsundere  -> récupère le flux UNE FOIS, affiche la liste des
+                        animes HARDSUB dispo (dédupliqués, sans tags
+                        d'épisode) avec un bouton par anime (sélection
+                        multiple), plus Done/Cancel. La liste est figée :
+                        elle ne se rafraîchit pas pendant que le menu est
+                        ouvert.
+  /off_tsundere     -> annule toute sélection en cours et repasse le
+                        tracker à OFF.
 
 Le travail (parsing RSS, extraction de source, téléchargement, validation)
 vit dans colab_leecher/engines/tsundere_rss.py — ce module-ci ne fait que
-l'orchestration Telegram : boucle de surveillance, persistance JSON de
-l'historique, et l'upload via le pipeline existant (Leech — renommage
-smart_rename + forward automatique vers les dumps configurés via /add,
-exactement comme n'importe quel autre leech du bot).
+l'orchestration Telegram.
 
-Filtre HARDSUB uniquement : le flux RSS (RSS_URL dans engines/tsundere_rss.py)
-filtre déjà par langue (FRENCH / SUBFRENCH / MULTI) mais renvoie aussi bien
-du softsub (piste de sous-titres séparée) que du hardsub (sous-titres
-incrustés). Le tracker ignore toute release dont le titre ne contient pas
-"HARDSUB" — elle est marquée "seen" (pour ne pas être réévaluée à chaque
-poll) mais jamais traitée/envoyée. Si la version hardsub du même épisode
-sort ensuite (guid différent), elle sera traitée normalement au poll
-suivant. Ça évite d'envoyer la version softsub en premier, puis un doublon
-quand le hardsub arrive.
+Filtre HARDSUB uniquement : le flux RSS renvoie aussi bien du softsub
+(piste de sous-titres séparée) que du hardsub (sous-titres incrustés).
+Seules les releases HARDSUB apparaissent dans la liste de sélection.
 
 Historique JSON (data/tsundere_processed.json) à deux clés :
   - "processed" : guid -> {title, url, at} — épisode réellement envoyé.
-  - "seen"      : guid -> timestamp — guid déjà rencontré dans le flux,
-    qu'il ait été traité avec succès, ignoré (softsub) ou échoué. Sert à
-    ne JAMAIS retraiter un guid déjà vu, y compris après un redémarrage du
-    bot — contrairement au script d'origine, dont le "premier passage"
-    ignorait en bloc tout ce qui se trouvait dans le flux à CHAQUE
-    démarrage (pas seulement le tout premier), ce qui pouvait faire perdre
-    silencieusement un épisode sorti pile au moment d'un redémarrage. Ici,
-    le flag "premier passage" ne se déclenche que si l'historique est
-    totalement vide (aucun guid jamais vu).
+  - "seen"      : guid -> timestamp — guid déjà rencontré, traité avec
+    succès ou non. Sert à ne jamais retraiter un guid déjà vu.
+
+NOTE : les fonctions _poll_loop()/_ensure_tracker() de la version d'origine
+(boucle de surveillance continue + auto-traitement de tout ce qui sort)
+sont conservées ci-dessous mais NE SONT PLUS appelées automatiquement.
+Elles restent disponibles si tu veux un jour relancer un mode 100%
+automatique en plus du menu manuel — dis-moi si c'est ce que tu veux pour
+le moteur Unreal Engine 4, ou si celui-ci doit avoir sa propre boucle
+séparée (c'est ce que j'ai fait dans engines/unreal_engine4.py).
 """
 from __future__ import annotations
 
@@ -51,18 +53,26 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from colab_leecher import OWNER, colab_bot
 from colab_leecher.engines.tsundere_rss import (
     CHECK_INTERVAL,
+    anime_name,
     check_file_size,
     episode_key,
     extract_video_url,
     fetch_feed,
     get_title,
     is_hardsub,
+    list_available_animes,
     prepare_file,
     source_priority,
 )
 from colab_leecher.engines.tsundere_rss import download_video as _download_video
 from colab_leecher.utility.handler import Leech
 from colab_leecher.utility.variables import Paths
+
+# À VÉRIFIER : nom réel de la fonction de compression dans
+# engines/freeconvert.py — deviné par analogie avec cloudconvert.py
+# (convert_file/resize_file/compress_file). Montre-moi ce fichier pour
+# que je corrige l'import si besoin.
+from colab_leecher.engines.freeconvert import compress_file
 
 log = logging.getLogger(__name__)
 
@@ -115,55 +125,237 @@ def _entry_guid(entry) -> str:
     ).strip()
 
 
-def _pick_untested_hardsub_entry(entries, store: dict):
-    """Sélectionne, dans les entrées du flux (ordre brut, plus récent en
-    premier), la première release HARDSUB pas encore connue (ni "seen" ni
-    "processed"). Utilisée par /tsundere_test pour ne JAMAIS tomber sur une
-    version softsub que le tracker automatique ignorerait de toute façon —
-    c'est cette divergence qui causait le double téléchargement : le test
-    prenait entries[0] à l'aveugle (parfois softsub), pendant que le
-    tracker traitait en parallèle la vraie version hardsub avec un guid
-    différent, sous un autre nom de fichier."""
-    for entry in entries:
-        guid = _entry_guid(entry) or get_title(entry)
-        if _is_known(store, guid):
-            continue
-        if not is_hardsub(get_title(entry)):
-            continue
-        return guid, entry
-    return None, None
+# ═════════════════════════════════════════════════════════════
+# Notification (DM owner)
+# ═════════════════════════════════════════════════════════════
+
+async def _notify(text: str, msg=None):
+    """Crée ou édite un message de statut dans le DM du owner."""
+    try:
+        if msg is None:
+            return await colab_bot.send_message(chat_id=OWNER, text=text)
+        return await msg.edit_text(text)
+    except Exception:
+        return msg
 
 
 # ═════════════════════════════════════════════════════════════
-# Verrou anti-doublon par épisode
+# Toggle + session de sélection manuelle (/online_tsundere)
+# ═════════════════════════════════════════════════════════════
+
+_online: bool = False
+
+
+class _SelectSession:
+    __slots__ = ("names", "entries_by_name", "selected", "message")
+
+    def __init__(self, names: list[str], entries_by_name: dict):
+        self.names = names
+        self.entries_by_name = entries_by_name  # anime_name -> entry (meilleure source trouvée)
+        self.selected: set[str] = set()
+        self.message = None
+
+
+_session: "_SelectSession | None" = None
+
+
+def _build_menu_markup(session: "_SelectSession") -> InlineKeyboardMarkup:
+    rows = []
+    for name in session.names:
+        checked = "✅" if name in session.selected else "⬜"
+        rows.append([InlineKeyboardButton(f"{checked} {name}", callback_data=f"tsundere_toggle:{name}")])
+    rows.append([
+        InlineKeyboardButton("✅ Done", callback_data="tsundere_select_done"),
+        InlineKeyboardButton("❌ Cancel", callback_data="tsundere_select_cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _menu_text(session: "_SelectSession") -> str:
+    return (
+        "🍥 <b>Animes disponibles sur tsundere.to</b>\n\n"
+        "Sélectionne un ou plusieurs animes à récupérer, puis Done "
+        "(ou Cancel pour ne rien faire).\n\n"
+        f"Sélectionnés : <b>{len(session.selected)}</b>"
+    )
+
+
+@colab_bot.on_message(filters.command("online_tsundere") & filters.private, group=-1)
+async def cmd_online_tsundere(client, message):
+    global _online, _session
+    if message.chat.id != OWNER:
+        return
+
+    _online = True
+
+    await message.reply_text("📡 Récupération du flux tsundere.to...")
+    try:
+        feed = await fetch_feed()
+    except Exception as exc:
+        log.exception("❌ Erreur /online_tsundere pendant fetch_feed")
+        await message.reply_text(f"❌ Impossible de récupérer le flux : {exc}")
+        return
+
+    entries = list(getattr(feed, "entries", []) or [])
+    names = list_available_animes(entries)
+
+    if not names:
+        await message.reply_text("❌ Aucun anime HARDSUB disponible dans le flux actuellement.")
+        return
+
+    entries_by_name: dict[str, object] = {}
+    for entry in entries:
+        title = get_title(entry)
+        if not is_hardsub(title):
+            continue
+        name = anime_name(title)
+        if name not in entries_by_name:
+            entries_by_name[name] = entry
+        else:
+            current_url = extract_video_url(entries_by_name[name])
+            candidate_url = extract_video_url(entry)
+            if candidate_url and (
+                not current_url or source_priority(candidate_url) < source_priority(current_url)
+            ):
+                entries_by_name[name] = entry
+
+    _session = _SelectSession(names, entries_by_name)
+    markup = _build_menu_markup(_session)
+    _session.message = await message.reply_text(_menu_text(_session), reply_markup=markup)
+
+
+@colab_bot.on_message(filters.command("off_tsundere") & filters.private, group=-1)
+async def cmd_off_tsundere(client, message):
+    global _online, _session
+    if message.chat.id != OWNER:
+        return
+
+    _online = False
+
+    if _session is not None and _session.message is not None:
+        try:
+            await _session.message.edit_text("🛑 Tracker tsundere désactivé, sélection annulée.")
+        except Exception:
+            pass
+    _session = None
+
+    await message.reply_text("🛑 tsundere_rss est maintenant OFF.")
+
+
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_toggle:"))
+async def cb_tsundere_toggle(client, callback_query):
+    global _session
+    if callback_query.from_user.id != OWNER or _session is None:
+        await callback_query.answer()
+        return
+
+    name = callback_query.data.split(":", 1)[1]
+    if name in _session.selected:
+        _session.selected.discard(name)
+    else:
+        _session.selected.add(name)
+
+    try:
+        await callback_query.message.edit_text(_menu_text(_session), reply_markup=_build_menu_markup(_session))
+    except Exception:
+        pass
+    await callback_query.answer()
+
+
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_select_cancel$"))
+async def cb_tsundere_select_cancel(client, callback_query):
+    global _session
+    if callback_query.from_user.id != OWNER:
+        await callback_query.answer()
+        return
+    _session = None
+    try:
+        await callback_query.message.edit_text("❌ Sélection annulée, rien n'a été lancé.")
+    except Exception:
+        pass
+    await callback_query.answer()
+
+
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_select_done$"))
+async def cb_tsundere_select_done(client, callback_query):
+    global _session
+    if callback_query.from_user.id != OWNER or _session is None:
+        await callback_query.answer()
+        return
+
+    if not _session.selected:
+        await callback_query.answer("Rien de sélectionné — choisis un anime ou clique Cancel.", show_alert=True)
+        return
+
+    chosen = [(name, _session.entries_by_name[name]) for name in _session.selected]
+    try:
+        await callback_query.message.edit_text(
+            "⏳ Traitement de " + ", ".join(n for n, _ in chosen) + " ..."
+        )
+    except Exception:
+        pass
+    await callback_query.answer()
+
+    _session = None
+
+    for name, entry in chosen:
+        await _process_selected_anime(name, entry)
+
+
+async def _process_selected_anime(name: str, entry) -> None:
+    """Téléchargement + compression FreeConvert simple (pas de hardsub
+    burn, la source tsundere.to est déjà hardsub) + upload normal via
+    Leech (forward vers les dumps configurés par /add, comme d'habitude)."""
+    title = get_title(entry)
+    video_url = extract_video_url(entry)
+
+    if not video_url or "1fichier.com" in video_url.lower():
+        await _notify(f"❌ <b>{name}</b>\n\nAucune source exploitable (1fichier exclu ou vide).")
+        return
+
+    status_msg = await _notify(f"🍥 <b>{name}</b>\n\n<code>{title}</code>\n\n⏳ Téléchargement...")
+
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = Path(f"{Paths.temp_cc_path}_tsundere_manual_{job_id}")
+
+    try:
+        file_path = await asyncio.to_thread(_download_video, video_url, job_dir)
+
+        if not check_file_size(file_path):
+            raise RuntimeError("Fichier trop volumineux ou invalide.")
+
+        prepared = await asyncio.to_thread(prepare_file, file_path)
+
+        await _notify(f"🍥 <b>{name}</b>\n\n🗜️ Compression FreeConvert...", status_msg)
+        compressed_path = await asyncio.to_thread(compress_file, prepared)
+
+        await _notify(f"🍥 <b>{name}</b>\n\n📤 Envoi vers Telegram...", status_msg)
+        await Leech(str(compressed_path.parent), True, convert_videos=False, status_msg=status_msg)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        log.info("✅ Traitement manuel terminé : %s", name)
+
+    except Exception as exc:
+        log.exception("❌ Erreur traitement manuel : %s", name)
+        await _notify(f"❌ <b>{name}</b>\n\n<code>{exc}</code>", status_msg)
+    finally:
+        if job_dir.exists():
+            import shutil
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+# ═════════════════════════════════════════════════════════════
+# Ancien mode 100% automatique (conservé, non démarré par défaut)
 # ═════════════════════════════════════════════════════════════
 #
-# Empêche de traiter deux fois le MÊME épisode en parallèle (softsub et
-# hardsub d'un même épisode ont des guids différents mais la même
-# episode_key). Ce cas-là n'a pas besoin de demander à l'owner : le
-# hardsub gagne toujours, silencieusement, comme le fait déjà le tri par
-# source_priority. Skip silencieux, pas de bouton.
+# Ces fonctions restent utilisables (par ex. appelées manuellement, ou
+# reliées à une future commande) mais rien ne les déclenche plus tout
+# seul à l'import — voir la note en haut de fichier.
 
 _processing_keys: set[str] = set()
-
-
-# ═════════════════════════════════════════════════════════════
-# File d'attente des téléchargements + choix de priorité par boutons
-# ═════════════════════════════════════════════════════════════
-#
-# Un seul téléchargement/upload à la fois (bande passante et disque
-# partagés sur Colab). Si une deuxième tâche (test manuel OU poll
-# automatique) arrive alors qu'une autre tourne déjà — ou qu'une autre
-# attend déjà — au lieu de la lancer en parallèle ou de choisir un ordre
-# silencieusement, on envoie à l'owner une liste avec un bouton par
-# épisode en attente ("Anime 1", "Anime 2", ...) pour qu'il choisisse
-# lequel passer en premier une fois le slot libéré. Sans réponse, l'ordre
-# d'arrivée (FIFO) s'applique par défaut.
-#
-# Dans le cas courant (un seul épisode à la fois, ce qui est la quasi
-# totalité du temps), aucun message n'est envoyé : le slot est libre, la
-# tâche démarre immédiatement, exactement comme avant.
-
 _active_title: str | None = None
 _waiting_jobs: dict[str, "_WaitingJob"] = {}
 
@@ -175,75 +367,49 @@ class _WaitingJob:
         self.token = uuid.uuid4().hex[:8]
         self.title = title
         self.event = asyncio.Event()
-        self.priority = False  # True une fois choisi par l'owner via bouton
+        self.priority = False
 
 
 async def _acquire_download_slot(title: str) -> "_WaitingJob | None":
-    """Bloque jusqu'à ce que ce soit le tour de `title`. Retourne le
-    _WaitingJob créé (à repasser à _release_download_slot), ou None si le
-    slot était libre immédiatement — cas normal, pas de file à gérer."""
     global _active_title
-
     if _active_title is None and not _waiting_jobs:
         _active_title = title
         return None
-
     job = _WaitingJob(title)
     _waiting_jobs[job.token] = job
     log.info("⏸️ Mis en attente (slot occupé par « %s ») : %s", _active_title, title)
     await _ask_priority()
-
     await job.event.wait()
     _active_title = title
     return job
 
 
 def _release_download_slot(job: "_WaitingJob | None") -> None:
-    """À appeler dans le `finally` du téléchargement/upload. Libère le
-    slot et réveille le prochain job en attente : celui marqué priority
-    (choisi via bouton) en premier, sinon le plus ancien arrivé (FIFO)."""
     global _active_title
     _active_title = None
-
     if job is not None:
         _waiting_jobs.pop(job.token, None)
-
     if not _waiting_jobs:
         return
-
-    next_job = min(
-        _waiting_jobs.values(),
-        key=lambda j: (0 if j.priority else 1, j.token),
-    )
+    next_job = min(_waiting_jobs.values(), key=lambda j: (0 if j.priority else 1, j.token))
     next_job.event.set()
 
 
 async def _ask_priority() -> None:
-    """Envoie un message avec un bouton par épisode actuellement en
-    attente, pour que l'owner choisisse lequel traiter en priorité dès que
-    le téléchargement en cours se termine. N'est appelé que lors d'une
-    vraie collision (voir _acquire_download_slot)."""
     jobs = list(_waiting_jobs.values())
     if not jobs:
         return
-
     lines = ["⏸️ <b>Plusieurs épisodes prêts en même temps.</b>"]
     if _active_title:
         lines.append(f"▶️ En cours : <code>{_active_title}</code>")
     lines.append("")
     lines.append("Choisis lequel traiter en priorité ensuite (sinon, ordre d'arrivée) :")
-
     buttons = []
     for i, job in enumerate(jobs, start=1):
         lines.append(f"{i}️⃣ <code>{job.title}</code>")
         buttons.append([InlineKeyboardButton(f"Anime {i}", callback_data=f"tsundere_pick:{job.token}")])
-
     try:
-        await colab_bot.send_message(
-            chat_id=OWNER,
-            text="\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        await colab_bot.send_message(chat_id=OWNER, text="\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
     except Exception:
         log.exception("❌ Impossible d'envoyer le choix de priorité")
 
@@ -253,45 +419,33 @@ async def cb_tsundere_pick(client, callback_query):
     if callback_query.from_user.id != OWNER:
         await callback_query.answer("Pas autorisé.", show_alert=True)
         return
-
     token = callback_query.data.split(":", 1)[1]
     job = _waiting_jobs.get(token)
     if job is None:
         await callback_query.answer("Cet épisode n'est plus en attente.", show_alert=True)
         return
-
     job.priority = True
     await callback_query.answer(f"✅ Priorité donnée : {job.title}"[:200])
     try:
         await callback_query.message.edit_text(
-            f"✅ <b>Priorité donnée</b>\n\n<code>{job.title}</code>\n\n"
-            "Sera traité juste après le téléchargement en cours."
+            f"✅ <b>Priorité donnée</b>\n\n<code>{job.title}</code>\n\nSera traité juste après le téléchargement en cours."
         )
     except Exception:
         pass
 
 
-# ═════════════════════════════════════════════════════════════
-# Traitement d'une publication
-# ═════════════════════════════════════════════════════════════
-
-async def _notify(text: str, msg=None):
-    """Crée ou édite un message de statut dans le DM du owner. Jamais dans
-    le chat global (pas de MSG.status_msg touché) — ce tracker tourne en
-    fond, indépendamment de toute tâche utilisateur en cours."""
-    try:
-        if msg is None:
-            return await colab_bot.send_message(chat_id=OWNER, text=text)
-        return await msg.edit_text(text)
-    except Exception:
-        return msg
+def _pick_untested_hardsub_entry(entries, store: dict):
+    for entry in entries:
+        guid = _entry_guid(entry) or get_title(entry)
+        if _is_known(store, guid):
+            continue
+        if not is_hardsub(get_title(entry)):
+            continue
+        return guid, entry
+    return None, None
 
 
 async def _process_entry(guid: str, entry, store: dict, *, _lock: bool = True) -> None:
-    """_lock=False : utilisé uniquement par _try_alternative_source(), qui
-    est déjà appelée depuis un contexte où la clé de l'épisode est verrouillée
-    (elle réessaie une autre source pour le MÊME épisode) — reposer le
-    verrou ici la ferait échouer à tort (elle se verrait déjà "prise")."""
     title = get_title(entry)
     key = episode_key(title)
 
@@ -317,10 +471,6 @@ async def _process_entry(guid: str, entry, store: dict, *, _lock: bool = True) -
 
         log.info("🔗 URL trouvée : %s", video_url)
 
-        # File d'attente : bloque ici si un autre téléchargement tourne
-        # déjà. En cas de collision (autre chose déjà en attente en même
-        # temps), _acquire_download_slot envoie les boutons de choix à
-        # l'owner. Cas normal (rien d'autre en attente) : retour immédiat.
         slot_job = await _acquire_download_slot(title)
         if slot_job is not None:
             log.info("▶️ Tour de : %s", title)
@@ -353,8 +503,6 @@ async def _process_entry(guid: str, entry, store: dict, *, _lock: bool = True) -
         except Exception as exc:
             log.exception("❌ Erreur pendant le traitement : %s", title)
             await _notify(f"❌ <b>{title}</b>\n\n<code>{exc}</code>", status_msg)
-            # Pas de mark_processed : le guid reste hors de "processed", mais
-            # une source alternative peut encore être tentée juste en dessous.
             if not await _try_alternative_source(title, guid, store):
                 _mark_seen(store, guid)
                 _save_store(store)
@@ -369,15 +517,10 @@ async def _process_entry(guid: str, entry, store: dict, *, _lock: bool = True) -
 
 
 async def _try_alternative_source(title: str, guid: str, store: dict) -> bool:
-    """Recherche, dans le flux courant, une autre publication du même
-    épisode (même episode_key) dont la source n'a pas déjà été essayée.
-    Ne considère que des candidates HARDSUB, pour rester cohérent avec le
-    filtre appliqué en amont dans _poll_loop()."""
     try:
         feed = await fetch_feed()
         current_key = episode_key(title)
         candidates = []
-
         for other in getattr(feed, "entries", []) or []:
             other_title = get_title(other)
             if episode_key(other_title) != current_key:
@@ -387,14 +530,12 @@ async def _try_alternative_source(title: str, guid: str, store: dict) -> bool:
             other_guid = _entry_guid(other) or other_title
             if other_guid == guid or _is_known(store, other_guid):
                 continue
-
             other_url = extract_video_url(other)
             if not other_url:
                 continue
             lower_url = other_url.lower()
             if "nekobt.to" in lower_url or "nyaa.si" in lower_url or "1fichier.com" in lower_url:
                 continue
-
             candidates.append((source_priority(other_url), other, other_guid))
 
         if not candidates:
@@ -406,20 +547,14 @@ async def _try_alternative_source(title: str, guid: str, store: dict) -> bool:
         log.info("🎯 Source alternative trouvée pour %s", title)
         await _process_entry(selected_guid, selected_entry, store, _lock=False)
         return True
-
     except Exception:
         log.exception("❌ Erreur pendant la recherche de source alternative")
         return False
 
 
-# ═════════════════════════════════════════════════════════════
-# Boucle de surveillance
-# ═════════════════════════════════════════════════════════════
-
 async def _poll_loop() -> None:
     await asyncio.sleep(15)
     log.info("📡 Surveillance RSS tsundere.to démarrée")
-
     store = _load_store()
     bootstrap = not store["seen"] and not store["processed"]
 
@@ -427,7 +562,7 @@ async def _poll_loop() -> None:
         try:
             feed = await fetch_feed()
             entries = list(getattr(feed, "entries", []) or [])
-            entries.reverse()  # plus ancien -> plus récent
+            entries.reverse()
             log.info("📡 %d publication(s) dans le flux", len(entries))
 
             if bootstrap:
@@ -441,17 +576,11 @@ async def _poll_loop() -> None:
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            new_entries = [
-                (g, e) for e in entries
-                if (g := _entry_guid(e)) and not _is_known(store, g)
-            ]
+            new_entries = [(g, e) for e in entries if (g := _entry_guid(e)) and not _is_known(store, g)]
             if not new_entries:
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            # Filtre HARDSUB uniquement : les releases softsub (sans
-            # "hardsub" dans le titre) sont marquées vues mais jamais
-            # traitées — voir docstring en tête de fichier.
             hardsub_entries = []
             for guid, entry in new_entries:
                 title = get_title(entry)
@@ -475,15 +604,12 @@ async def _poll_loop() -> None:
                 def _prio(item):
                     url = extract_video_url(item[1])
                     return source_priority(url) if url else 999
-
                 group.sort(key=_prio)
                 guid, selected_entry = group[0]
-
                 for other_guid, _ in group:
                     if other_guid != guid:
                         _mark_seen(store, other_guid)
                 _save_store(store)
-
                 await _process_entry(guid, selected_entry, store)
 
         except Exception:
@@ -505,21 +631,6 @@ def _ensure_tracker():
 # ═════════════════════════════════════════════════════════════
 # Commande de debug (owner only)
 # ═════════════════════════════════════════════════════════════
-#
-# IMPORTANT — group=-1 :
-# nyaa_tracker.py enregistre un handler catch-all sur TOUT message texte
-# privé (filters.text & filters.private & ~filters.command([...liste...])),
-# utilisé pour capter la saisie de date/heure du mode "snipe". "tsundere_test"
-# n'y figure pas. Sans group=-1, ce handler et cmd_tsundere_test seraient
-# tous les deux dans le groupe Pyrogram par défaut (0), où UN SEUL handler
-# par groupe traite chaque update (le premier dont le filtre matche, dans
-# l'ordre d'enregistrement = ordre d'import des modules). Si nyaa_tracker
-# est importé avant tsundere_tracker, son catch-all "avale" silencieusement
-# /tsundere_test (pas de snipe en attente -> retourne sans rien faire) et
-# cmd_tsundere_test n'est jamais atteint. group=-1 place ce handler dans un
-# groupe traité avant le groupe 0, donc il répond quel que soit l'ordre
-# d'import. Même classe de bug que celui déjà rencontré sur la commande
-# Anilist, réglé à l'époque de la même façon.
 
 @colab_bot.on_message(filters.command("tsundere_test") & filters.private, group=-1)
 async def cmd_tsundere_test(client, message):
@@ -534,14 +645,6 @@ async def cmd_tsundere_test(client, message):
             return
 
         store = _load_store()
-
-        # ⚠️ Avant : `entry = entries[0]` sans filtre HARDSUB ni check
-        # _is_known -> pouvait tomber sur une release softsub que le
-        # tracker automatique ignore de son côté, pendant que celui-ci
-        # traitait en parallèle la vraie version hardsub (guid différent,
-        # même épisode) -> téléchargement en double.
-        # Maintenant : même logique de sélection que le tracker (HARDSUB
-        # uniquement, jamais un guid déjà connu).
         guid, entry = _pick_untested_hardsub_entry(entries, store)
         if entry is None:
             await message.reply_text(
@@ -563,5 +666,5 @@ async def cmd_tsundere_test(client, message):
         await message.reply_text(f"❌ Erreur : {exc}")
 
 
-# Démarrage automatique — toujours actif, pas besoin de commande.
-_ensure_tracker()
+# Plus de démarrage automatique ici — /online_tsundere déclenche le menu
+# manuel ; _ensure_tracker() reste dispo si besoin d'un mode 100% auto.
