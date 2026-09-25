@@ -60,19 +60,19 @@ from colab_leecher.engines.tsundere_rss import (
     fetch_feed,
     get_title,
     is_hardsub,
+    is_video_url,
     list_available_animes,
     prepare_file,
     source_priority,
 )
 from colab_leecher.engines.tsundere_rss import download_video as _download_video
 from colab_leecher.utility.handler import Leech
-from colab_leecher.utility.variables import Paths
+from colab_leecher.utility.variables import BOT, Paths
 
-# À VÉRIFIER : nom réel de la fonction de compression dans
-# engines/freeconvert.py — deviné par analogie avec cloudconvert.py
-# (convert_file/resize_file/compress_file). Montre-moi ce fichier pour
-# que je corrige l'import si besoin.
-from colab_leecher.engines.freeconvert import compress_file
+# Conversion/compression simple (sans hardsub) par import d'URL distante —
+# ne marche que pour une vraie URL vidéo directe, pas Transfer.it/Mega
+# (voir l'avertissement dans engines/freeconvert.py).
+from colab_leecher.engines.freeconvert import convert_remote_url
 
 log = logging.getLogger(__name__)
 
@@ -303,9 +303,14 @@ async def cb_tsundere_select_done(client, callback_query):
 
 
 async def _process_selected_anime(name: str, entry) -> None:
-    """Téléchargement + compression FreeConvert simple (pas de hardsub
-    burn, la source tsundere.to est déjà hardsub) + upload normal via
-    Leech (forward vers les dumps configurés par /add, comme d'habitude)."""
+    """Compression FreeConvert simple (pas de hardsub burn, la source
+    tsundere.to est déjà hardsub) + upload normal via Leech (forward vers
+    les dumps configurés par /add, comme d'habitude).
+
+    N'utilise convert_remote_url() (import URL distante, pas de download
+    local) que si la source est une vraie URL vidéo directe. Pour
+    Transfer.it/Mega, pas encore de chemin FreeConvert possible — voir
+    l'avertissement dans engines/freeconvert.py."""
     title = get_title(entry)
     video_url = extract_video_url(entry)
 
@@ -313,24 +318,35 @@ async def _process_selected_anime(name: str, entry) -> None:
         await _notify(f"❌ <b>{name}</b>\n\nAucune source exploitable (1fichier exclu ou vide).")
         return
 
-    status_msg = await _notify(f"🍥 <b>{name}</b>\n\n<code>{title}</code>\n\n⏳ Téléchargement...")
+    if not is_video_url(video_url):
+        await _notify(
+            f"❌ <b>{name}</b>\n\nSource Transfer.it/Mega : compression FreeConvert pas encore "
+            "possible sans passer par un upload local (fonction pas encore écrite). "
+            "Dis-moi si tu veux que je fasse un fallback sans compression en attendant."
+        )
+        return
+
+    status_msg = await _notify(f"🍥 <b>{name}</b>\n\n<code>{title}</code>\n\n🗜️ Compression FreeConvert...")
 
     job_id = uuid.uuid4().hex[:8]
     job_dir = Path(f"{Paths.temp_cc_path}_tsundere_manual_{job_id}")
+    job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        file_path = await asyncio.to_thread(_download_video, video_url, job_dir)
+        fc_keys = ",".join(BOT.Options.fc_api_keys)
+        compressed_path = await convert_remote_url(
+            fc_keys, video_url, title, str(job_dir),
+            quality_profile="balanced",
+            process_cb=lambda pct, msg: _notify(f"🍥 <b>{name}</b>\n\n🗜️ {msg} ({pct:.0f}%)", status_msg),
+        )
+        compressed_path = Path(compressed_path)
 
-        if not check_file_size(file_path):
-            raise RuntimeError("Fichier trop volumineux ou invalide.")
-
-        prepared = await asyncio.to_thread(prepare_file, file_path)
-
-        await _notify(f"🍥 <b>{name}</b>\n\n🗜️ Compression FreeConvert...", status_msg)
-        compressed_path = await asyncio.to_thread(compress_file, prepared)
+        if not check_file_size(compressed_path):
+            raise RuntimeError("Fichier compressé trop volumineux ou invalide.")
+        prepare_file(compressed_path)
 
         await _notify(f"🍥 <b>{name}</b>\n\n📤 Envoi vers Telegram...", status_msg)
-        await Leech(str(compressed_path.parent), True, convert_videos=False, status_msg=status_msg)
+        await Leech(str(job_dir), True, convert_videos=False, status_msg=status_msg)
 
         try:
             await status_msg.delete()
