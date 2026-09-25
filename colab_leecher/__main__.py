@@ -735,7 +735,7 @@ async def handle_photo(client, message):
 
 
 # ══════════════════════════════════════════════
-#  Import nyaa_tracker / tsundere_tracker (registers their handlers)
+#  Import nyaa_tracker / tsundere_tracker / engines (registers their handlers)
 # ══════════════════════════════════════════════
 
 try:
@@ -749,6 +749,17 @@ try:
     logging.info("🍥 Tsundere RSS tracker loaded")
 except Exception as e:
     logging.warning(f"Tsundere RSS tracker not loaded: {e}")
+
+# Moteur "Myuu" / Unreal Engine 4 — surveillance automatique tsundere.to
+# + double sortie FreeConvert (480p/360p) + forward_intelligent.
+# Sans cet import, ses handlers (/myuu_engine_on, /myuu_engine_off) ne
+# sont jamais enregistrés auprès de Pyrogram et les commandes restent
+# muettes, même si elles existent dans engines/unreal_engine4.py.
+try:
+    import colab_leecher.engines.unreal_engine4
+    logging.info("🟣 Unreal Engine 4 loaded")
+except Exception as e:
+    logging.warning(f"Unreal Engine 4 not loaded: {e}")
 
 try:
     import colab_leecher.services.Aniliste
