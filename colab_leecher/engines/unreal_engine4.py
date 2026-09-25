@@ -23,8 +23,8 @@ jamais traiter deux fois le même épisode.
 2. engines/freeconvert.py : signature réelle de la fonction de resize
    (deviné ci-dessous comme resize_file(input_path, quality="480p")
    d'après ce que tu avais dit sur cloudconvert.py — à corriger).
-3. forward_intelligent.get_dump_channels() : pas encore câblé (voir ce
-   fichier) — sans ça, ce moteur ne peut pas savoir où forwarder.
+3. forward_intelligent.get_dump_channels() est câblé sur BOT.Options.dump_ids
+   (récupère le titre de chaque canal via l'API Telegram à chaque appel).
 4. Historique JSON : je réutilise data/tsundere_processed.json (partagé
    avec tsundere_tracker.py) pour éviter les doublons entre le mode
    manuel et ce moteur automatique — à confirmer que c'est bien voulu
@@ -47,25 +47,27 @@ from colab_leecher.engines.tsundere_rss import (
     CHECK_INTERVAL,
     anime_name,
     check_file_size,
-    download_video,
     episode_key,
     extract_video_url,
     fetch_feed,
     get_title,
     is_hardsub,
+    is_video_url,
     prepare_file,
     source_priority,
 )
 from colab_leecher.engines.forward_intelligent import get_dump_channels, match_dump_channels
-from colab_leecher.utility.variables import Paths
+from colab_leecher.utility.variables import BOT, Paths
 
-# À VÉRIFIER : signature réelle dans engines/freeconvert.py
-from colab_leecher.engines.freeconvert import resize_file
+# Conversion simple (sans hardsub) par import d'URL distante — ne marche
+# que pour une vraie URL vidéo directe, pas Transfer.it/Mega (voir
+# l'avertissement dans engines/freeconvert.py).
+from colab_leecher.engines.freeconvert import convert_remote_url
 
 log = logging.getLogger(__name__)
 
 _STORE_PATH = "data/tsundere_processed.json"  # partagé avec tsundere_tracker.py
-_QUALITIES = ("480p", "360p")
+_QUALITY_RESIZE = {"480p": (854, 480), "360p": (640, 360)}
 
 
 def _load_store() -> dict:
@@ -132,27 +134,41 @@ async def _process_entry(guid: str, entry, store: dict) -> None:
         _save_store(store)
         return
 
-    status_msg = await _notify(f"🍥 <b>[Unreal Engine 4] {name}</b>\n\n<code>{title}</code>\n\n⏳ Téléchargement...")
+    if not is_video_url(video_url):
+        # Transfer.it/Mega : pas de chemin FreeConvert possible pour
+        # l'instant (pas d'upload local -> FreeConvert écrit) — skip
+        # propre plutôt que planter, en attendant cette fonction.
+        log.warning("⚠️ [Unreal Engine 4] Source Transfer.it/Mega non supportée pour l'instant : %s", title)
+        _mark_seen(store, guid)
+        _save_store(store)
+        return
+
+    status_msg = await _notify(f"🍥 <b>[Unreal Engine 4] {name}</b>\n\n<code>{title}</code>\n\n⏳ Démarrage...")
 
     job_id = uuid.uuid4().hex[:8]
     job_dir = Path(f"{Paths.temp_cc_path}_unreal4_{job_id}")
+    job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        file_path = await asyncio.to_thread(download_video, video_url, job_dir)
-
-        if not check_file_size(file_path):
-            raise RuntimeError("Fichier trop volumineux ou invalide.")
-
-        prepared = await asyncio.to_thread(prepare_file, file_path)
-
-        dump_channels = get_dump_channels()
+        dump_channels = await get_dump_channels()
         matches = match_dump_channels(title, dump_channels)
         if not matches:
             log.warning("⚠️ Aucun canal dump ne correspond à : %s", name)
 
-        for quality in _QUALITIES:
+        fc_keys = ",".join(BOT.Options.fc_api_keys)
+
+        for quality, resize in _QUALITY_RESIZE.items():
             await _notify(f"🍥 <b>[Unreal Engine 4] {name}</b>\n\n🗜️ FreeConvert {quality}...", status_msg)
-            output_path = await asyncio.to_thread(resize_file, prepared, quality)
+            output_path = await convert_remote_url(
+                fc_keys, video_url, title, str(job_dir),
+                quality_profile="balanced", resize=resize,
+            )
+            output_path = Path(output_path)
+
+            if not check_file_size(output_path):
+                log.warning("⚠️ Sortie %s invalide/trop lourde pour %s", quality, title)
+                continue
+            prepare_file(output_path)
 
             for channel in matches:
                 try:
