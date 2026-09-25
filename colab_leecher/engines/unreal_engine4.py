@@ -2,33 +2,42 @@
 colab_leecher/engines/unreal_engine4.py
 
 Le moteur "Myuu" — surnommé "Unreal Engine 4" par l'utilisateur : il
-orchestre tsundere_rss (détection) + FreeConvert (double sortie 480p et
-360p) + forward_intelligent (routage vers les bons canaux dump).
+surveille tsundere.to comme tsundere_tracker.py, mais fonctionne
+entièrement en autonomie sur une WATCHLIST hebdomadaire au lieu de
+proposer un menu à chaque nouvel épisode.
 
-Flow : dès qu'une vidéo HARDSUB est trouvée sur tsundere.to, le bot la
-télécharge, l'envoie vers FreeConvert pour sortir une 480p ET une 360p,
-puis envoie chaque sortie vers les canaux dump correspondant au nom de
-l'anime (via forward_intelligent), au lieu de tout envoyer partout.
+Principe :
+  /myuu_add <nom>     -> ajoute un anime à la watchlist, suivi
+                          automatiquement pendant 7 jours (expire tout
+                          seul, à rajouter ensuite si tu veux continuer).
+  /myuu_list          -> liste la watchlist active + temps restant.
+  /myuu_remove <id>   -> retire un anime de la watchlist avant expiration.
+  /myuu_engine_on     -> démarre la boucle de surveillance automatique.
+  /myuu_engine_off    -> l'arrête.
 
-Ce moteur a SA PROPRE boucle de surveillance, séparée de celle (désormais
-manuelle) de tsundere_tracker.py — parce que son comportement est
-entièrement automatique (pas de sélection manuelle), contrairement au
-menu /online_tsundere. Il partage juste le même historique JSON pour ne
-jamais traiter deux fois le même épisode.
+Tant que le moteur est actif, à chaque cycle de poll il compare les
+NOUVEAUX épisodes HARDSUB du flux tsundere.to (jamais le backlog — voir
+le mécanisme de bootstrap plus bas) aux noms présents dans la watchlist
+(matching simple sur le titre normalisé, comme anime_name() ailleurs
+dans le projet — pas de résolution AniList ici). Un match => traitement
+IMMÉDIAT et automatique, sans confirmation : la vidéo source est
+d'abord téléchargée telle quelle et envoyée aux canaux dump (taguée
+[HD], sert de version haute qualité/archive), puis FreeConvert sort en
+plus une 480p ET une 360p — chaque sortie est routée vers les bons
+canaux dump via forward_intelligent, selon le nom de l'anime.
 
-À CONFIRMER / À BRANCHER avant de pouvoir tester ce fichier :
+Bootstrap (nouveau) : au tout premier démarrage (historique JSON
+totalement vide), le moteur marque tout le backlog actuellement présent
+dans le flux comme "déjà vu", SANS rien traiter — pour garantir que,
+peu importe quand un anime est ajouté à la watchlist ensuite, seuls les
+épisodes qui arrivent réellement APRÈS l'activation du moteur seront
+jamais pris en compte, jamais les anciens déjà dans le flux.
 
-1. Nom des commandes toggle — j'ai mis /myuu_engine_on et
-   /myuu_engine_off en attendant que tu me donnes les vrais noms voulus.
-2. engines/freeconvert.py : signature réelle de la fonction de resize
-   (deviné ci-dessous comme resize_file(input_path, quality="480p")
-   d'après ce que tu avais dit sur cloudconvert.py — à corriger).
-3. forward_intelligent.get_dump_channels() est câblé sur BOT.Options.dump_ids
-   (récupère le titre de chaque canal via l'API Telegram à chaque appel).
-4. Historique JSON : je réutilise data/tsundere_processed.json (partagé
-   avec tsundere_tracker.py) pour éviter les doublons entre le mode
-   manuel et ce moteur automatique — à confirmer que c'est bien voulu
-   (sinon je sépare avec un fichier dédié, ex data/unreal_engine4.json).
+Ce moteur a SA PROPRE boucle de surveillance, séparée de celle de
+tsundere_tracker.py (qui ne démarre plus qu'à la demande via
+/online_tsundere). Il partage le même historique JSON
+(data/tsundere_processed.json) pour ne jamais traiter deux fois le même
+épisode entre les deux modes.
 """
 from __future__ import annotations
 
@@ -36,8 +45,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 
 from pyrogram import filters
@@ -56,6 +68,7 @@ from colab_leecher.engines.tsundere_rss import (
     prepare_file,
     source_priority,
 )
+from colab_leecher.engines.tsundere_rss import download_video as _download_video
 from colab_leecher.engines.forward_intelligent import get_dump_channels, match_dump_channels
 from colab_leecher.utility.variables import BOT, Paths
 
@@ -69,6 +82,11 @@ log = logging.getLogger(__name__)
 _STORE_PATH = "data/tsundere_processed.json"  # partagé avec tsundere_tracker.py
 _QUALITY_RESIZE = {"480p": (854, 480), "360p": (640, 360)}
 
+
+# ═════════════════════════════════════════════════════════════
+# Persistance JSON — historique des épisodes (identique au store de
+# tsundere_tracker.py, pour dédupliquer entre les deux modes)
+# ═════════════════════════════════════════════════════════════
 
 def _load_store() -> dict:
     if not os.path.exists(_STORE_PATH):
@@ -110,6 +128,12 @@ def _entry_guid(entry) -> str:
     return str(entry.get("id") or entry.get("guid") or entry.get("link") or "").strip()
 
 
+# Store partagé en mémoire pour ce module — chargé une fois, mis à jour au
+# fil de l'eau. Tout tourne sur la même event loop asyncio (poll loop +
+# commandes), donc pas de souci de concurrence.
+_store: dict = _load_store()
+
+
 async def _notify(text: str, msg=None):
     try:
         if msg is None:
@@ -120,30 +144,203 @@ async def _notify(text: str, msg=None):
 
 
 # ═════════════════════════════════════════════════════════════
-# Traitement d'un épisode détecté : dl -> 480p + 360p -> forward intelligent
+# Watchlist hebdomadaire — expire automatiquement après 7 jours
 # ═════════════════════════════════════════════════════════════
 
-async def _process_entry(guid: str, entry, store: dict) -> None:
+_WATCHLIST_PATH = "data/unreal4_watchlist.json"
+_EXPIRY_SECONDS = 7 * 24 * 3600
+
+
+@dataclass
+class WatchEntry:
+    id: int
+    name: str
+    added_at: float
+    expires_at: float
+
+
+class _WL:
+    _entries: dict[int, WatchEntry] = {}
+    _nid: int = 1
+
+    @classmethod
+    def _load(cls) -> None:
+        try:
+            with open(_WATCHLIST_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            for d in raw.get("e", {}).values():
+                try:
+                    e = WatchEntry(**d)
+                    cls._entries[e.id] = e
+                except TypeError:
+                    pass
+            cls._nid = raw.get("n", max(cls._entries.keys(), default=0) + 1)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            log.warning("[Unreal4 WL] %s", exc)
+
+    @classmethod
+    def _save(cls) -> None:
+        os.makedirs(os.path.dirname(_WATCHLIST_PATH) or ".", exist_ok=True)
+        with open(_WATCHLIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {"e": {str(e.id): asdict(e) for e in cls._entries.values()}, "n": cls._nid},
+                f, ensure_ascii=False, indent=2,
+            )
+
+    @classmethod
+    def add(cls, name: str) -> int:
+        now = time.time()
+        entry = WatchEntry(id=cls._nid, name=name, added_at=now, expires_at=now + _EXPIRY_SECONDS)
+        cls._entries[entry.id] = entry
+        cls._nid += 1
+        cls._save()
+        return entry.id
+
+    @classmethod
+    def remove(cls, eid: int) -> bool:
+        if eid in cls._entries:
+            del cls._entries[eid]
+            cls._save()
+            return True
+        return False
+
+    @classmethod
+    def all(cls) -> list[WatchEntry]:
+        return sorted(cls._entries.values(), key=lambda e: e.id)
+
+    @classmethod
+    def purge_expired(cls) -> list[WatchEntry]:
+        """Retire les entrées expirées et les renvoie (pour notification)."""
+        now = time.time()
+        expired = [e for e in cls._entries.values() if e.expires_at <= now]
+        for e in expired:
+            del cls._entries[e.id]
+        if expired:
+            cls._save()
+        return expired
+
+
+_WL._load()
+
+
+def _normalize(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def _match_watchlist(title: str, watch_entries: list["WatchEntry"]) -> str | None:
+    """Matching simple sur le titre RSS normalisé (anime_name()), pas de
+    résolution AniList. Retourne le nom (tel que tapé dans /myuu_add) de
+    la première entrée qui matche, ou None si aucun match."""
+    candidate = _normalize(anime_name(title))
+    if not candidate:
+        return None
+    for entry in watch_entries:
+        norm_name = _normalize(entry.name)
+        if not norm_name:
+            continue
+        if norm_name == candidate or norm_name in candidate or candidate in norm_name:
+            return entry.name
+    return None
+
+
+@colab_bot.on_message(filters.command("myuu_add") & filters.private, group=-1)
+async def cmd_myuu_add(client, message):
+    if message.chat.id != OWNER:
+        return
+    name = " ".join(message.command[1:]).strip()
+    if not name:
+        await message.reply_text(
+            "Usage : <code>/myuu_add Nom de l'anime</code>\n\n"
+            "Suivi automatique pendant 7 jours — les nouveaux épisodes "
+            "HARDSUB détectés seront traités et forward automatiquement, "
+            "sans confirmation. Relance la commande pour renouveler après "
+            "expiration."
+        )
+        return
+
+    eid = _WL.add(name)
+    expiry_str = datetime.fromtimestamp(time.time() + _EXPIRY_SECONDS).strftime("%d/%m %H:%M")
+    await message.reply_text(
+        f"✅ <b>#{eid}</b> ajouté à la watchlist Unreal Engine 4\n\n"
+        f"📺 <code>{name}</code>\n"
+        f"⏳ Suivi automatique jusqu'au <b>{expiry_str}</b> (7 jours)."
+    )
+
+
+@colab_bot.on_message(filters.command("myuu_list") & filters.private, group=-1)
+async def cmd_myuu_list(client, message):
+    if message.chat.id != OWNER:
+        return
+    _WL.purge_expired()
+    entries = _WL.all()
+    if not entries:
+        await message.reply_text("🟣 Watchlist Unreal Engine 4 vide.\nUtilise /myuu_add <nom de l'anime>.")
+        return
+
+    now = time.time()
+    lines = ["🟣 <b>Watchlist Unreal Engine 4</b>", "━━━━━━━━━━━━━━━━━━━━━━━━", ""]
+    for e in entries:
+        remaining = max(0, e.expires_at - now)
+        days = int(remaining // 86400)
+        hours = int((remaining % 86400) // 3600)
+        lines.append(f"🔹 <b>#{e.id}</b>  <code>{e.name}</code>\n   ⏳ Expire dans {days}j {hours}h")
+        lines.append("")
+    await message.reply_text("\n".join(lines)[:4000])
+
+
+@colab_bot.on_message(filters.command("myuu_remove") & filters.private, group=-1)
+async def cmd_myuu_remove(client, message):
+    if message.chat.id != OWNER:
+        return
+    args = message.command[1:]
+    if not args or not args[0].isdigit():
+        await message.reply_text("Usage : <code>/myuu_remove 1</code>")
+        return
+    eid = int(args[0])
+    entries = {e.id: e for e in _WL.all()}
+    e = entries.get(eid)
+    if not e:
+        await message.reply_text(f"❌ #{eid} introuvable.")
+        return
+    _WL.remove(eid)
+    await message.reply_text(f"✅ Retiré de la watchlist : #{eid} — {e.name}")
+
+
+# ═════════════════════════════════════════════════════════════
+# Traitement automatique d'un épisode matché : FreeConvert 480p + 360p
+# -> forward_intelligent vers les bons canaux dump
+# ═════════════════════════════════════════════════════════════
+
+async def _process_watchlist_hit(name: str, entry) -> None:
     title = get_title(entry)
-    name = anime_name(title)
     video_url = extract_video_url(entry)
+    guid = _entry_guid(entry)
 
     if not video_url or "1fichier.com" in video_url.lower():
         log.warning("⚠️ Aucune source exploitable pour : %s", title)
-        _mark_seen(store, guid)
-        _save_store(store)
+        await _notify(f"❌ <b>[Unreal Engine 4] {name}</b>\n\nAucune source exploitable (1fichier exclu ou vide).")
+        if guid:
+            _mark_seen(_store, guid)
+            _save_store(_store)
         return
 
     if not is_video_url(video_url):
         # Transfer.it/Mega : pas de chemin FreeConvert possible pour
-        # l'instant (pas d'upload local -> FreeConvert écrit) — skip
-        # propre plutôt que planter, en attendant cette fonction.
+        # l'instant (pas d'upload local -> FreeConvert écrit) — on
+        # marque vu pour ne pas le retraiter indéfiniment.
         log.warning("⚠️ [Unreal Engine 4] Source Transfer.it/Mega non supportée pour l'instant : %s", title)
-        _mark_seen(store, guid)
-        _save_store(store)
+        await _notify(
+            f"❌ <b>[Unreal Engine 4] {name}</b>\n\nSource Transfer.it/Mega : pas encore "
+            "supporté sans upload local vers FreeConvert (fonction pas encore écrite)."
+        )
+        if guid:
+            _mark_seen(_store, guid)
+            _save_store(_store)
         return
 
-    status_msg = await _notify(f"🍥 <b>[Unreal Engine 4] {name}</b>\n\n<code>{title}</code>\n\n⏳ Démarrage...")
+    status_msg = await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n<code>{title}</code>\n\n⏳ Démarrage...")
 
     job_id = uuid.uuid4().hex[:8]
     job_dir = Path(f"{Paths.temp_cc_path}_unreal4_{job_id}")
@@ -155,10 +352,42 @@ async def _process_entry(guid: str, entry, store: dict) -> None:
         if not matches:
             log.warning("⚠️ Aucun canal dump ne correspond à : %s", name)
 
+        # ── Version d'origine (HD, non compressée) — envoyée en plus des
+        # deux sorties FreeConvert, sert de version haute qualité/archive.
+        await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n📥 Téléchargement HD (source)...", status_msg)
+        try:
+            hd_path = await asyncio.to_thread(_download_video, video_url, job_dir)
+            hd_path = Path(hd_path)
+            if check_file_size(hd_path):
+                try:
+                    hd_path = Path(await asyncio.to_thread(prepare_file, hd_path))
+                except Exception:
+                    log.exception("❌ [Unreal Engine 4] Validation/réparation HD échouée pour %s", title)
+                    hd_path = None
+                if hd_path is not None:
+                    for channel in matches:
+                        try:
+                            await colab_bot.send_video(
+                                chat_id=channel["id"],
+                                video=str(hd_path),
+                                caption=f"{title} [HD]",
+                            )
+                        except Exception:
+                            log.exception("❌ Échec envoi HD vers le canal %s", channel.get("name"))
+            else:
+                log.warning("⚠️ Version HD trop lourde/invalide pour %s, non envoyée.", title)
+        except Exception:
+            log.exception("❌ [Unreal Engine 4] Échec téléchargement HD pour %s", title)
+            await _notify(
+                f"⚠️ <b>[Unreal Engine 4] {name}</b>\n\nÉchec du téléchargement HD — "
+                "on continue quand même avec la compression 480p/360p...",
+                status_msg,
+            )
+
         fc_keys = ",".join(BOT.Options.fc_api_keys)
 
         for quality, resize in _QUALITY_RESIZE.items():
-            await _notify(f"🍥 <b>[Unreal Engine 4] {name}</b>\n\n🗜️ FreeConvert {quality}...", status_msg)
+            await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n🗜️ FreeConvert {quality}...", status_msg)
             output_path = await convert_remote_url(
                 fc_keys, video_url, title, str(job_dir),
                 quality_profile="balanced", resize=resize,
@@ -168,7 +397,11 @@ async def _process_entry(guid: str, entry, store: dict) -> None:
             if not check_file_size(output_path):
                 log.warning("⚠️ Sortie %s invalide/trop lourde pour %s", quality, title)
                 continue
-            prepare_file(output_path)
+            try:
+                output_path = Path(await asyncio.to_thread(prepare_file, output_path))
+            except Exception:
+                log.exception("❌ [Unreal Engine 4] Validation/réparation %s échouée pour %s", quality, title)
+                continue
 
             for channel in matches:
                 try:
@@ -180,8 +413,9 @@ async def _process_entry(guid: str, entry, store: dict) -> None:
                 except Exception:
                     log.exception("❌ Échec envoi vers le canal %s", channel.get("name"))
 
-        _mark_processed(store, guid, title, video_url)
-        _save_store(store)
+        if guid:
+            _mark_processed(_store, guid, title, video_url)
+            _save_store(_store)
         try:
             await status_msg.delete()
         except Exception:
@@ -191,8 +425,9 @@ async def _process_entry(guid: str, entry, store: dict) -> None:
     except Exception as exc:
         log.exception("❌ [Unreal Engine 4] Erreur : %s", title)
         await _notify(f"❌ <b>[Unreal Engine 4] {name}</b>\n\n<code>{exc}</code>", status_msg)
-        _mark_seen(store, guid)
-        _save_store(store)
+        if guid:
+            _mark_seen(_store, guid)
+            _save_store(_store)
     finally:
         if job_dir.exists():
             import shutil
@@ -200,7 +435,7 @@ async def _process_entry(guid: str, entry, store: dict) -> None:
 
 
 # ═════════════════════════════════════════════════════════════
-# Boucle de surveillance (propre à ce moteur)
+# Boucle de surveillance — 100% autonome sur la watchlist, pas de menu
 # ═════════════════════════════════════════════════════════════
 
 _enabled: bool = False
@@ -209,37 +444,92 @@ _task = None
 
 async def _poll_loop() -> None:
     log.info("🟣 Unreal Engine 4 démarré")
-    store = _load_store()
+
+    # Bootstrap : au tout premier lancement (historique totalement vide),
+    # on ignore le backlog actuel du flux sans rien traiter, pour ne
+    # jamais reprendre de vieux épisodes déjà présents au moment de
+    # l'activation — même si un anime est ajouté à la watchlist plus tard.
+    bootstrap = not _store["seen"] and not _store["processed"]
 
     while _enabled:
         try:
+            expired = _WL.purge_expired()
+            for e in expired:
+                try:
+                    await colab_bot.send_message(
+                        OWNER,
+                        f"⏳ <b>[Unreal Engine 4]</b> Suivi expiré : <code>{e.name}</code>\n"
+                        "Retiré de la watchlist — relance /myuu_add pour continuer à le suivre.",
+                    )
+                except Exception:
+                    pass
+
             feed = await fetch_feed()
             entries = list(getattr(feed, "entries", []) or [])
             entries.reverse()
 
-            new_entries = [(g, e) for e in entries if (g := _entry_guid(e)) and not _is_known(store, g)]
-            hardsub_entries = [(g, e) for g, e in new_entries if is_hardsub(get_title(e))]
-            for g, e in new_entries:
-                if not is_hardsub(get_title(e)):
-                    _mark_seen(store, g)
-            _save_store(store)
+            if bootstrap:
+                log.info("🛑 [Unreal Engine 4] Premier lancement : backlog actuel ignoré (%d entrée(s))", len(entries))
+                for entry in entries:
+                    g = _entry_guid(entry)
+                    if g:
+                        _mark_seen(_store, g)
+                _save_store(_store)
+                bootstrap = False
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            new_entries = [e for e in entries if (g := _entry_guid(e)) and not _is_known(_store, g)]
+            if not new_entries:
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            hardsub_new = []
+            for entry in new_entries:
+                if is_hardsub(get_title(entry)):
+                    hardsub_new.append(entry)
+                else:
+                    g = _entry_guid(entry)
+                    _mark_seen(_store, g)
+            _save_store(_store)
+
+            if not hardsub_new:
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            watch_entries = _WL.all()
 
             groups: dict[str, list] = {}
-            for guid, entry in hardsub_entries:
+            for entry in hardsub_new:
                 key = episode_key(get_title(entry))
-                groups.setdefault(key, []).append((guid, entry))
+                groups.setdefault(key, []).append(entry)
 
             for key, group in groups.items():
-                def _prio(item):
-                    url = extract_video_url(item[1])
+                def _prio(e):
+                    url = extract_video_url(e)
                     return source_priority(url) if url else 999
                 group.sort(key=_prio)
-                guid, selected_entry = group[0]
-                for other_guid, _ in group:
-                    if other_guid != guid:
-                        _mark_seen(store, other_guid)
-                _save_store(store)
-                await _process_entry(guid, selected_entry, store)
+                selected = group[0]
+                for other in group:
+                    if other is not selected:
+                        g = _entry_guid(other)
+                        if g:
+                            _mark_seen(_store, g)
+                _save_store(_store)
+
+                title = get_title(selected)
+                guid = _entry_guid(selected)
+                matched_name = _match_watchlist(title, watch_entries) if watch_entries else None
+
+                if matched_name is None:
+                    # Pas sur la watchlist -> ignoré, marqué vu pour ne
+                    # jamais le reproposer.
+                    if guid:
+                        _mark_seen(_store, guid)
+                        _save_store(_store)
+                    continue
+
+                await _process_watchlist_hit(matched_name, selected)
 
         except Exception:
             log.exception("❌ [Unreal Engine 4] Erreur pendant le poll")
@@ -251,7 +541,6 @@ async def _poll_loop() -> None:
 
 @colab_bot.on_message(filters.command("myuu_engine_on") & filters.private, group=-1)
 async def cmd_myuu_engine_on(client, message):
-    # NOM DE COMMANDE À CONFIRMER
     global _enabled, _task
     if message.chat.id != OWNER:
         return
@@ -260,12 +549,17 @@ async def cmd_myuu_engine_on(client, message):
         return
     _enabled = True
     _task = asyncio.get_event_loop().create_task(_poll_loop())
-    await message.reply_text("🟣 Unreal Engine 4 activé — surveillance automatique en cours.")
+
+    watch_count = len(_WL.all())
+    await message.reply_text(
+        "🟣 Unreal Engine 4 activé — surveillance automatique en cours.\n\n"
+        f"📋 {watch_count} anime(s) actuellement suivi(s) sur la watchlist.\n"
+        "Utilise /myuu_add pour en ajouter, /myuu_list pour voir la liste."
+    )
 
 
 @colab_bot.on_message(filters.command("myuu_engine_off") & filters.private, group=-1)
 async def cmd_myuu_engine_off(client, message):
-    # NOM DE COMMANDE À CONFIRMER
     global _enabled
     if message.chat.id != OWNER:
         return
