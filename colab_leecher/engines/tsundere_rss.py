@@ -7,9 +7,7 @@ tsundere.to : parsing du feed, extraction/priorisation des sources
 téléchargement (yt-dlp / Transfer.it), validation et réparation ffmpeg.
 
 L'orchestration (boucle de surveillance, upload Telegram, persistance de
-l'historique) vit dans colab_leecher/tsundere_tracker.py, dans le même
-esprit que nyaa_tracker.py : ce module-ci ne fait QUE le travail, il ne
-sait pas parler à Telegram.
+l'historique) vit dans colab_leecher/tsundere_tracker.py.
 """
 from __future__ import annotations
 
@@ -39,8 +37,6 @@ RSS_URL = (
 
 CHECK_INTERVAL = 30
 
-# Marge de sécurité sous la limite d'upload Pyrofork (2 Go standard,
-# 4 Go en compte premium) — 1.95 Go pour ne jamais frôler le seuil réel.
 MAX_FILE_SIZE = 1_950 * 1024 * 1024
 
 _HARDSUB_RE = re.compile(r"\bhardsub\b", re.IGNORECASE)
@@ -89,18 +85,6 @@ def is_video_url(url: str) -> bool:
 
 
 def is_hardsub(title: str) -> bool:
-    """
-    True si le titre indique une release HARDSUB (sous-titres incrustés
-    dans l'image). Le flux RSS filtre déjà la langue (FRENCH / SUBFRENCH /
-    MULTI via RSS_URL) mais renvoie aussi bien du softsub (piste de
-    sous-titres à part, .ass/.srt en dehors de la vidéo) que du hardsub.
-
-    Le tracker n'utilise cette fonction que pour DÉCIDER quelle release
-    traiter : les releases softsub (sans "hardsub" dans le titre) sont
-    ignorées tant qu'une version hardsub du même épisode n'est pas sortie,
-    pour ne jamais envoyer la version softsub en premier puis renvoyer un
-    doublon quand le hardsub arrive ensuite.
-    """
     return bool(_HARDSUB_RE.search(str(title or "")))
 
 
@@ -109,10 +93,6 @@ def is_hardsub(title: str) -> bool:
 # ============================================================
 
 def extract_video_url(entry) -> str | None:
-    """
-    Priorité : Transfer.it > Mega > vraie URL vidéo > 1fichier.
-    NekoBT et Nyaa sont ignorés.
-    """
     candidates: list[str] = []
 
     def add_url(value):
@@ -224,7 +204,8 @@ def get_title(entry) -> str:
 
 def episode_key(title: str) -> str:
     """Normalise un titre pour grouper les différents encodages/qualités
-    d'un même épisode ensemble (évite les doublons)."""
+    d'un même épisode ensemble (évite les doublons). Clé brute, pas
+    destinée à l'affichage — voir anime_name() pour ça."""
     value = str(title or "").lower()
     value = re.sub(r"\bhardsub\b", "", value)
     value = re.sub(r"\b(720p|1080p|480p|2160p|4k)\b", "", value)
@@ -233,6 +214,56 @@ def episode_key(title: str) -> str:
     value = re.sub(r"\bx264\b", "", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
+
+
+# Marqueurs d'épisode à retirer pour ne garder que le nom de l'anime :
+# "Ep1080", "E1080", "Episode 1080", "S01E23", "- 12", etc.
+_EPISODE_MARKERS_RE = re.compile(
+    r"""
+    \bs\d{1,2}e\d{1,4}\b       |   # S01E23
+    \bepisode\s*\d{1,4}\b     |   # Episode 1080 / episode1080
+    \bep\.?\s*\d{1,4}\b       |   # Ep1080 / Ep. 1080 / ep 12
+    \be\d{1,4}\b              |   # E1080
+    -\s*\d{1,4}\b                 # "- 12" en fin de titre (style Nyaa)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def anime_name(title: str) -> str:
+    """
+    Réduit un titre de release à un nom d'anime "propre", pour l'affichage
+    dans la liste de sélection manuelle (/online_tsundere) : retire le tag
+    HARDSUB, la qualité, le codec/audio (comme episode_key), PUIS le
+    marqueur d'épisode lui-même, et remet une casse "Title Case" lisible.
+
+    Ex : "One Piece Ep1080 VOSTFR 1080p CR WEB-DL AAC2.0 H.264-Myuus-Raws"
+      -> "One Piece"
+    """
+    value = episode_key(title)
+    value = _EPISODE_MARKERS_RE.sub("", value)
+    value = re.sub(r"[-_]{2,}.*$", "", value)  # coupe un tag de groupe résiduel
+    value = re.sub(r"\s+", " ", value).strip(" -_")
+    return value.title() if value else "Anime inconnu"
+
+
+def list_available_animes(entries) -> list[str]:
+    """À partir des entrées brutes du flux RSS, renvoie la liste
+    dédupliquée des noms d'animes HARDSUB actuellement disponibles, triée
+    alphabétiquement. Utilisée par /online_tsundere."""
+    seen: set[str] = set()
+    names: list[str] = []
+    for entry in entries:
+        title = get_title(entry)
+        if not is_hardsub(title):
+            continue
+        name = anime_name(title)
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return sorted(names, key=str.lower)
 
 
 def source_priority(url: str) -> int:
@@ -255,18 +286,12 @@ def source_priority(url: str) -> int:
 # ============================================================
 
 def download_video(url: str, dest_dir: Path) -> Path:
-    """
-    Télécharge `url` dans `dest_dir` (dossier de job dédié, unique par
-    appel — évite tout risque de collision si plusieurs téléchargements
-    tournent en parallèle, contrairement à un dossier `downloads/` partagé).
-    """
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     url = str(url).strip()
     log.info("🚀 URL reçue : %s", url)
 
-    # ── Transfer.it ──────────────────────────────────────────
     if "transfer.it/t/" in url.lower():
         log.info("🔗 Transfer.it détecté")
         tx = Transferit()
@@ -280,31 +305,20 @@ def download_video(url: str, dest_dir: Path) -> Path:
         tx.download(url, str(dest_dir))
 
         extensions = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v", ".ts"}
-        candidates = [
-            x for x in dest_dir.iterdir()
-            if x.is_file() and x.suffix.lower() in extensions
-        ]
+        candidates = [x for x in dest_dir.iterdir() if x.is_file() and x.suffix.lower() in extensions]
         if not candidates:
-            candidates = [
-                x for x in dest_dir.iterdir()
-                if x.is_file() and x.stat().st_size > 100 * 1024
-            ]
+            candidates = [x for x in dest_dir.iterdir() if x.is_file() and x.stat().st_size > 100 * 1024]
         if not candidates:
             raise FileNotFoundError("❌ Transfer.it : aucun vrai fichier vidéo trouvé")
 
-        # dest_dir est unique à CE job (voir docstring), donc "le plus
-        # récent par mtime" ne peut plus se tromper de fichier même si
-        # d'autres jobs tournent en parallèle dans leurs propres dossiers.
         file_path = max(candidates, key=lambda x: x.stat().st_mtime)
         log.info("✅ Transfer.it terminé : %s", file_path)
         return file_path
 
-    # ── 1fichier — jamais censé arriver ici (filtré en amont) ──
     if "1fichier.com" in url.lower():
         log.info("🔗 1fichier détecté")
         raise RuntimeError("❌ 1fichier détecté : téléchargement direct non disponible.")
 
-    # ── yt-dlp (Mega, URLs vidéo directes, etc.) ────────────────
     log.info("🚀 Téléchargement yt-dlp : %s", url)
 
     ydl_opts = {
@@ -432,9 +446,6 @@ def repair_mp4(file_path):
 
 
 def prepare_file(file_path):
-    """Valide le fichier vidéo, tente une réparation MP4 si besoin, et
-    renvoie le chemin du fichier prêt à être leech. Lève une exception si
-    rien n'est récupérable."""
     file_path = Path(file_path)
     if not file_path.exists():
         raise FileNotFoundError(f"Fichier introuvable : {file_path}")
