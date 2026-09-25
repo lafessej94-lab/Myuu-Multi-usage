@@ -406,3 +406,129 @@ async def hardsub_remote_url(
             log.warning("url_cb a échoué (non bloquant): %s", exc)
 
     return await _download_file(url, output_path, download_cb)
+
+
+# ⚠️ IMPORTANT — limite de l'approche "import URL distante" (option 2) :
+# le task FreeConvert "import/url" fait une requête HTTP simple côté
+# serveur FreeConvert. Ça marche pour une vraie URL de fichier vidéo
+# (is_video_url() == True dans engines/tsundere_rss.py), mais PAS pour
+# Transfer.it ou Mega, qui sont des pages/liens chiffrés nécessitant la
+# lib `Transferit` ou un client Mega dédié — FreeConvert ne peut pas les
+# récupérer tout seul. Comme Transfer.it > Mega sont justement les
+# sources PRIORITAIRES du flux tsundere.to (avant "URL vidéo directe"),
+# ça veut dire concrètement :
+#   - Si la source choisie est une vraie URL vidéo directe -> OK, cette
+#     fonction marche telle quelle, aucun download local nécessaire.
+#   - Si la source est Transfer.it/Mega -> il faut d'abord télécharger
+#     localement (download_video() existant dans engines/tsundere_rss.py),
+#     puis uploader ce fichier local vers FreeConvert. Je n'ai vu aucune
+#     fonction "import/upload" dans ce que tu m'as partagé — dis-moi si
+#     elle existe ailleurs dans freeconvert.py (fichier tronqué ?) ou si
+#     c'est à écrire.
+# En attendant, les call sites (tsundere_tracker.py / unreal_engine4.py)
+# testent is_video_url(video_url) et n'utilisent convert_remote_url() que
+# dans ce cas ; sinon ils lèvent une erreur claire au lieu de planter
+# silencieusement.
+
+def _create_convert_payload(
+    *,
+    video_url: str,
+    input_format: str,
+    output_format: str,
+    output_filename: str,
+    crf: int,
+    speed: str,
+    resize: Optional[tuple[int, int]] = None,
+) -> dict:
+    options = {
+        "video_codec": "libx264",
+        "video_rate_control_h264": "crf",
+        "video_crf_h264": crf,
+        "video_encoding_speed_h264_265": speed,
+        "audio_codec": "aac",
+        "audio_bitrate_aac": "128k",
+    }
+    if resize:
+        width, height = resize
+        options["adjust_video_settings"] = "change-resolution"
+        options["video_screen_size"] = f"{width}:{height}"
+
+    return {
+        "tasks": {
+            "import-video": {
+                "operation": "import/url",
+                "url": video_url,
+            },
+            "convert": {
+                "operation": "convert",
+                "input": "import-video",
+                "input_format": input_format,
+                "output_format": output_format,
+                "filename": os.path.basename(output_filename),
+                "options": options,
+            },
+            "export": {
+                "operation": "export/url",
+                "input": ["convert"],
+            },
+        }
+    }
+
+
+async def convert_remote_url(
+    api_keys: str,
+    video_url: str,
+    source_name: str,
+    dest_dir: str,
+    *,
+    quality_profile: str = "balanced",
+    resize: Optional[tuple[int, int]] = None,
+    process_cb: ProgressCB = None,
+    download_cb: ProgressCB = None,
+    url_cb: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> str:
+    """
+    Conversion/compression simple (sans hardsub) via FreeConvert, par
+    import d'URL distante — voir l'avertissement en tête de section sur
+    les sources compatibles (URL vidéo directe uniquement, pas
+    Transfer.it/Mega).
+
+    resize : optionnel — (largeur, hauteur) cible (ex (854, 480) pour du
+    480p, (640, 360) pour du 360p). None = pas de changement de résolution,
+    juste une compression au profil de qualité choisi.
+    """
+    keys = parse_api_keys(api_keys)
+    api_key = await pick_working_key(keys)
+    cfg = QUALITY_PROFILES[normalize_quality_profile(quality_profile)]
+
+    clean_source_name = unquote(source_name)
+    input_format = os.path.splitext(clean_source_name)[1].lstrip(".").lower() or "mp4"
+
+    quality_suffix = resolution_label(resize[1]) if resize else None
+    output_name = build_final_name(clean_source_name, override_quality=quality_suffix, output_ext="mp4")
+    output_path = os.path.join(dest_dir, output_name)
+
+    payload = _create_convert_payload(
+        video_url=video_url,
+        input_format=input_format,
+        output_format="mp4",
+        output_filename=output_name,
+        crf=cfg.crf,
+        speed=cfg.speed,
+        resize=resize,
+    )
+
+    job = await _post_job(api_key, payload)
+    job_id = job.get("id", "?")
+    job = await _wait_for_job(api_key, job_id, process_cb)
+    url = _export_url(job)
+    if not url:
+        raise RuntimeError("FreeConvert a terminé sans URL d'export.")
+
+    if url_cb:
+        try:
+            await url_cb(url)
+        except Exception as exc:
+            log.warning("url_cb a échoué (non bloquant): %s", exc)
+
+    return await _download_file(url, output_path, download_cb)
