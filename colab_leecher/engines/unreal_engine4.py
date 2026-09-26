@@ -64,7 +64,6 @@ from colab_leecher.engines.tsundere_rss import (
     fetch_feed,
     get_title,
     is_hardsub,
-    is_video_url,
     prepare_file,
     source_priority,
 )
@@ -75,7 +74,7 @@ from colab_leecher.utility.variables import BOT, Paths
 # Conversion simple (sans hardsub) par import d'URL distante — ne marche
 # que pour une vraie URL vidéo directe, pas Transfer.it/Mega (voir
 # l'avertissement dans engines/freeconvert.py).
-from colab_leecher.engines.freeconvert import convert_remote_url
+from colab_leecher.engines.freeconvert import convert_local_file_multi
 
 log = logging.getLogger(__name__)
 
@@ -379,20 +378,6 @@ async def _process_watchlist_hit(name: str, entry) -> None:
             _save_store(_store)
         return
 
-    if not is_video_url(video_url):
-        # Transfer.it/Mega : pas de chemin FreeConvert possible pour
-        # l'instant (pas d'upload local -> FreeConvert écrit) — on
-        # marque vu pour ne pas le retraiter indéfiniment.
-        log.warning("⚠️ [Unreal Engine 4] Source Transfer.it/Mega non supportée pour l'instant : %s", title)
-        await _notify(
-            f"❌ <b>[Unreal Engine 4] {name}</b>\n\nSource Transfer.it/Mega : pas encore "
-            "supporté sans upload local vers FreeConvert (fonction pas encore écrite)."
-        )
-        if guid:
-            _mark_seen(_store, guid)
-            _save_store(_store)
-        return
-
     status_msg = await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n<code>{title}</code>\n\n⏳ Démarrage...")
 
     job_id = uuid.uuid4().hex[:8]
@@ -405,46 +390,70 @@ async def _process_watchlist_hit(name: str, entry) -> None:
         if not matches:
             log.warning("⚠️ Aucun canal dump ne correspond à : %s", name)
 
-        # ── Version d'origine (HD, non compressée) — envoyée en plus des
-        # deux sorties FreeConvert, sert de version haute qualité/archive.
-        await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n📥 Téléchargement HD (source)...", status_msg)
+        # ── Téléchargement local de la source (HD) — sert à la fois de
+        # version haute qualité envoyée telle quelle ET de fichier source
+        # pour l'upload FreeConvert (480p/360p). download_video() gère
+        # Transfer.it, Mega et URL directe indifféremment, donc plus besoin
+        # de bloquer Transfer.it/Mega ici : tout passe par le même chemin.
+        await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n📥 Téléchargement de la source...", status_msg)
         try:
             hd_path = await asyncio.to_thread(_download_video, video_url, job_dir)
             hd_path = Path(hd_path)
-            if check_file_size(hd_path):
-                try:
-                    hd_path = Path(await asyncio.to_thread(prepare_file, hd_path))
-                except Exception:
-                    log.exception("❌ [Unreal Engine 4] Validation/réparation HD échouée pour %s", title)
-                    hd_path = None
-                if hd_path is not None:
-                    for channel in matches:
-                        try:
-                            await colab_bot.send_video(
-                                chat_id=channel["id"],
-                                video=str(hd_path),
-                                caption=f"{title} [HD]",
-                            )
-                        except Exception:
-                            log.exception("❌ Échec envoi HD vers le canal %s", channel.get("name"))
-            else:
-                log.warning("⚠️ Version HD trop lourde/invalide pour %s, non envoyée.", title)
-        except Exception:
-            log.exception("❌ [Unreal Engine 4] Échec téléchargement HD pour %s", title)
+        except Exception as exc:
+            log.exception("❌ [Unreal Engine 4] Échec du téléchargement source pour %s", title)
             await _notify(
-                f"⚠️ <b>[Unreal Engine 4] {name}</b>\n\nÉchec du téléchargement HD — "
-                "on continue quand même avec la compression 480p/360p...",
+                f"❌ <b>[Unreal Engine 4] {name}</b>\n\nÉchec du téléchargement de la source : <code>{exc}</code>",
                 status_msg,
             )
+            if guid:
+                _mark_seen(_store, guid)
+                _save_store(_store)
+            return
 
-        fc_keys = ",".join(BOT.Options.fc_api_keys)
-
-        for quality, resize in _QUALITY_RESIZE.items():
-            await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n🗜️ FreeConvert {quality}...", status_msg)
-            output_path = await convert_remote_url(
-                fc_keys, video_url, title, str(job_dir),
-                quality_profile="balanced", resize=resize,
+        try:
+            hd_path = Path(await asyncio.to_thread(prepare_file, hd_path))
+        except Exception:
+            log.exception("❌ [Unreal Engine 4] Validation/réparation échouée pour %s", title)
+            await _notify(
+                f"❌ <b>[Unreal Engine 4] {name}</b>\n\nFichier source invalide après téléchargement.",
+                status_msg,
             )
+            if guid:
+                _mark_seen(_store, guid)
+                _save_store(_store)
+            return
+
+        # Envoi de la version HD si elle passe sous la limite Telegram --
+        # sinon on saute juste cet envoi, la compression continue quand
+        # même avec ce même fichier local.
+        if check_file_size(hd_path):
+            for channel in matches:
+                try:
+                    await colab_bot.send_video(
+                        chat_id=channel["id"],
+                        video=str(hd_path),
+                        caption=f"{title} [HD]",
+                    )
+                except Exception:
+                    log.exception("❌ Échec envoi HD vers le canal %s", channel.get("name"))
+        else:
+            log.warning("⚠️ Version HD trop lourde pour Telegram (%s), non envoyée telle quelle.", title)
+
+        # ── Compression FreeConvert (480p + 360p) via UPLOAD du fichier
+        # déjà téléchargé — un seul upload pour les deux qualités (pas
+        # de import/url distant, donc plus de blocage Transfer.it/Mega).
+        await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n🗜️ Upload + compression FreeConvert (480p/360p)...", status_msg)
+        fc_keys = ",".join(BOT.Options.fc_api_keys)
+        outputs = await convert_local_file_multi(
+            fc_keys, str(hd_path), str(job_dir),
+            qualities=_QUALITY_RESIZE, quality_profile="balanced",
+        )
+
+        for quality in _QUALITY_RESIZE:
+            output_path = outputs.get(quality)
+            if not output_path:
+                log.warning("⚠️ Sortie %s absente pour %s", quality, title)
+                continue
             output_path = Path(output_path)
 
             if not check_file_size(output_path):
