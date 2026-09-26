@@ -112,11 +112,8 @@ def _find_task(job: dict, name: str) -> Optional[dict]:
     return None
 
 
-def _export_url(job: dict) -> str:
-    export_task = _find_task(job, "export")
-    if not export_task:
-        return ""
-    result = export_task.get("result") or {}
+def _task_export_url(task: dict) -> str:
+    result = task.get("result") or {}
     url = result.get("url")
     if url:
         return str(url)
@@ -124,6 +121,13 @@ def _export_url(job: dict) -> str:
     if files and files[0].get("url"):
         return str(files[0]["url"])
     return ""
+
+
+def _export_url(job: dict) -> str:
+    export_task = _find_task(job, "export")
+    if not export_task:
+        return ""
+    return _task_export_url(export_task)
 
 
 def _job_failure_reason(job: dict) -> str:
@@ -532,3 +536,170 @@ async def convert_remote_url(
             log.warning("url_cb a échoué (non bloquant): %s", exc)
 
     return await _download_file(url, output_path, download_cb)
+
+
+# ============================================================
+# CONVERSION PAR UPLOAD LOCAL (import/upload)
+#
+# Pour les sources que FreeConvert ne peut pas récupérer lui-même en
+# HTTP simple (Transfer.it, Mega — voir l'avertissement plus haut) : on
+# télécharge d'abord le fichier localement (download_video() dans
+# tsundere_rss.py), puis on l'UPLOAD vers FreeConvert au lieu de lui
+# donner une URL distante.
+#
+# Endpoint : POST /v1/process/import/upload (ou, comme ici, une tâche
+# "operation": "import/upload" dans un job classique) renvoie un
+# formulaire pré-signé à usage unique :
+#   result.form.url        -> URL dynamique où poster le fichier
+#   result.form.parameters -> champs à inclure tels quels (expires,
+#                              signature, size_limit, max_file_count...)
+# Le fichier s'envoie en multipart/form-data sur cette URL, avec TOUS
+# les champs de "parameters" (dans l'ordre reçu) puis le champ "file"
+# en dernier — comme un POST de policy S3 classique, l'ordre des champs
+# compte, "file" doit être le dernier.
+# ============================================================
+
+async def _upload_file(form_url: str, form_parameters: dict, file_path: str) -> None:
+    data = aiohttp.FormData()
+    for key, value in (form_parameters or {}).items():
+        data.add_field(key, str(value))
+
+    with open(file_path, "rb") as fh:
+        data.add_field("file", fh, filename=os.path.basename(file_path))
+        async with aiohttp.ClientSession(timeout=_TIMEOUT_DOWNLOAD) as sess:
+            async with sess.post(form_url, data=data) as resp:
+                if resp.status not in (200, 201, 204):
+                    text = await resp.text()
+                    raise RuntimeError(f"Échec de l'upload FreeConvert ({resp.status}): {text[:300]}")
+
+
+def _create_upload_multi_convert_payload(
+    *,
+    input_format: str,
+    output_format: str,
+    qualities: dict[str, Optional[tuple[int, int]]],
+    output_filenames: dict[str, str],
+    crf: int,
+    speed: str,
+) -> dict:
+    """Un seul import/upload, plusieurs convert/export en parallèle (un
+    par entrée de `qualities`) — le fichier n'est uploadé qu'une fois,
+    peu importe le nombre de sorties demandées."""
+    tasks: dict = {
+        "import-video": {
+            "operation": "import/upload",
+        },
+    }
+
+    for quality, resize in qualities.items():
+        options = {
+            "video_codec": "libx264",
+            "video_rate_control_h264": "crf",
+            "video_crf_h264": crf,
+            "video_encoding_speed_h264_265": speed,
+            "audio_codec": "aac",
+            "audio_bitrate_aac": "128k",
+        }
+        if resize:
+            width, height = resize
+            options["adjust_video_settings"] = "change-resolution"
+            options["video_screen_size"] = f"{width}:{height}"
+
+        convert_name = f"convert_{quality}"
+        export_name = f"export_{quality}"
+
+        tasks[convert_name] = {
+            "operation": "convert",
+            "input": "import-video",
+            "input_format": input_format,
+            "output_format": output_format,
+            "filename": os.path.basename(output_filenames[quality]),
+            "options": options,
+        }
+        tasks[export_name] = {
+            "operation": "export/url",
+            "input": [convert_name],
+        }
+
+    return {"tasks": tasks}
+
+
+async def convert_local_file_multi(
+    api_keys: str,
+    file_path: str,
+    dest_dir: str,
+    *,
+    qualities: dict[str, Optional[tuple[int, int]]],
+    quality_profile: str = "balanced",
+    process_cb: ProgressCB = None,
+    upload_cb: ProgressCB = None,
+    download_cb: ProgressCB = None,
+) -> dict[str, str]:
+    """
+    Compression FreeConvert à partir d'un fichier LOCAL déjà téléchargé
+    (typiquement Transfer.it/Mega, mais fonctionne pour n'importe quelle
+    source) : un seul upload vers FreeConvert, puis une sortie par entrée
+    de `qualities` (ex {"480p": (854, 480), "360p": (640, 360)}).
+
+    Retourne {quality: chemin_du_fichier_téléchargé}. Une qualité dont
+    l'export a échoué est simplement absente du résultat (log warning),
+    plutôt que de faire échouer tout le job.
+    """
+    keys = parse_api_keys(api_keys)
+    api_key = await pick_working_key(keys)
+    cfg = QUALITY_PROFILES[normalize_quality_profile(quality_profile)]
+
+    file_path = str(file_path)
+    source_name = os.path.basename(file_path)
+    input_format = os.path.splitext(source_name)[1].lstrip(".").lower() or "mp4"
+
+    output_filenames: dict[str, str] = {}
+    output_paths: dict[str, str] = {}
+    for quality, resize in qualities.items():
+        suffix = resolution_label(resize[1]) if resize else quality
+        name = build_final_name(source_name, override_quality=suffix, output_ext="mp4")
+        output_filenames[quality] = name
+        output_paths[quality] = os.path.join(dest_dir, name)
+
+    payload = _create_upload_multi_convert_payload(
+        input_format=input_format,
+        output_format="mp4",
+        qualities=qualities,
+        output_filenames=output_filenames,
+        crf=cfg.crf,
+        speed=cfg.speed,
+    )
+
+    job = await _post_job(api_key, payload)
+
+    import_task = _find_task(job, "import-video")
+    if not import_task:
+        raise RuntimeError("FreeConvert n'a pas renvoyé de tâche d'upload (import-video introuvable).")
+    form = (import_task.get("result") or {}).get("form") or {}
+    form_url = form.get("url")
+    form_parameters = form.get("parameters") or {}
+    if not form_url:
+        raise RuntimeError("FreeConvert n'a pas renvoyé d'URL d'upload.")
+
+    if upload_cb:
+        await upload_cb(0.0, "Upload vers FreeConvert...")
+    await _upload_file(form_url, form_parameters, file_path)
+    if upload_cb:
+        await upload_cb(100.0, "Upload terminé")
+
+    job_id = job.get("id", "?")
+    job = await _wait_for_job(api_key, job_id, process_cb)
+
+    results: dict[str, str] = {}
+    for quality in qualities:
+        export_task = _find_task(job, f"export_{quality}")
+        if not export_task:
+            log.warning("⚠️ Tâche d'export introuvable pour la qualité %s", quality)
+            continue
+        url = _task_export_url(export_task)
+        if not url:
+            log.warning("⚠️ FreeConvert a terminé sans URL d'export pour la qualité %s", quality)
+            continue
+        results[quality] = await _download_file(url, output_paths[quality], download_cb)
+
+    return results
