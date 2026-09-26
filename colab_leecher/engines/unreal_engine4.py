@@ -128,6 +128,59 @@ def _entry_guid(entry) -> str:
     return str(entry.get("id") or entry.get("guid") or entry.get("link") or "").strip()
 
 
+def _pick_untested_hardsub_entry(entries, store: dict):
+    """Renvoie le premier épisode HARDSUB non encore connu du store, ou
+    (None, None) si rien de tel n'est disponible. Utilisé par
+    /unreal_test sans argument."""
+    for entry in entries:
+        guid = _entry_guid(entry) or get_title(entry)
+        if _is_known(store, guid):
+            continue
+        if not is_hardsub(get_title(entry)):
+            continue
+        return guid, entry
+    return None, None
+
+
+def _find_best_entry_by_name(entries, query: str):
+    """Cherche dans le flux l'épisode HARDSUB le plus récent correspondant
+    au nom donné (même matching normalisé que la watchlist), toutes
+    sources dédupliquées par episode_key et triées par source_priority.
+    Ignore volontairement le store (_is_known) : un test nommé doit
+    pouvoir être relancé plusieurs fois d'affilée. Renvoie None si rien
+    ne correspond."""
+    norm_query = _normalize(query)
+    if not norm_query:
+        return None
+
+    groups: dict[str, list] = {}
+    order: list[str] = []
+    for entry in entries:
+        title = get_title(entry)
+        if not is_hardsub(title):
+            continue
+        candidate = _normalize(anime_name(title))
+        if not candidate:
+            continue
+        if not (norm_query == candidate or norm_query in candidate or candidate in norm_query):
+            continue
+        key = episode_key(title)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(entry)
+
+    if not order:
+        return None
+
+    # Le flux liste généralement les publications les plus récentes en
+    # premier -> le premier groupe rencontré = l'épisode le plus récent
+    # disponible pour cet anime.
+    group = groups[order[0]]
+    group.sort(key=lambda e: source_priority(extract_video_url(e)) if extract_video_url(e) else 999)
+    return group[0]
+
+
 # Store partagé en mémoire pour ce module — chargé une fois, mis à jour au
 # fil de l'eau. Tout tourne sur la même event loop asyncio (poll loop +
 # commandes), donc pas de souci de concurrence.
@@ -565,3 +618,65 @@ async def cmd_myuu_engine_off(client, message):
         return
     _enabled = False
     await message.reply_text("🟣 Unreal Engine 4 désactivé.")
+
+
+@colab_bot.on_message(filters.command("unreal_test") & filters.private, group=-1)
+async def cmd_unreal_test(client, message):
+    """Test manuel du pipeline complet (HD + FreeConvert 480p/360p +
+    forward_intelligent), en BYPASSANT la watchlist.
+
+    Usage :
+      /unreal_test              -> prend le premier épisode HARDSUB non
+                                    encore traité trouvé dans le flux.
+      /unreal_test <nom anime>  -> cherche précisément cet anime dans le
+                                    flux (matching normalisé, comme la
+                                    watchlist), rejouable plusieurs fois
+                                    d'affilée même si déjà testé avant.
+    """
+    if message.chat.id != OWNER:
+        return
+
+    query = " ".join(message.command[1:]).strip()
+
+    await message.reply_text("🧪 [Unreal Engine 4] Test RSS tsundere.to en cours...")
+    try:
+        feed = await fetch_feed()
+        entries = list(getattr(feed, "entries", []) or [])
+        if not entries:
+            await message.reply_text("❌ Aucun élément trouvé dans le flux.")
+            return
+
+        if query:
+            entry = _find_best_entry_by_name(entries, query)
+            if entry is None:
+                await message.reply_text(
+                    f"❌ Aucun épisode HARDSUB correspondant à <code>{query}</code> "
+                    "trouvé dans le flux actuellement."
+                )
+                return
+        else:
+            _, entry = _pick_untested_hardsub_entry(entries, _store)
+            if entry is None:
+                await message.reply_text(
+                    "❌ Aucun épisode HARDSUB non traité trouvé dans le flux "
+                    "(soit tout est déjà connu, soit rien n'est encore hardsub)."
+                )
+                return
+
+        title = get_title(entry)
+        video_url = extract_video_url(entry)
+        if not video_url:
+            await message.reply_text(f"❌ Vidéo introuvable.\n\n📺 {title}")
+            return
+
+        name = anime_name(title)
+        await message.reply_text(
+            f"✅ Trouvé : <code>{title}</code>\n\n🔗 {video_url}\n\n"
+            "📥 Traitement complet (HD + FreeConvert 480p/360p + forward), "
+            "sans passer par la watchlist..."
+        )
+        await _process_watchlist_hit(name, entry)
+        await message.reply_text("✅ Test terminé.")
+    except Exception as exc:
+        log.exception("Erreur /unreal_test")
+        await message.reply_text(f"❌ Erreur : {exc}")
