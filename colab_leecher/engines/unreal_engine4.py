@@ -468,9 +468,27 @@ async def _process_watchlist_hit(name: str, entry) -> None:
         fc_keys = ",".join(BOT.Options.fc_api_keys)
         fc_dir = job_dir / "freeconvert_raw"
         fc_dir.mkdir(parents=True, exist_ok=True)
+
+        async def _fc_upload_cb(pct: float, msg: str) -> None:
+            await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n⬆️ {msg} ({pct:.0f}%)", status_msg)
+
+        async def _fc_process_cb(pct: float, msg: str) -> None:
+            # msg contient déjà le détail "Import X% · Compression ..."
+            # -- voir freeconvert._detailed_progress(). Paliers 0/50/100
+            # par tâche, pas une progression continue (limite de l'API
+            # FreeConvert, pas du code).
+            await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n🗜️ {msg}", status_msg)
+
+        async def _fc_download_cb(pct: float, msg: str) -> None:
+            # msg est déjà préfixé par la qualité ("480p — ...").
+            await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n⬇️ {msg} ({pct:.0f}%)", status_msg)
+
         outputs = await convert_local_file_multi(
             fc_keys, str(hd_path), str(fc_dir),
             qualities=_QUALITY_RESIZE, quality_profile="balanced",
+            upload_cb=_fc_upload_cb,
+            process_cb=_fc_process_cb,
+            download_cb=_fc_download_cb,
         )
 
         fc_upload_dir = job_dir / "fc_upload"
