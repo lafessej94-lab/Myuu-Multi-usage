@@ -21,10 +21,20 @@ le mécanisme de bootstrap plus bas) aux noms présents dans la watchlist
 (matching simple sur le titre normalisé, comme anime_name() ailleurs
 dans le projet — pas de résolution AniList ici). Un match => traitement
 IMMÉDIAT et automatique, sans confirmation : la vidéo source est
-d'abord téléchargée telle quelle et envoyée aux canaux dump (taguée
-[HD], sert de version haute qualité/archive), puis FreeConvert sort en
-plus une 480p ET une 360p — chaque sortie est routée vers les bons
-canaux dump via forward_intelligent, selon le nom de l'anime.
+d'abord téléchargée telle quelle et envoyée (taguée [HD], sert de
+version haute qualité/archive), puis FreeConvert sort en plus une 480p
+ET une 360p.
+
+Upload/forward (nouveau) : l'envoi et le routage vers les canaux dump
+passent maintenant par Leech() (colab_leecher/utility/handler), le même
+pipeline que le reste du projet. Leech() uploade le fichier dans le
+chat cible puis forward automatiquement vers TOUS les canaux dump
+configurés via /add (BOT.Options.dump_ids), sans filtrage par nom
+d'anime — le module forward_intelligent (matching par nom de canal)
+n'est plus utilisé ici. La HD est leechée dès que le téléchargement et
+la validation sont terminés, AVANT de lancer FreeConvert, pour qu'elle
+parte sans attendre les sorties 480p/360p ; celles-ci sont leechées à
+part une fois prêtes.
 
 Bootstrap (nouveau) : au tout premier démarrage (historique JSON
 totalement vide), le moteur marque tout le backlog actuellement présent
@@ -46,6 +56,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, asdict
@@ -68,7 +79,7 @@ from colab_leecher.engines.tsundere_rss import (
     source_priority,
 )
 from colab_leecher.engines.tsundere_rss import download_video as _download_video
-from colab_leecher.engines.forward_intelligent import get_dump_channels, match_dump_channels
+from colab_leecher.utility.handler import Leech
 from colab_leecher.utility.variables import BOT, Paths
 
 # Conversion simple (sans hardsub) par import d'URL distante — ne marche
@@ -361,9 +372,31 @@ async def cmd_myuu_remove(client, message):
 
 
 # ═════════════════════════════════════════════════════════════
-# Traitement automatique d'un épisode matché : FreeConvert 480p + 360p
-# -> forward_intelligent vers les bons canaux dump
+# Traitement automatique d'un épisode matché : upload HD via Leech,
+# puis FreeConvert 480p + 360p, uploadées à part via Leech elles aussi.
+# Le forward vers les canaux dump (TOUS les dump_ids configurés via
+# /add) est géré automatiquement par Leech -> upload_file ->
+# maybe_autoforward, plus de matching par nom de canal.
 # ═════════════════════════════════════════════════════════════
+
+async def _leech_single_file(file_path: Path, job_dir: Path, subfolder: str, status_msg) -> bool:
+    """Copie file_path dans un sous-dossier dédié de job_dir et lance
+    Leech() dessus (remove=True : le sous-dossier et sa copie sont
+    nettoyés après l'upload, le fichier original passé en argument n'est
+    jamais touché). Renvoie True si l'upload a été tenté sans exception,
+    False sinon (déjà loggé par Leech/l'appelant)."""
+    upload_dir = job_dir / subfolder
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        await asyncio.to_thread(shutil.copy, str(file_path), str(upload_dir / file_path.name))
+        await Leech(str(upload_dir), True, convert_videos=False, status_msg=status_msg)
+        return True
+    except Exception:
+        log.exception("❌ [Unreal Engine 4] Échec Leech pour %s", file_path.name)
+        if upload_dir.exists():
+            shutil.rmtree(upload_dir, ignore_errors=True)
+        return False
+
 
 async def _process_watchlist_hit(name: str, entry) -> None:
     title = get_title(entry)
@@ -385,16 +418,10 @@ async def _process_watchlist_hit(name: str, entry) -> None:
     job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        dump_channels = await get_dump_channels()
-        matches = match_dump_channels(title, dump_channels)
-        if not matches:
-            log.warning("⚠️ Aucun canal dump ne correspond à : %s", name)
-
         # ── Téléchargement local de la source (HD) — sert à la fois de
         # version haute qualité envoyée telle quelle ET de fichier source
         # pour l'upload FreeConvert (480p/360p). download_video() gère
-        # Transfer.it, Mega et URL directe indifféremment, donc plus besoin
-        # de bloquer Transfer.it/Mega ici : tout passe par le même chemin.
+        # Transfer.it, Mega et URL directe indifféremment.
         await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n📥 Téléchargement de la source...", status_msg)
         try:
             hd_path = await asyncio.to_thread(_download_video, video_url, job_dir)
@@ -423,31 +450,32 @@ async def _process_watchlist_hit(name: str, entry) -> None:
                 _save_store(_store)
             return
 
-        # Envoi de la version HD si elle passe sous la limite Telegram --
-        # sinon on saute juste cet envoi, la compression continue quand
-        # même avec ce même fichier local.
+        # ── Envoi HD via Leech dès que la source est prête, sans
+        # attendre FreeConvert — Leech copie le fichier dans son propre
+        # sous-dossier avant upload, donc hd_path reste intact ici pour
+        # servir de source à FreeConvert juste après.
         if check_file_size(hd_path):
-            for channel in matches:
-                try:
-                    await colab_bot.send_video(
-                        chat_id=channel["id"],
-                        video=str(hd_path),
-                        caption=f"{title} [HD]",
-                    )
-                except Exception:
-                    log.exception("❌ Échec envoi HD vers le canal %s", channel.get("name"))
+            await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n📤 Envoi de la HD...", status_msg)
+            await _leech_single_file(hd_path, job_dir, "hd_upload", status_msg)
         else:
             log.warning("⚠️ Version HD trop lourde pour Telegram (%s), non envoyée telle quelle.", title)
 
         # ── Compression FreeConvert (480p + 360p) via UPLOAD du fichier
-        # déjà téléchargé — un seul upload pour les deux qualités (pas
-        # de import/url distant, donc plus de blocage Transfer.it/Mega).
+        # déjà téléchargé — un seul upload vers FreeConvert pour les deux
+        # qualités, sorties dans leur propre sous-dossier pour ne jamais
+        # mélanger avec hd_path.
         await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n🗜️ Upload + compression FreeConvert (480p/360p)...", status_msg)
         fc_keys = ",".join(BOT.Options.fc_api_keys)
+        fc_dir = job_dir / "freeconvert_raw"
+        fc_dir.mkdir(parents=True, exist_ok=True)
         outputs = await convert_local_file_multi(
-            fc_keys, str(hd_path), str(job_dir),
+            fc_keys, str(hd_path), str(fc_dir),
             qualities=_QUALITY_RESIZE, quality_profile="balanced",
         )
+
+        fc_upload_dir = job_dir / "fc_upload"
+        fc_upload_dir.mkdir(parents=True, exist_ok=True)
+        any_fc_ready = False
 
         for quality in _QUALITY_RESIZE:
             output_path = outputs.get(quality)
@@ -465,15 +493,21 @@ async def _process_watchlist_hit(name: str, entry) -> None:
                 log.exception("❌ [Unreal Engine 4] Validation/réparation %s échouée pour %s", quality, title)
                 continue
 
-            for channel in matches:
-                try:
-                    await colab_bot.send_video(
-                        chat_id=channel["id"],
-                        video=str(output_path),
-                        caption=f"{title} [{quality}]",
-                    )
-                except Exception:
-                    log.exception("❌ Échec envoi vers le canal %s", channel.get("name"))
+            await asyncio.to_thread(shutil.copy, str(output_path), str(fc_upload_dir / output_path.name))
+            any_fc_ready = True
+
+        if any_fc_ready:
+            await _notify(f"🟣 <b>[Unreal Engine 4] {name}</b>\n\n📤 Envoi des sorties FreeConvert...", status_msg)
+            try:
+                await Leech(str(fc_upload_dir), True, convert_videos=False, status_msg=status_msg)
+            except Exception:
+                log.exception("❌ [Unreal Engine 4] Échec Leech FreeConvert pour %s", title)
+                if fc_upload_dir.exists():
+                    shutil.rmtree(fc_upload_dir, ignore_errors=True)
+        else:
+            log.warning("⚠️ Aucune sortie FreeConvert exploitable pour %s", title)
+            if fc_upload_dir.exists():
+                shutil.rmtree(fc_upload_dir, ignore_errors=True)
 
         if guid:
             _mark_processed(_store, guid, title, video_url)
@@ -492,7 +526,6 @@ async def _process_watchlist_hit(name: str, entry) -> None:
             _save_store(_store)
     finally:
         if job_dir.exists():
-            import shutil
             shutil.rmtree(job_dir, ignore_errors=True)
 
 
@@ -631,8 +664,8 @@ async def cmd_myuu_engine_off(client, message):
 
 @colab_bot.on_message(filters.command("unreal_test") & filters.private, group=-1)
 async def cmd_unreal_test(client, message):
-    """Test manuel du pipeline complet (HD + FreeConvert 480p/360p +
-    forward_intelligent), en BYPASSANT la watchlist.
+    """Test manuel du pipeline complet (HD + FreeConvert 480p/360p,
+    upload/forward via Leech), en BYPASSANT la watchlist.
 
     Usage :
       /unreal_test              -> prend le premier épisode HARDSUB non
@@ -681,8 +714,8 @@ async def cmd_unreal_test(client, message):
         name = anime_name(title)
         await message.reply_text(
             f"✅ Trouvé : <code>{title}</code>\n\n🔗 {video_url}\n\n"
-            "📥 Traitement complet (HD + FreeConvert 480p/360p + forward), "
-            "sans passer par la watchlist..."
+            "📥 Traitement complet (HD + FreeConvert 480p/360p, upload via "
+            "Leech), sans passer par la watchlist..."
         )
         await _process_watchlist_hit(name, entry)
         await message.reply_text("✅ Test terminé.")
