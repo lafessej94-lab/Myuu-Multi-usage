@@ -139,6 +139,59 @@ def _job_failure_reason(job: dict) -> str:
     return str(job.get("message") or "Unknown FreeConvert error")
 
 
+def _stage_pct(status: str) -> float:
+    """Convertit le statut (grossier) d'une tâche FreeConvert en un
+    pourcentage indicatif. L'API FreeConvert ne renvoie qu'un statut par
+    tâche (waiting/processing/completed), jamais de pourcentage continu
+    -- ce n'est donc qu'une estimation par palier (0/50/100), pas une
+    progression fluide comme pour le téléchargement du résultat."""
+    status = (status or "").lower()
+    if status == "completed":
+        return 100.0
+    if status in {"processing", "running"}:
+        return 50.0
+    return 0.0
+
+
+def _detailed_progress(job: dict) -> tuple[float, str]:
+    """Construit un message de progression détaillé "Import X% ·
+    Compression Y%, Z%" à partir des tâches du job. Générique : marche
+    aussi bien pour un job hardsub_remote_url/convert_remote_url (une
+    seule tâche "hardsub"/"convert") que pour convert_local_file_multi
+    (plusieurs tâches "convert_{quality}"). Les tâches "export_*"
+    (préparation du lien de téléchargement côté FreeConvert, rapide) ne
+    sont pas affichées séparément, elles comptent juste dans le calcul
+    du pourcentage global.
+    """
+    tasks = job.get("tasks") or []
+
+    import_status = None
+    convert_stages: list[tuple[str, str]] = []  # (label, status)
+
+    for task in tasks:
+        name = str(task.get("name") or "")
+        status = str(task.get("status") or "")
+
+        if name == "import-video":
+            import_status = status
+        elif name == "hardsub" or name == "convert" or name.startswith("convert_"):
+            label = name.split("_", 1)[1] if "_" in name else "vidéo"
+            convert_stages.append((label, status))
+
+    parts = []
+    if import_status is not None:
+        parts.append(f"Import {_stage_pct(import_status):.0f}%")
+    if convert_stages:
+        detail = ", ".join(f"{label} {_stage_pct(status):.0f}%" for label, status in convert_stages)
+        parts.append(f"Compression {detail}")
+
+    msg = " · ".join(parts) if parts else str(job.get("status") or "FreeConvert")
+
+    finished = sum(1 for t in tasks if str(t.get("status")).lower() == "completed")
+    overall_pct = min(95.0, (finished / len(tasks) * 100.0)) if tasks else 0.0
+    return overall_pct, msg
+
+
 async def _wait_for_job(
     api_key: str,
     job_id: str,
@@ -151,16 +204,14 @@ async def _wait_for_job(
         status = str(job.get("status") or "")
         if status == "completed":
             if progress_cb:
-                await progress_cb(100.0, "FreeConvert terminé")
+                await progress_cb(100.0, "Import 100% · Compression 100%")
             return job
         if status in {"failed", "error"}:
             raise RuntimeError(_job_failure_reason(job))
 
-        tasks = job.get("tasks") or []
-        finished = sum(1 for t in tasks if str(t.get("status")).lower() == "completed")
-        pct = min(95.0, (finished / len(tasks) * 100.0)) if tasks else 0.0
+        pct, detail_msg = _detailed_progress(job)
         if progress_cb:
-            await progress_cb(pct, f"FreeConvert {status}")
+            await progress_cb(pct, detail_msg)
         await asyncio.sleep(3)
     raise RuntimeError(f"FreeConvert job {job_id} timed out.")
 
@@ -641,6 +692,20 @@ async def convert_local_file_multi(
     source) : un seul upload vers FreeConvert, puis une sortie par entrée
     de `qualities` (ex {"480p": (854, 480), "360p": (640, 360)}).
 
+    Callbacks (tous optionnels) :
+      upload_cb   -> progression de l'upload LOCAL vers FreeConvert
+                     (0% au démarrage, 100% une fois posté -- pas de
+                     suivi octet par octet, c'est un simple POST
+                     multipart d'un coup).
+      process_cb  -> progression du traitement CÔTÉ FreeConvert (import
+                     + compression). Le message inclut le détail "Import
+                     X% · Compression 480p Y%, 360p Z%" -- voir
+                     _detailed_progress(), limité aux paliers 0/50/100
+                     par tâche (l'API FreeConvert ne donne pas mieux).
+      download_cb -> progression du téléchargement de CHAQUE sortie
+                     déjà convertie, avec la qualité préfixée dans le
+                     message ("480p — Téléchargement...").
+
     Retourne {quality: chemin_du_fichier_téléchargé}. Une qualité dont
     l'export a échoué est simplement absente du résultat (log warning),
     plutôt que de faire échouer tout le job.
@@ -700,6 +765,13 @@ async def convert_local_file_multi(
         if not url:
             log.warning("⚠️ FreeConvert a terminé sans URL d'export pour la qualité %s", quality)
             continue
-        results[quality] = await _download_file(url, output_paths[quality], download_cb)
+
+        async def _quality_download_cb(pct: float, msg: str, _quality: str = quality) -> None:
+            if download_cb:
+                await download_cb(pct, f"{_quality} — {msg}")
+
+        results[quality] = await _download_file(
+            url, output_paths[quality], _quality_download_cb if download_cb else None
+        )
 
     return results
