@@ -40,6 +40,7 @@ session.names. Pagination ajoutée (PAGE_SIZE animes par page).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ import time
 import uuid
 from pathlib import Path
 
-from pyrogram import filters
+from pyrogram import StopPropagation, filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from colab_leecher import OWNER, colab_bot
@@ -77,6 +78,22 @@ from colab_leecher.engines.freeconvert import convert_remote_url
 log = logging.getLogger(__name__)
 
 _STORE_PATH = "data/tsundere_processed.json"
+
+def _stop_after(func):
+    """Empêche les handlers callback génériques du bot (groupe 0) de
+    traiter aussi les clics tsundere_*. Les erreurs sont loguées, puis
+    la propagation est toujours stoppée."""
+    @functools.wraps(func)
+    async def wrapper(client, callback_query):
+        try:
+            await func(client, callback_query)
+        except StopPropagation:
+            raise
+        except Exception:
+            log.exception("❌ Erreur dans le handler callback %s", func.__name__)
+        raise StopPropagation
+    return wrapper
+
 
 PAGE_SIZE = 10  # animes par page dans le menu de sélection
 
@@ -266,7 +283,8 @@ async def cmd_off_tsundere(client, message):
     await message.reply_text("🛑 tsundere_rss est maintenant OFF.")
 
 
-@colab_bot.on_callback_query(filters.regex(r"^tsundere_toggle:\d+$"))
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_toggle:\d+$"), group=-1)
+@_stop_after
 async def cb_tsundere_toggle(client, callback_query):
     global _session
     if callback_query.from_user.id != OWNER or _session is None:
@@ -292,7 +310,8 @@ async def cb_tsundere_toggle(client, callback_query):
     await callback_query.answer()
 
 
-@colab_bot.on_callback_query(filters.regex(r"^tsundere_page:\d+$"))
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_page:\d+$"), group=-1)
+@_stop_after
 async def cb_tsundere_page(client, callback_query):
     if callback_query.from_user.id != OWNER or _session is None:
         await callback_query.answer("Menu expiré, relance /online_tsundere.", show_alert=True)
@@ -308,12 +327,14 @@ async def cb_tsundere_page(client, callback_query):
     await callback_query.answer()
 
 
-@colab_bot.on_callback_query(filters.regex(r"^tsundere_noop$"))
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_noop$"), group=-1)
+@_stop_after
 async def cb_tsundere_noop(client, callback_query):
     await callback_query.answer()
 
 
-@colab_bot.on_callback_query(filters.regex(r"^tsundere_select_cancel$"))
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_select_cancel$"), group=-1)
+@_stop_after
 async def cb_tsundere_select_cancel(client, callback_query):
     global _session
     if callback_query.from_user.id != OWNER:
@@ -327,7 +348,8 @@ async def cb_tsundere_select_cancel(client, callback_query):
     await callback_query.answer()
 
 
-@colab_bot.on_callback_query(filters.regex(r"^tsundere_select_done$"))
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_select_done$"), group=-1)
+@_stop_after
 async def cb_tsundere_select_done(client, callback_query):
     global _session
     if callback_query.from_user.id != OWNER or _session is None:
@@ -481,7 +503,8 @@ async def _ask_priority() -> None:
         log.exception("❌ Impossible d'envoyer le choix de priorité")
 
 
-@colab_bot.on_callback_query(filters.regex(r"^tsundere_pick:"))
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_pick:"), group=-1)
+@_stop_after
 async def cb_tsundere_pick(client, callback_query):
     if callback_query.from_user.id != OWNER:
         await callback_query.answer("Pas autorisé.", show_alert=True)
