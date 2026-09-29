@@ -376,14 +376,13 @@ async def cb_tsundere_select_done(client, callback_query):
 
 
 async def _process_selected_anime(name: str, entry) -> None:
-    """Compression FreeConvert simple (pas de hardsub burn, la source
-    tsundere.to est déjà hardsub) + upload normal via Leech (forward vers
-    les dumps configurés par /add, comme d'habitude).
+    """Traitement d'un anime choisi dans le menu.
 
-    N'utilise convert_remote_url() (import URL distante, pas de download
-    local) que si la source est une vraie URL vidéo directe. Pour
-    Transfer.it/Mega, pas encore de chemin FreeConvert possible — voir
-    l'avertissement dans engines/freeconvert.py."""
+    - Source = vraie URL vidéo directe : compression FreeConvert
+      (convert_remote_url, sans download local) puis upload via Leech.
+    - Source = Transfer.it / Mega : FreeConvert impossible, donc fallback
+      = téléchargement local (yt-dlp / Transfer.it) puis upload via Leech
+      SANS compression (limite Telegram : MAX_FILE_SIZE ~1,95 Go)."""
     title = get_title(entry)
     video_url = extract_video_url(entry)
 
@@ -391,32 +390,35 @@ async def _process_selected_anime(name: str, entry) -> None:
         await _notify(f"❌ <b>{name}</b>\n\nAucune source exploitable (1fichier exclu ou vide).")
         return
 
-    if not is_video_url(video_url):
-        await _notify(
-            f"❌ <b>{name}</b>\n\nSource Transfer.it/Mega : compression FreeConvert pas encore "
-            "possible sans passer par un upload local (fonction pas encore écrite). "
-            "Dis-moi si tu veux que je fasse un fallback sans compression en attendant."
-        )
-        return
+    # Transfer.it / Mega : pas d'URL vidéo directe -> FreeConvert impossible.
+    # Fallback : téléchargement local puis envoi sans compression.
+    use_freeconvert = is_video_url(video_url)
 
-    status_msg = await _notify(f"🍥 <b>{name}</b>\n\n<code>{title}</code>\n\n🗜️ Compression FreeConvert...")
+    status_msg = await _notify(
+        f"🍥 <b>{name}</b>\n\n<code>{title}</code>\n\n"
+        + ("🗜️ Compression FreeConvert..." if use_freeconvert else "⏳ Téléchargement (sans compression)...")
+    )
 
     job_id = uuid.uuid4().hex[:8]
     job_dir = Path(f"{Paths.temp_cc_path}_tsundere_manual_{job_id}")
     job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        fc_keys = ",".join(BOT.Options.fc_api_keys)
-        compressed_path = await convert_remote_url(
-            fc_keys, video_url, title, str(job_dir),
-            quality_profile="balanced",
-            process_cb=lambda pct, msg: _notify(f"🍥 <b>{name}</b>\n\n🗜️ {msg} ({pct:.0f}%)", status_msg),
-        )
-        compressed_path = Path(compressed_path)
+        if use_freeconvert:
+            fc_keys = ",".join(BOT.Options.fc_api_keys)
+            out_path = await convert_remote_url(
+                fc_keys, video_url, title, str(job_dir),
+                quality_profile="balanced",
+                process_cb=lambda pct, msg: _notify(f"🍥 <b>{name}</b>\n\n🗜️ {msg} ({pct:.0f}%)", status_msg),
+            )
+            out_path = Path(out_path)
+        else:
+            out_path = await asyncio.to_thread(_download_video, video_url, job_dir)
+            log.info("📥 Téléchargement terminé : %s", out_path.name)
 
-        if not check_file_size(compressed_path):
-            raise RuntimeError("Fichier compressé trop volumineux ou invalide.")
-        prepare_file(compressed_path)
+        if not check_file_size(out_path):
+            raise RuntimeError("Fichier trop volumineux ou invalide.")
+        await asyncio.to_thread(prepare_file, out_path)
 
         await _notify(f"🍥 <b>{name}</b>\n\n📤 Envoi vers Telegram...", status_msg)
         await Leech(str(job_dir), True, convert_videos=False, status_msg=status_msg)
