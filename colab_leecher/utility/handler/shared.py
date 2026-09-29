@@ -51,10 +51,19 @@ async def _finish_status(status_msg, text: str, reply_markup=None) -> None:
     terminé/annulé/en échec. `status_msg` peut être un StatusSlideshow OU un
     Message Pyrogram classique (pas de diaporama) : dans ce 2e cas .stop()
     est simplement absent et on ignore, edit_text() se comporte normalement.
+
+    Si aucun `reply_markup` n'est fourni, on demande aussi au diaporama
+    d'oublier son clavier mémorisé (clear_buttons) : sinon il renverrait le
+    dernier clavier connu (ex. le bouton ❌ Cancel) sur le message final.
     """
     if hasattr(status_msg, "stop"):
         try:
             await status_msg.stop()
+        except Exception:
+            pass
+    if reply_markup is None and hasattr(status_msg, "clear_buttons"):
+        try:
+            status_msg.clear_buttons()
         except Exception:
             pass
     try:
