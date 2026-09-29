@@ -73,7 +73,7 @@ from colab_leecher.utility.variables import BOT, Paths
 # Conversion/compression simple (sans hardsub) par import d'URL distante —
 # ne marche que pour une vraie URL vidéo directe, pas Transfer.it/Mega
 # (voir l'avertissement dans engines/freeconvert.py).
-from colab_leecher.engines.freeconvert import convert_remote_url
+from colab_leecher.engines.freeconvert import convert_local_file_multi
 
 log = logging.getLogger(__name__)
 
@@ -166,7 +166,7 @@ _online: bool = False
 
 
 class _SelectSession:
-    __slots__ = ("names", "entries_by_name", "selected", "message", "page")
+    __slots__ = ("names", "entries_by_name", "selected", "message", "page", "chosen")
 
     def __init__(self, names: list[str], entries_by_name: dict):
         self.names = names
@@ -174,6 +174,7 @@ class _SelectSession:
         self.selected: set[str] = set()
         self.message = None
         self.page = 0
+        self.chosen: list = []  # rempli au clic sur Done, avant le choix du mode
 
     @property
     def total_pages(self) -> int:
@@ -351,7 +352,6 @@ async def cb_tsundere_select_cancel(client, callback_query):
 @colab_bot.on_callback_query(filters.regex(r"^tsundere_select_done$"), group=-1)
 @_stop_after
 async def cb_tsundere_select_done(client, callback_query):
-    global _session
     if callback_query.from_user.id != OWNER or _session is None:
         await callback_query.answer()
         return
@@ -360,29 +360,84 @@ async def cb_tsundere_select_done(client, callback_query):
         await callback_query.answer("Rien de sélectionné — choisis un anime ou clique Cancel.", show_alert=True)
         return
 
-    chosen = [(name, _session.entries_by_name[name]) for name in _session.selected]
+    # On garde la session ouverte : on demande d'abord le mode de traitement.
+    _session.chosen = [(name, _session.entries_by_name[name]) for name in sorted(_session.selected, key=str.lower)]
+    names_txt = "\n".join(f"• {n}" for n, _ in _session.chosen)
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗜️ Avec compression FreeConvert", callback_data="tsundere_mode:fc")],
+        [InlineKeyboardButton("📦 Sans compression", callback_data="tsundere_mode:raw")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="tsundere_select_cancel")],
+    ])
     try:
         await callback_query.message.edit_text(
-            "⏳ Traitement de " + ", ".join(n for n, _ in chosen) + " ..."
+            f"🍥 <b>{len(_session.chosen)} anime(s) sélectionné(s)</b>\n\n{names_txt}\n\n"
+            "Comment veux-tu les traiter ?\n\n"
+            "<i>FreeConvert : le bot télécharge l'original, l'envoie sur FreeConvert, "
+            "compresse en 360p, puis t'envoie l'original ET la version 360p.</i>",
+            reply_markup=markup,
         )
     except Exception:
         pass
     await callback_query.answer()
 
+
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_mode:(fc|raw)$"), group=-1)
+@_stop_after
+async def cb_tsundere_mode(client, callback_query):
+    global _session
+    if callback_query.from_user.id != OWNER or _session is None or not _session.chosen:
+        await callback_query.answer("Menu expiré, relance /online_tsundere.", show_alert=True)
+        return
+
+    compress = callback_query.data.split(":", 1)[1] == "fc"
+    chosen = _session.chosen
     _session = None
 
+    label = "🗜️ avec compression FreeConvert" if compress else "📦 sans compression"
+    try:
+        await callback_query.message.edit_text(
+            f"⏳ Traitement ({label}) de " + ", ".join(n for n, _ in chosen) + " ..."
+        )
+    except Exception:
+        pass
+    await callback_query.answer()
+
     for name, entry in chosen:
-        await _process_selected_anime(name, entry)
+        await _process_selected_anime(name, entry, compress=compress)
 
 
-async def _process_selected_anime(name: str, entry) -> None:
+FC_RESOLUTION = ("360p", (640, 360))  # (label, (largeur, hauteur))
+
+
+def _throttled_cb(name: str, status_msg, prefix: str, min_interval: float = 4.0):
+    """Callback de progression (pct, msg) qui n'édite le message Telegram
+    que si le texte change et au plus toutes les `min_interval` secondes
+    (évite les FloodWait pendant le polling FreeConvert)."""
+    state = {"last_text": "", "last_t": 0.0}
+
+    async def cb(pct: float, msg: str) -> None:
+        text = f"🍥 <b>{name}</b>\n\n{prefix} {msg} ({pct:.0f}%)"
+        now = time.time()
+        if text == state["last_text"]:
+            return
+        if pct < 100 and now - state["last_t"] < min_interval:
+            return
+        state["last_text"] = text
+        state["last_t"] = now
+        await _notify(text, status_msg)
+
+    return cb
+
+
+async def _process_selected_anime(name: str, entry, compress: bool = True) -> None:
     """Traitement d'un anime choisi dans le menu.
 
-    - Source = vraie URL vidéo directe : compression FreeConvert
-      (convert_remote_url, sans download local) puis upload via Leech.
-    - Source = Transfer.it / Mega : FreeConvert impossible, donc fallback
-      = téléchargement local (yt-dlp / Transfer.it) puis upload via Leech
-      SANS compression (limite Telegram : MAX_FILE_SIZE ~1,95 Go)."""
+    compress=False : téléchargement local puis envoi de l'original.
+    compress=True  : téléchargement local de l'original, upload vers
+                     FreeConvert, compression 360p, puis envoi de
+                     l'original ET de la version 360p.
+    Marche pour toutes les sources (Transfer.it, Mega, URL directe) puisque
+    FreeConvert reçoit un fichier local, pas une URL."""
     title = get_title(entry)
     video_url = extract_video_url(entry)
 
@@ -390,36 +445,46 @@ async def _process_selected_anime(name: str, entry) -> None:
         await _notify(f"❌ <b>{name}</b>\n\nAucune source exploitable (1fichier exclu ou vide).")
         return
 
-    # Transfer.it / Mega : pas d'URL vidéo directe -> FreeConvert impossible.
-    # Fallback : téléchargement local puis envoi sans compression.
-    use_freeconvert = is_video_url(video_url)
-
-    status_msg = await _notify(
-        f"🍥 <b>{name}</b>\n\n<code>{title}</code>\n\n"
-        + ("🗜️ Compression FreeConvert..." if use_freeconvert else "⏳ Téléchargement (sans compression)...")
-    )
+    status_msg = await _notify(f"🍥 <b>{name}</b>\n\n<code>{title}</code>\n\n⏳ Téléchargement de l'original...")
 
     job_id = uuid.uuid4().hex[:8]
     job_dir = Path(f"{Paths.temp_cc_path}_tsundere_manual_{job_id}")
     job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        if use_freeconvert:
-            fc_keys = ",".join(BOT.Options.fc_api_keys)
-            out_path = await convert_remote_url(
-                fc_keys, video_url, title, str(job_dir),
-                quality_profile="balanced",
-                process_cb=lambda pct, msg: _notify(f"🍥 <b>{name}</b>\n\n🗜️ {msg} ({pct:.0f}%)", status_msg),
-            )
-            out_path = Path(out_path)
-        else:
-            out_path = await asyncio.to_thread(_download_video, video_url, job_dir)
-            log.info("📥 Téléchargement terminé : %s", out_path.name)
+        # 1. Téléchargement de l'original
+        original_path = Path(await asyncio.to_thread(_download_video, video_url, job_dir))
+        log.info("📥 Téléchargement terminé : %s", original_path.name)
 
-        if not check_file_size(out_path):
+        if not check_file_size(original_path):
             raise RuntimeError("Fichier trop volumineux ou invalide.")
-        await asyncio.to_thread(prepare_file, out_path)
+        await asyncio.to_thread(prepare_file, original_path)
 
+        # 2. Compression 360p via FreeConvert (upload local)
+        if compress:
+            label, resize = FC_RESOLUTION
+            await _notify(f"🍥 <b>{name}</b>\n\n🗜️ Envoi vers FreeConvert ({label})...", status_msg)
+
+            fc_keys = ",".join(BOT.Options.fc_api_keys)
+            results = await convert_local_file_multi(
+                fc_keys, str(original_path), str(job_dir),
+                qualities={label: resize},
+                quality_profile="balanced",
+                upload_cb=_throttled_cb(name, status_msg, "📤 FreeConvert :"),
+                process_cb=_throttled_cb(name, status_msg, "🗜️"),
+                download_cb=_throttled_cb(name, status_msg, "📥"),
+            )
+            compressed_path = Path(results[label]) if label in results else None
+            if compressed_path is None or not compressed_path.exists():
+                raise RuntimeError("FreeConvert n'a pas renvoyé de fichier 360p.")
+
+            if not check_file_size(compressed_path):
+                raise RuntimeError("Fichier compressé trop volumineux ou invalide.")
+            await asyncio.to_thread(prepare_file, compressed_path)
+
+            # L'original reste dans job_dir : Leech enverra l'original ET le 360p.
+
+        # 3. Envoi vers Telegram
         await _notify(f"🍥 <b>{name}</b>\n\n📤 Envoi vers Telegram...", status_msg)
         await Leech(str(job_dir), True, convert_videos=False, status_msg=status_msg)
 
