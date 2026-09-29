@@ -10,9 +10,9 @@ quelque chose que sur commande explicite :
   /online_tsundere  -> récupère le flux UNE FOIS, affiche la liste des
                         animes HARDSUB dispo (dédupliqués, sans tags
                         d'épisode) avec un bouton par anime (sélection
-                        multiple), plus Done/Cancel. La liste est figée :
-                        elle ne se rafraîchit pas pendant que le menu est
-                        ouvert.
+                        multiple, paginée), plus Done/Cancel. La liste est
+                        figée : elle ne se rafraîchit pas pendant que le
+                        menu est ouvert.
   /off_tsundere     -> annule toute sélection en cours et repasse le
                         tracker à OFF.
 
@@ -32,10 +32,10 @@ Historique JSON (data/tsundere_processed.json) à deux clés :
 NOTE : les fonctions _poll_loop()/_ensure_tracker() de la version d'origine
 (boucle de surveillance continue + auto-traitement de tout ce qui sort)
 sont conservées ci-dessous mais NE SONT PLUS appelées automatiquement.
-Elles restent disponibles si tu veux un jour relancer un mode 100%
-automatique en plus du menu manuel — dis-moi si c'est ce que tu veux pour
-le moteur Unreal Engine 4, ou si celui-ci doit avoir sa propre boucle
-séparée (c'est ce que j'ai fait dans engines/unreal_engine4.py).
+
+FIX : les callback_data des boutons ne contiennent plus le nom de l'anime
+(limite Telegram de 64 octets -> BUTTON_DATA_INVALID) mais son index dans
+session.names. Pagination ajoutée (PAGE_SIZE animes par page).
 """
 from __future__ import annotations
 
@@ -77,6 +77,8 @@ from colab_leecher.engines.freeconvert import convert_remote_url
 log = logging.getLogger(__name__)
 
 _STORE_PATH = "data/tsundere_processed.json"
+
+PAGE_SIZE = 10  # animes par page dans le menu de sélection
 
 
 # ═════════════════════════════════════════════════════════════
@@ -147,23 +149,44 @@ _online: bool = False
 
 
 class _SelectSession:
-    __slots__ = ("names", "entries_by_name", "selected", "message")
+    __slots__ = ("names", "entries_by_name", "selected", "message", "page")
 
     def __init__(self, names: list[str], entries_by_name: dict):
         self.names = names
         self.entries_by_name = entries_by_name  # anime_name -> entry (meilleure source trouvée)
         self.selected: set[str] = set()
         self.message = None
+        self.page = 0
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, (len(self.names) + PAGE_SIZE - 1) // PAGE_SIZE)
 
 
 _session: "_SelectSession | None" = None
 
 
 def _build_menu_markup(session: "_SelectSession") -> InlineKeyboardMarkup:
+    start = session.page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, len(session.names))
+
     rows = []
-    for name in session.names:
+    for i in range(start, end):
+        name = session.names[i]
         checked = "✅" if name in session.selected else "⬜"
-        rows.append([InlineKeyboardButton(f"{checked} {name}", callback_data=f"tsundere_toggle:{name}")])
+        # callback_data = index (court) et non le nom (limite 64 octets)
+        rows.append([InlineKeyboardButton(f"{checked} {name}", callback_data=f"tsundere_toggle:{i}")])
+
+    # Ligne de navigation (seulement si plusieurs pages)
+    if session.total_pages > 1:
+        nav = []
+        if session.page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"tsundere_page:{session.page - 1}"))
+        nav.append(InlineKeyboardButton(f"{session.page + 1}/{session.total_pages}", callback_data="tsundere_noop"))
+        if session.page < session.total_pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"tsundere_page:{session.page + 1}"))
+        rows.append(nav)
+
     rows.append([
         InlineKeyboardButton("✅ Done", callback_data="tsundere_select_done"),
         InlineKeyboardButton("❌ Cancel", callback_data="tsundere_select_cancel"),
@@ -172,8 +195,9 @@ def _build_menu_markup(session: "_SelectSession") -> InlineKeyboardMarkup:
 
 
 def _menu_text(session: "_SelectSession") -> str:
+    page_info = f" (page {session.page + 1}/{session.total_pages})" if session.total_pages > 1 else ""
     return (
-        "🍥 <b>Animes disponibles sur tsundere.to</b>\n\n"
+        f"🍥 <b>Animes disponibles sur tsundere.to</b>{page_info}\n\n"
         "Sélectionne un ou plusieurs animes à récupérer, puis Done "
         "(ou Cancel pour ne rien faire).\n\n"
         f"Sélectionnés : <b>{len(session.selected)}</b>"
@@ -242,14 +266,20 @@ async def cmd_off_tsundere(client, message):
     await message.reply_text("🛑 tsundere_rss est maintenant OFF.")
 
 
-@colab_bot.on_callback_query(filters.regex(r"^tsundere_toggle:"))
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_toggle:\d+$"))
 async def cb_tsundere_toggle(client, callback_query):
     global _session
     if callback_query.from_user.id != OWNER or _session is None:
         await callback_query.answer()
         return
 
-    name = callback_query.data.split(":", 1)[1]
+    try:
+        idx = int(callback_query.data.split(":", 1)[1])
+        name = _session.names[idx]
+    except (ValueError, IndexError):
+        await callback_query.answer("Menu expiré, relance /online_tsundere.", show_alert=True)
+        return
+
     if name in _session.selected:
         _session.selected.discard(name)
     else:
@@ -259,6 +289,27 @@ async def cb_tsundere_toggle(client, callback_query):
         await callback_query.message.edit_text(_menu_text(_session), reply_markup=_build_menu_markup(_session))
     except Exception:
         pass
+    await callback_query.answer()
+
+
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_page:\d+$"))
+async def cb_tsundere_page(client, callback_query):
+    if callback_query.from_user.id != OWNER or _session is None:
+        await callback_query.answer("Menu expiré, relance /online_tsundere.", show_alert=True)
+        return
+
+    page = int(callback_query.data.split(":", 1)[1])
+    _session.page = max(0, min(page, _session.total_pages - 1))
+
+    try:
+        await callback_query.message.edit_text(_menu_text(_session), reply_markup=_build_menu_markup(_session))
+    except Exception:
+        pass
+    await callback_query.answer()
+
+
+@colab_bot.on_callback_query(filters.regex(r"^tsundere_noop$"))
+async def cb_tsundere_noop(client, callback_query):
     await callback_query.answer()
 
 
