@@ -11,6 +11,7 @@ complète des réexports.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import uuid
@@ -43,7 +44,7 @@ from colab_leecher.utility.handler.shared import (
 )
 from colab_leecher.utility.handler.task_control import cancelTask
 from colab_leecher.utility.helper import fileType, keyboard, sysINFO
-from colab_leecher.utility.variables import BOT, MSG, Messages, Paths, TaskInfo
+from colab_leecher.utility.variables import ActiveJobs, BOT, MSG, Messages, Paths, TaskInfo
 
 
 def _seedr_ready() -> bool:
@@ -235,6 +236,11 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
     tourner en PARALLÈLE avec d'autres jobs FC hardsub (jusqu'à
     FC_HARDSUB_CONCURRENCY à la fois, semaphore partagé — voir shared.py) :
     dossier de travail et message de statut dédiés à ce job.
+
+    Annulable via le bouton ❌ Cancel (ActiveJobs), y compris pendant
+    l'attente d'un slot : le `try` englobe le semaphore pour que le statut,
+    le désenregistrement et le nettoyage des dossiers se fassent dans tous
+    les cas.
     """
     if not _seedr_ready():
         await _finish_status(status_msg, "❌ Seedr credentials are missing in your Colab launcher.")
@@ -248,17 +254,20 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
     subtitle_dir = ospath.join(Paths.WORK_PATH, f"seedr_subtitles_{job_id}")
     makedirs(job_dir, exist_ok=True)
     makedirs(subtitle_dir, exist_ok=True)
+    ActiveJobs.register(job_id, asyncio.current_task())
 
-    await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Queue", 0.0, "En attente d'un slot disponible...")
+    folder_id = None
+    seedr_user = seedr_pwd = ""
+    kind = "Seedr + FreeConvert Hardsub"
 
-    async with _fc_hardsub_semaphore:
-        folder_id = None
-        seedr_user = seedr_pwd = ""
-        try:
-            await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Seedr", 0.0, "Preparing Seedr job")
+    try:
+        await _fc_job_status(status_msg, kind, "Queue", 0.0, "En attente d'un slot disponible...", job_id=job_id)
+
+        async with _fc_hardsub_semaphore:
+            await _fc_job_status(status_msg, kind, "Seedr", 0.0, "Preparing Seedr job", job_id=job_id)
 
             async def _seedr_cb(stage: str, pct: float, detail: str) -> None:
-                await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", f"Seedr/{stage}", pct * 0.30, detail)
+                await _fc_job_status(status_msg, kind, f"Seedr/{stage}", pct * 0.30, detail, job_id=job_id)
 
             files, folder_id, seedr_user, seedr_pwd = await fetch_urls_via_seedr(magnet, progress_cb=_seedr_cb)
             videos = _seedr_video_files(files)
@@ -273,24 +282,24 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
                 base_start = 30.0 + ((idx / total) * 55.0)
                 base_end = 30.0 + (((idx + 1) / total) * 55.0)
 
-                await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Probe", base_start, "Inspecting subtitle streams", name)
+                await _fc_job_status(status_msg, kind, "Probe", base_start, "Inspecting subtitle streams", name, job_id=job_id)
                 probe = await probe_remote_video(video_url)
                 sub_stream = pick_french_text_subtitle(probe)
                 if not sub_stream:
                     raise RuntimeError(f"No French text subtitle stream found in {name}")
 
-                await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Extract", base_start + 6.0, "Extracting French subtitles", name)
+                await _fc_job_status(status_msg, kind, "Extract", base_start + 6.0, "Extracting French subtitles", name, job_id=job_id)
                 subtitle_path = await extract_subtitle_from_url(video_url, sub_stream, subtitle_dir, stem)
 
                 async def _process_cb(pct: float, detail: str, filename: str = name) -> None:
                     overall = (base_start + 10.0) + ((base_end - (base_start + 10.0)) * max(0.0, min(pct, 100.0)) / 100.0)
-                    await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "FreeConvert", overall, detail, filename)
+                    await _fc_job_status(status_msg, kind, "FreeConvert", overall, detail, filename, job_id=job_id)
 
                 async def _download_cb(pct: float, detail: str, filename: str = name) -> None:
                     overall = 85.0 + ((idx + (max(0.0, min(pct, 100.0)) / 100.0)) / total * 15.0)
-                    await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Download", overall, detail, filename)
+                    await _fc_job_status(status_msg, kind, "Download", overall, detail, filename, job_id=job_id)
 
-                await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Queue", base_start + 10.0, "Submitting FreeConvert hardsub job", name)
+                await _fc_job_status(status_msg, kind, "Queue", base_start + 10.0, "Submitting FreeConvert hardsub job", name, job_id=job_id)
 
                 _quality_override = resolution_label(resize[1]) if resize else None
                 _renamed_name = build_final_name(name, override_quality=_quality_override, output_ext="mp4")
@@ -325,18 +334,21 @@ async def Seedr_FC_Hardsub_Handler(magnet: str, status_msg, resize: tuple[int, i
                     url_cb=_url_cb,
                 )
 
-            await _fc_job_status(status_msg, "Seedr + FreeConvert Hardsub", "Upload", 100.0, "Uploading to Telegram")
-            await _burn_prefix_suffix_in_dir(job_dir, status_msg, "Seedr + FreeConvert Hardsub")
+            await _fc_job_status(status_msg, kind, "Upload", 100.0, "Uploading to Telegram", job_id=job_id)
+            await _burn_prefix_suffix_in_dir(job_dir, status_msg, kind)
             await Leech(job_dir, True, convert_videos=False, status_msg=status_msg)
             try:
                 await status_msg.delete()
             except Exception:
                 pass
-        except Exception as exc:
-            await _finish_status(status_msg, f"❌ <b>Seedr+FC hardsub failed</b>\n\n<code>{exc}</code>")
-        finally:
-            if folder_id and seedr_user and seedr_pwd:
-                await _del_folder(seedr_user, seedr_pwd, folder_id)
-            for d in (job_dir, subtitle_dir):
-                if ospath.exists(d):
-                    shutil.rmtree(d, ignore_errors=True)
+    except asyncio.CancelledError:
+        await _finish_status(status_msg, "⛔ <b>Seedr + FreeConvert hardsub cancelled</b>", reply_markup=None)
+    except Exception as exc:
+        await _finish_status(status_msg, f"❌ <b>Seedr+FC hardsub failed</b>\n\n<code>{exc}</code>")
+    finally:
+        ActiveJobs.unregister(job_id)
+        if folder_id and seedr_user and seedr_pwd:
+            await _del_folder(seedr_user, seedr_pwd, folder_id)
+        for d in (job_dir, subtitle_dir):
+            if ospath.exists(d):
+                shutil.rmtree(d, ignore_errors=True)
