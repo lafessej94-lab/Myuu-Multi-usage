@@ -35,6 +35,14 @@ partagé entre TOUTE édition du message (loop ET edit_text externe) : si
 un edit vient d'avoir lieu récemment (par n'importe quelle source), le
 tick suivant du diaporama est simplement sauté au lieu de rentrer en
 collision.
+
+── Fix 3 : clavier inline mémorisé ─────────────────────────────────────
+edit_text() garde le dernier reply_markup non-None reçu (self._kb) et le
+renvoie à chaque édition, ce qui permet de garder un bouton (ex. ❌ Cancel)
+affiché pendant les mises à jour de progression. clear_buttons() oublie ce
+clavier : à appeler avant d'afficher un statut final (voir
+_finish_status() dans utility/handler/shared.py), sinon le dernier clavier
+resterait attaché au message d'échec/annulation.
 """
 from __future__ import annotations
 
@@ -143,6 +151,12 @@ class StatusSlideshow:
         except Exception:
             pass
         return self.message
+
+    def clear_buttons(self) -> None:
+        """Oublie le clavier inline mémorisé : les prochains edit_text()
+        (et le prochain tick du diaporama) n'en enverront plus. À appeler
+        avant d'afficher un statut final (échec, annulation...)."""
+        self._kb = None
 
     async def stop(self) -> None:
         """Arrête le diaporama SANS supprimer le message — à appeler par
