@@ -105,6 +105,23 @@ async def _job_status(api_key: str, job_id: str) -> dict:
     return data
 
 
+async def _delete_job(api_key: str, job_id: str) -> None:
+    """Best-effort : demande à FreeConvert de supprimer/annuler le job
+    (appelé quand la tâche du bot est annulée, pour que le job ne continue
+    pas à tourner et consommer des crédits côté FreeConvert).
+
+    NOTE : l'endpoint DELETE /process/jobs/{id} n'a pas pu être confirmé
+    dans la doc FreeConvert. Le résultat (HTTP xxx) est loggué : un 404/405
+    veut dire qu'il faut corriger l'URL. Ne lève jamais d'exception."""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
+            async with sess.delete(f"{FC_API}/process/jobs/{job_id}", headers=headers) as resp:
+                log.info("FreeConvert : suppression du job %s -> HTTP %s", job_id, resp.status)
+    except Exception as exc:
+        log.warning("FreeConvert : impossible de supprimer le job %s: %s", job_id, exc)
+
+
 def _find_task(job: dict, name: str) -> Optional[dict]:
     for task in job.get("tasks", []):
         if task.get("name") == name:
@@ -198,21 +215,29 @@ async def _wait_for_job(
     progress_cb: ProgressCB = None,
     timeout_s: int = 3600,
 ) -> dict:
+    """Attend la fin du job FreeConvert. Si la tâche du bot est annulée
+    pendant l'attente (bouton Cancel), le job est aussi supprimé côté
+    FreeConvert (best-effort, voir _delete_job) avant de repropager
+    l'annulation."""
     deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        job = await _job_status(api_key, job_id)
-        status = str(job.get("status") or "")
-        if status == "completed":
-            if progress_cb:
-                await progress_cb(100.0, "Import 100% · Compression 100%")
-            return job
-        if status in {"failed", "error"}:
-            raise RuntimeError(_job_failure_reason(job))
+    try:
+        while time.time() < deadline:
+            job = await _job_status(api_key, job_id)
+            status = str(job.get("status") or "")
+            if status == "completed":
+                if progress_cb:
+                    await progress_cb(100.0, "Import 100% · Compression 100%")
+                return job
+            if status in {"failed", "error"}:
+                raise RuntimeError(_job_failure_reason(job))
 
-        pct, detail_msg = _detailed_progress(job)
-        if progress_cb:
-            await progress_cb(pct, detail_msg)
-        await asyncio.sleep(3)
+            pct, detail_msg = _detailed_progress(job)
+            if progress_cb:
+                await progress_cb(pct, detail_msg)
+            await asyncio.sleep(3)
+    except asyncio.CancelledError:
+        await _delete_job(api_key, job_id)
+        raise
     raise RuntimeError(f"FreeConvert job {job_id} timed out.")
 
 
@@ -266,6 +291,9 @@ async def _download_file(url: str, dest_path: str, progress_cb: ProgressCB = Non
     URL fait planter le download (voire invalide le lien). On force donc
     UNE SEULE connexion (-x1 -s1), avec un timeout de sécurité pour ne
     jamais rester bloqué indéfiniment si le lien pose problème.
+
+    Si la tâche du bot est annulée pendant le téléchargement, le process
+    aria2c est tué (sinon il continuerait en arrière-plan).
     """
     dest_dir = os.path.dirname(dest_path) or "."
     dest_name = os.path.basename(dest_path)
@@ -312,6 +340,15 @@ async def _download_file(url: str, dest_path: str, progress_cb: ProgressCB = Non
     try:
         await asyncio.wait_for(_read_output(), timeout=1800)
         code = await asyncio.wait_for(proc.wait(), timeout=30)
+    except asyncio.CancelledError:
+        # Annulation demandée (bouton Cancel) : on ne laisse pas aria2c
+        # tourner en tâche de fond.
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        raise
     except asyncio.TimeoutError:
         log.warning("aria2c bloqué trop longtemps, on force l'arrêt et fallback sur aiohttp.")
         try:
@@ -476,14 +513,8 @@ async def hardsub_remote_url(
 #     fonction marche telle quelle, aucun download local nécessaire.
 #   - Si la source est Transfer.it/Mega -> il faut d'abord télécharger
 #     localement (download_video() existant dans engines/tsundere_rss.py),
-#     puis uploader ce fichier local vers FreeConvert. Je n'ai vu aucune
-#     fonction "import/upload" dans ce que tu m'as partagé — dis-moi si
-#     elle existe ailleurs dans freeconvert.py (fichier tronqué ?) ou si
-#     c'est à écrire.
-# En attendant, les call sites (tsundere_tracker.py / unreal_engine4.py)
-# testent is_video_url(video_url) et n'utilisent convert_remote_url() que
-# dans ce cas ; sinon ils lèvent une erreur claire au lieu de planter
-# silencieusement.
+#     puis uploader ce fichier local vers FreeConvert
+#     (voir convert_local_file_multi() plus bas).
 
 def _create_convert_payload(
     *,
